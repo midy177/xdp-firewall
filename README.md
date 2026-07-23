@@ -77,7 +77,7 @@ The frontend source is Vue 3. `frontend/package.json` aliases Vite to Rolldown V
 - `firewall_rules`: static allow/deny CIDR rules, optional protocol and port match.
 - `firewall_geo_country_policies`: per-country allow/deny policy.
 - `firewall_dynamic_defense`: global `ip_rate_limit` and `flood` policy.
-- `firewall_trusted_cidrs`: CIDR whitelist for global dynamic defense.
+- `firewall_trusted_cidrs`: highest-priority source CIDR whitelist.
 - `firewall_threat_sources`: threat-intelligence feed definitions.
 - `firewall_nodes`: distributed node heartbeat and last applied version.
 
@@ -98,11 +98,11 @@ clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -c bpf/xdp_firewall.c -o bpf/xdp_fi
 
 The userspace agent defaults to `/usr/local/share/xdp-firewall/xdp_firewall.o`. Pass `--xdp-object ./bpf/xdp_firewall.o` for local development or custom packaging.
 
-## Trusted CIDRs
+## Whitelist
 
-Trusted CIDRs are the whitelist for global dynamic defense. Source IPs matching these prefixes still go through ordinary firewall rules, threat intelligence, and country allow/deny rules, but skip global `ip_rate_limit` and `flood` checks.
+Trusted CIDRs are the highest-priority source whitelist. Source IPs matching these prefixes are allowed before ordinary firewall rules, threat-intelligence deny prefixes, country allow/deny rules, and global dynamic defense checks.
 
-They are stored in the database so every agent sees the same whitelist. Initialize entries from the API process with Clap arguments or environment variables, or manage them later through the API/frontend. Agents read the database and apply the whitelist; they do not mutate whitelist configuration.
+They are stored in the database so the control plane can push the same whitelist to every agent over xDS. Initialize entries from the API process with Clap arguments or environment variables, or manage them later through the API/frontend. Agents apply the pushed whitelist; they do not mutate whitelist configuration.
 
 ```bash
 xdp-firewall api \
@@ -128,6 +128,15 @@ The same whitelist can be managed through:
 - `POST /trusted-cidrs`
 - `DELETE /trusted-cidrs/{id}`
 
+## Enforcement Priority
+
+Ingress packets are evaluated in this order:
+
+1. Whitelist (`trusted_cidrs`): matching source CIDRs are allowed immediately.
+2. Ordinary firewall rules and threat-intelligence deny prefixes: lower numeric `priority` values have higher priority.
+3. Country allow/deny rules.
+4. Global dynamic defense: `ip_rate_limit` and `flood`.
+
 ## Dynamic Defense
 
 Global dynamic defense is enabled by default and applies after ordinary firewall, threat intelligence, and country allow/deny decisions:
@@ -135,7 +144,7 @@ Global dynamic defense is enabled by default and applies after ordinary firewall
 - `ip_rate_limit`: per-source-IP token bucket.
 - `flood`: per-source-IP token bucket with a temporary block window after the threshold is exceeded.
 
-Trusted CIDRs skip these global dynamic defense checks. Configure dynamic defense through:
+Whitelist entries are evaluated before dynamic defense, so matching sources are allowed immediately. Configure dynamic defense through:
 
 - `GET /dynamic-defense`
 - `PUT /dynamic-defense`
@@ -146,11 +155,27 @@ Use `agent` for persistent enforcement. The agent does not connect to the config
 
 `sync-once` fetches one policy snapshot from xDS, applies it, then exits; on Linux this means the process no longer owns the XDP attachment. It is useful for validation workflows, not for keeping a node protected.
 
-Do not use `xdp-firewall policy show` inside an agent-only container to inspect the applied policy. `policy show` is a database command, while agent containers intentionally do not receive `DATABASE_URL`. Use the API container, the `GET /policy` API, or the agent apply log instead.
+Do not use `xdp-firewall policy show` inside an agent-only container to inspect the applied policy. `policy show` is a database command, while agent containers intentionally do not receive `DATABASE_URL` and set `XDP_FIREWALL_AGENT_ONLY=true` to reject control-plane database commands. Use the API container, the `GET /policy` API, or the agent apply log instead.
 
 The control plane controls push cadence with `xdp-firewall api --xds-push-interval-seconds 5`. Agents do not poll the database. They keep a streaming gRPC subscription open and apply updates when xDS pushes a newer version. Heartbeats still run from the agent to xDS with `--heartbeat-seconds`.
 
 Before compiling each pushed snapshot, the agent resolves the xDS control-plane host and adds local in-memory allow rules for those controller IPs. This protects the controller-to-agent path from accidental ingress blocks. The current XDP program is ingress-only, so egress traffic from the agent to the controller is not restricted by this firewall.
+
+## Agent Monitor
+
+`monitor` is an agent-side troubleshooting command. It does not connect to the database and is allowed inside `XDP_FIREWALL_AGENT_ONLY=true` containers.
+
+```bash
+xdp-firewall monitor --once
+```
+
+By default it prints one line every five seconds. Use `--interval-seconds` to change the cadence, `--once` for a single sample, or `--json` for JSON lines. Each sample includes node identity, detected interface, xDS control URL, interface state, MTU, bpffs mount status, agent-only mode, whether `DATABASE_URL` is present, whether a local SQLite file exists in `/var/lib/xdp-firewall`, local agent process count, xDS connectivity, and the current xDS policy snapshot summary when xDS is reachable.
+
+Example output:
+
+```text
+time=2026-07-23T12:13:12Z node_id=node-1 interface=ens5 control_url=http://127.0.0.1:50051 operstate=up mtu=9001 carrier=1 bpffs_mounted=true agent_only=true database_url_present=false local_db_file_present=false agent_processes=1 xds_status=ok policy_version=5 rules=0 geo_countries=0 trusted_cidrs=3 threat_sources=2 dynamic_defense=true ip_rate_limit=true flood=true
+```
 
 ## xDS Control Plane
 
@@ -187,7 +212,7 @@ Default capacity and approximate key/value payload:
 | --- | ---: | --- | ---: |
 | `rule_cidrs` | `262144` | Ordinary firewall CIDR rules | `8 MiB` |
 | `geo_cidrs` | `262144` | Country CIDR prefixes | `6.5 MiB` |
-| `trusted_cidrs` | `4096` | Trusted CIDR whitelist for global dynamic defense | `0.1 MiB` |
+| `trusted_cidrs` | `4096` | Highest-priority source CIDR whitelist | `0.1 MiB` |
 | `country_rules` | `676` | Country-code allow/deny actions | A few KiB |
 | `defense_policy` | `1` | Global dynamic defense configuration | Negligible |
 | `rate_buckets` | `1048576` | Per-source-IP `ip_rate_limit` and `flood` token buckets | `46-48 MiB` |

@@ -3,6 +3,7 @@ pub mod cli;
 pub mod db;
 pub mod firewall;
 pub mod geo;
+pub mod monitor;
 pub mod security;
 pub mod sync;
 pub mod threat;

@@ -72,6 +72,16 @@
         </div>
       </div>
 
+      <section class="priority-strip" :aria-label="t('priorityOrder')">
+        <div v-for="item in priorityOrder" :key="item.rank" class="priority-step">
+          <strong>{{ item.rank }}</strong>
+          <div>
+            <span>{{ t(item.label) }}</span>
+            <small>{{ t(item.detail) }}</small>
+          </div>
+        </div>
+      </section>
+
       <section v-if="tab === 'rules'" class="panel">
         <div class="panel-head">
           <div>
@@ -126,7 +136,12 @@
               <td colspan="6" class="empty">{{ t("emptyRules") }}</td>
             </tr>
             <tr v-for="rule in rules" :key="rule.id">
-              <td>{{ rule.priority }}</td>
+              <td>
+                <div class="priority-cell">
+                  <span>{{ rule.priority }}</span>
+                  <Badge v-if="isHighestRule(rule)" tone="amber">{{ t("highest") }}</Badge>
+                </div>
+              </td>
               <td><Badge :tone="rule.action === 'deny' ? 'red' : 'green'">{{ rule.action }}</Badge></td>
               <td>{{ rule.cidr }}</td>
               <td>{{ rule.protocol ?? 'any' }}</td>
@@ -405,7 +420,7 @@
 </template>
 
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { ChevronLeft, ChevronRight, DatabaseZap, Globe2, KeyRound, ListFilter, Plus, RefreshCcw, Server, ShieldCheck, Trash2 } from "lucide-vue-next";
 import Badge from "./components/ui/Badge.vue";
 import Button from "./components/ui/Button.vue";
@@ -511,7 +526,7 @@ const messages = {
     emptyNodes: "暂无节点心跳",
     emptyRules: "暂无普通防火墙规则",
     emptyThreats: "暂无威胁源",
-    emptyTrustedCidrs: "暂无限流白名单",
+    emptyTrustedCidrs: "暂无白名单",
     enabled: "启用",
     enabledShort: "开",
     error: "错误",
@@ -519,6 +534,7 @@ const messages = {
     floodPps: "Flood PPS",
     format: "格式",
     firewall: "防火墙配置",
+    highest: "最高",
     ipBurst: "IP 突发",
     ipPps: "IP PPS",
     interface: "网卡",
@@ -529,10 +545,19 @@ const messages = {
     policy: "策略",
     port: "端口",
     priority: "优先级",
+    priorityCountries: "国家规则",
+    priorityCountriesDetail: "再按国家代码执行允许或拒绝",
+    priorityDefense: "动态防御",
+    priorityDefenseDetail: "最后执行全局 ip_rate_limit 和 flood",
+    priorityOrder: "执行优先级",
+    priorityRules: "普通规则 / 威胁情报",
+    priorityRulesDetail: "普通规则按数字从小到大匹配；威胁情报编译为拒绝规则",
+    priorityWhitelist: "白名单",
+    priorityWhitelistDetail: "最高优先级，命中后直接允许",
     protocol: "协议",
     refresh: "刷新",
     rules: "规则",
-    rulesHint: "按优先级匹配 CIDR、协议和端口",
+    rulesHint: "按优先级匹配 CIDR、协议和端口，数字越小优先级越高",
     ruleAction: "规则动作",
     ruleCidr: "规则 CIDR",
     rulePriority: "规则优先级",
@@ -551,8 +576,8 @@ const messages = {
     threatSourceName: "威胁源名称",
     threatSourceUrl: "威胁源 URL",
     threatSources: "威胁源",
-    trustedCidrs: "限流白名单",
-    trustedCidrsHint: "匹配这些 CIDR 的源 IP 不受全局 ip_rate_limit 和 flood 限制",
+    trustedCidrs: "白名单",
+    trustedCidrsHint: "最高优先级；匹配这些 CIDR 的源 IP 会在普通规则、威胁情报、国家规则、动态防御之前直接允许",
     total: "总数",
     version: "版本",
     nodesHint: "查看各节点最近同步状态"
@@ -579,7 +604,7 @@ const messages = {
     emptyNodes: "No node heartbeats",
     emptyRules: "No firewall rules",
     emptyThreats: "No threat sources",
-    emptyTrustedCidrs: "No trusted CIDRs",
+    emptyTrustedCidrs: "No whitelist entries",
     enabled: "Enabled",
     enabledShort: "on",
     error: "Error",
@@ -587,6 +612,7 @@ const messages = {
     floodPps: "Flood PPS",
     format: "Format",
     firewall: "Firewall Config",
+    highest: "highest",
     ipBurst: "IP burst",
     ipPps: "IP PPS",
     interface: "Interface",
@@ -597,10 +623,19 @@ const messages = {
     policy: "Policy",
     port: "Port",
     priority: "Priority",
+    priorityCountries: "Country rules",
+    priorityCountriesDetail: "Then apply country-code allow or deny decisions",
+    priorityDefense: "Dynamic Defense",
+    priorityDefenseDetail: "Finally apply global ip_rate_limit and flood",
+    priorityOrder: "Enforcement Priority",
+    priorityRules: "Firewall Rules / Threat Intel",
+    priorityRulesDetail: "Rules match from lower numbers to higher numbers; threat intel is compiled as deny rules",
+    priorityWhitelist: "Whitelist",
+    priorityWhitelistDetail: "Highest priority; matching sources are allowed immediately",
     protocol: "Protocol",
     refresh: "Refresh",
     rules: "Rules",
-    rulesHint: "Match CIDR, protocol, and port by priority",
+    rulesHint: "Match CIDR, protocol, and port by priority; lower numbers have higher priority",
     ruleAction: "Rule action",
     ruleCidr: "Rule CIDR",
     rulePriority: "Rule priority",
@@ -619,8 +654,8 @@ const messages = {
     threatSourceName: "Threat source name",
     threatSourceUrl: "Threat source URL",
     threatSources: "Threat Sources",
-    trustedCidrs: "Trusted CIDRs",
-    trustedCidrsHint: "Source IPs matching these CIDRs skip global ip_rate_limit and flood checks",
+    trustedCidrs: "Whitelist",
+    trustedCidrsHint: "Highest priority; source IPs matching these CIDRs are allowed before firewall rules, threat intelligence, country rules, and dynamic defense",
     total: "Total",
     version: "Version",
     nodesHint: "View the last sync state for each node"
@@ -668,6 +703,24 @@ const validationMessages = {
 
 type TextKey = keyof typeof messages.zh;
 type ValidationKey = keyof typeof validationMessages.zh;
+
+const priorityOrder: { rank: string; label: TextKey; detail: TextKey }[] = [
+  { rank: "1", label: "priorityWhitelist", detail: "priorityWhitelistDetail" },
+  { rank: "2", label: "priorityRules", detail: "priorityRulesDetail" },
+  { rank: "3", label: "priorityCountries", detail: "priorityCountriesDetail" },
+  { rank: "4", label: "priorityDefense", detail: "priorityDefenseDetail" }
+];
+
+const highestRulePriority = computed(() => {
+  if (rules.value.length === 0) {
+    return null;
+  }
+  return Math.min(...rules.value.map((rule) => rule.priority));
+});
+
+function isHighestRule(rule: Rule): boolean {
+  return highestRulePriority.value !== null && rule.priority === highestRulePriority.value;
+}
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   error.value = "";

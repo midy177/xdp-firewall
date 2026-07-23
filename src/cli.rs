@@ -19,6 +19,7 @@ pub enum Command {
     Xds(XdsArgs),
     Agent(AgentArgs),
     SyncOnce(SyncOnceArgs),
+    Monitor(MonitorArgs),
     Policy {
         #[command(flatten)]
         database: DatabaseArgs,
@@ -68,7 +69,7 @@ pub struct ApiArgs {
         alias = "trusted-cidrs",
         env = "XDP_FIREWALL_TRUSTED_CIDRS",
         value_delimiter = ',',
-        help = "Trusted source CIDR allowlist for global ip_rate_limit and flood. Can be repeated or comma-separated. These prefixes are persisted to the policy database."
+        help = "Highest-priority source CIDR whitelist. Can be repeated or comma-separated. Matching sources are allowed before firewall, threat, country, and dynamic defense checks. These prefixes are persisted to the policy database."
     )]
     pub trusted_cidrs: Vec<String>,
 }
@@ -250,6 +251,40 @@ pub struct SyncOnceArgs {
         default_value_t = DEFAULT_RATE_MAP_ENTRIES
     )]
     pub rate_map_entries: u32,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct MonitorArgs {
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_NODE_ID",
+        help = "Node identity used when querying xDS. Uses XDP_FIREWALL_NODE_ID, NODE_ID, HOSTNAME, or /etc/hostname when omitted."
+    )]
+    pub node_id: Option<String>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDS_URL",
+        default_value = "http://127.0.0.1:50051",
+        help = "gRPC xDS control-plane URL used by monitor."
+    )]
+    pub control_url: String,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_AGENT_TOKEN",
+        help = "Bearer token sent to the xDS control plane."
+    )]
+    pub agent_token: Option<String>,
+    #[arg(
+        long,
+        help = "Network interface to inspect. Auto-detects the default-route interface when omitted."
+    )]
+    pub interface: Option<String>,
+    #[arg(long, default_value_t = 5)]
+    pub interval_seconds: u64,
+    #[arg(long, help = "Print one monitor sample and exit.")]
+    pub once: bool,
+    #[arg(long, help = "Print monitor samples as JSON lines.")]
+    pub json: bool,
 }
 
 #[derive(Debug, Args, Clone)]

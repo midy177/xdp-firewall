@@ -47,6 +47,8 @@ spec:
                   fieldPath: spec.nodeName
             - name: XDP_FIREWALL_XDP_MODE
               value: auto
+            - name: XDP_FIREWALL_AGENT_ONLY
+              value: "true"
             - name: RUST_LOG
               value: xdp_firewall=info
           command: ["/usr/local/bin/xdp-firewall"]

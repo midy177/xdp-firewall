@@ -98,7 +98,7 @@ impl XdpManager {
         #[cfg(target_os = "linux")]
         {
             let map_sizes = map_sizes.validate()?;
-            let interface = resolve_interface(interface)?;
+            let interface = resolve_interface_name(interface)?;
             return Ok(Self {
                 inner: linux::LinuxXdpManager::attach(
                     &interface,
@@ -140,8 +140,23 @@ impl XdpManager {
     }
 }
 
+pub fn resolve_interface_name(configured: Option<&str>) -> Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        return resolve_linux_interface_name(configured);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(configured
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("noop")
+            .to_string())
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn resolve_interface(configured: Option<&str>) -> Result<String> {
+fn resolve_linux_interface_name(configured: Option<&str>) -> Result<String> {
     use anyhow::{Context, bail};
 
     if let Some(interface) = configured.map(str::trim).filter(|value| !value.is_empty()) {

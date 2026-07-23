@@ -320,7 +320,10 @@ static __always_inline int dynamic_defense_limited(__u8 family, __u8 addr[16])
 
 static __always_inline int handle_packet(__u8 family, __u8 proto, __u16 dport, __u8 src[16])
 {
-    int trusted = lookup_trusted(family, src) != 0;
+    if (lookup_trusted(family, src) != 0) {
+        incr_stat(STAT_PASS);
+        return XDP_PASS;
+    }
 
     struct rule_value *rule = lookup_rule(family, proto, dport, src);
     if (rule) {
@@ -346,12 +349,10 @@ static __always_inline int handle_packet(__u8 family, __u8 proto, __u16 dport, _
         }
     }
 
-    if (!trusted) {
-        int defense_drop = dynamic_defense_limited(family, src);
-        if (defense_drop) {
-            incr_stat(defense_drop);
-            return XDP_DROP;
-        }
+    int defense_drop = dynamic_defense_limited(family, src);
+    if (defense_drop) {
+        incr_stat(defense_drop);
+        return XDP_DROP;
     }
 
     incr_stat(STAT_PASS);

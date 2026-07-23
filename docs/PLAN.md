@@ -18,6 +18,12 @@
 - [completed] Move `--database-url` off the global CLI so `agent --help` does not show DB configuration.
 - [completed] Keep Compose trusted CIDR template empty by default to avoid inserting example prefixes into real policy.
 - [completed] Hide advanced agent map capacity flags from normal help output while keeping env/CLI overrides available.
+- [completed] Add `XDP_FIREWALL_AGENT_ONLY=true` to agent deployments and reject control-plane commands inside agent-only containers.
+- [completed] Add agent-side `monitor` command for troubleshooting without database access.
+- [completed] Extend monitor output with agent-only, database-env, local-db-file, control URL, and JSON-line diagnostics.
+- [completed] Change trusted CIDR whitelist semantics to highest-priority allow before firewall, threat, country, and dynamic defense checks.
+- [completed] Update frontend UI to show global enforcement priority and mark the highest-priority ordinary rule on the current rules page.
+- [completed] Rename frontend trusted CIDR wording from rate-limit whitelist to whitelist.
 
 ## Completed
 
@@ -74,7 +80,7 @@
 - Added BPF `defense_policy` array map for global dynamic defense config.
 - Added BPF rate bucket key separation for global ip/flood buckets.
 - Added BPF flood drop stat index.
-- Changed BPF trusted CIDR handling so trusted sources skip only global dynamic defense checks.
+- Changed BPF trusted CIDR handling so trusted sources are allowed before ordinary firewall, threat intelligence, country, and dynamic defense checks.
 - Removed country rate-limit behavior from the BPF data path.
 - Added DB entity and migration for `firewall_dynamic_defense`.
 - Added DB entity and migration for `firewall_trusted_cidrs`.
@@ -128,12 +134,11 @@
 - Global dynamic defense is enabled by default for new or missing dynamic defense rows.
 - The product exposes exactly one firewall policy; no user-facing multi-policy creation or selection is allowed.
 - `edge` remains the internal DB key only to avoid a destructive schema migration.
-- `trusted-cidr` is the rate-limit/flood whitelist.
-- If source IP matches `trusted-cidr`, it skips global `ip_rate_limit` and `flood`.
-- `trusted-cidr` should not blindly bypass normal firewall, threat intelligence, or country deny rules.
-- `trusted-cidr` must be persisted in DB so all agents can read the same whitelist.
+- `trusted-cidr` is the highest-priority source whitelist.
+- If source IP matches `trusted-cidr`, it is allowed before ordinary firewall, threat intelligence, country, and dynamic defense checks.
+- `trusted-cidr` must be persisted in DB so the control plane can push the same whitelist to all agents.
 - `trusted-cidr` must support initialization from API Clap/env and management through API/frontend.
-- `agent` and `sync-once` must not mutate firewall configuration tables; they may only read policy/configuration and write node heartbeat state.
+- `agent` and `sync-once` must not connect to the database or mutate firewall configuration tables; they receive policy snapshots and send heartbeat state through xDS.
 
 ## Remaining Tasks
 
