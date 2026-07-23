@@ -24,6 +24,7 @@ pub struct Cli {
 pub enum Command {
     Migrate,
     Api(ApiArgs),
+    Xds(XdsArgs),
     Agent(AgentArgs),
     SyncOnce(SyncOnceArgs),
     Policy {
@@ -37,6 +38,25 @@ pub struct ApiArgs {
     #[arg(long, default_value = "0.0.0.0:8080")]
     pub bind: String,
     #[arg(
+        long,
+        env = "XDP_FIREWALL_XDS_BIND",
+        default_value = "0.0.0.0:50051",
+        help = "gRPC xDS bind address exposed by the API control-plane process."
+    )]
+    pub xds_bind: String,
+    #[arg(
+        long,
+        default_value_t = 5,
+        help = "Minimum xDS policy push interval in seconds. The control plane checks for changed policy versions at this cadence."
+    )]
+    pub xds_push_interval_seconds: u64,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_AGENT_TOKEN",
+        help = "Bearer token required from XDP agents. If omitted, the xDS service is unauthenticated."
+    )]
+    pub agent_token: Option<String>,
+    #[arg(
         long = "trusted-cidr",
         alias = "trusted-cidrs",
         env = "XDP_FIREWALL_TRUSTED_CIDRS",
@@ -44,6 +64,24 @@ pub struct ApiArgs {
         help = "Trusted source CIDR allowlist for global ip_rate_limit and flood. Can be repeated or comma-separated. These prefixes are persisted to the policy database."
     )]
     pub trusted_cidrs: Vec<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct XdsArgs {
+    #[arg(long, default_value = "0.0.0.0:50051")]
+    pub bind: String,
+    #[arg(
+        long,
+        default_value_t = 5,
+        help = "Minimum xDS policy push interval in seconds. The control plane checks for changed policy versions at this cadence."
+    )]
+    pub push_interval_seconds: u64,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_AGENT_TOKEN",
+        help = "Bearer token required from XDP agents. If omitted, the xDS service is unauthenticated."
+    )]
+    pub agent_token: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -62,6 +100,19 @@ pub struct AgentArgs {
     pub node_id: Option<String>,
     #[arg(
         long,
+        env = "XDP_FIREWALL_XDS_URL",
+        default_value = "http://127.0.0.1:50051",
+        help = "gRPC xDS control-plane URL used by the agent."
+    )]
+    pub control_url: String,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_AGENT_TOKEN",
+        help = "Bearer token sent to the xDS control plane."
+    )]
+    pub agent_token: Option<String>,
+    #[arg(
+        long,
         help = "Network interface to attach XDP to. Auto-detects the default-route interface when omitted."
     )]
     pub interface: Option<String>,
@@ -75,8 +126,6 @@ pub struct AgentArgs {
     pub xdp_mode: XdpAttachMode,
     #[arg(long, default_value = "/usr/local/share/xdp-firewall/xdp_firewall.o")]
     pub xdp_object: String,
-    #[arg(long, default_value_t = 5)]
-    pub poll_seconds: u64,
     #[arg(long, default_value_t = 30)]
     pub heartbeat_seconds: u64,
     #[arg(long, default_value = "xdp_firewall")]
@@ -121,6 +170,19 @@ pub struct SyncOnceArgs {
         help = "Node identity for heartbeats. Uses XDP_FIREWALL_NODE_ID, NODE_ID, HOSTNAME, or /etc/hostname when omitted."
     )]
     pub node_id: Option<String>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDS_URL",
+        default_value = "http://127.0.0.1:50051",
+        help = "gRPC xDS control-plane URL used by sync-once."
+    )]
+    pub control_url: String,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_AGENT_TOKEN",
+        help = "Bearer token sent to the xDS control plane."
+    )]
+    pub agent_token: Option<String>,
     #[arg(
         long,
         help = "Network interface to attach XDP to. Auto-detects the default-route interface when omitted."

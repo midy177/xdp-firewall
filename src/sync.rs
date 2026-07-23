@@ -1,17 +1,18 @@
 use crate::cli::{AgentArgs, SyncOnceArgs};
-use crate::db::entities::{node, policy_version};
-use crate::{firewall, security, xdp};
+use crate::{firewall, xdp, xds};
 use anyhow::{Context, Result, bail};
-use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
+use ipnet::IpNet;
+use std::net::IpAddr;
 use tokio::time::{Duration, interval};
 use tracing::{error, info};
 
-pub async fn sync_once(db: DatabaseConnection, args: SyncOnceArgs) -> Result<()> {
+pub async fn sync_once(args: SyncOnceArgs) -> Result<()> {
     let node_id = resolve_node_id(args.node_id.as_deref())?;
     let policy = firewall::DEFAULT_POLICY_NAME;
     info!(
         node_id = %node_id,
         policy,
+        control_url = %args.control_url,
         configured_interface = ?args.interface,
         xdp_mode = %args.xdp_mode.as_str(),
         xdp_object = %args.xdp_object,
@@ -26,43 +27,42 @@ pub async fn sync_once(db: DatabaseConnection, args: SyncOnceArgs) -> Result<()>
         args.xdp_mode,
     )?;
     let interface = xdp.interface_name().to_string();
-    let snapshot = firewall::load_policy(&db, policy).await?;
-    let compiled = firewall::compile_policy(&snapshot).await?;
-    xdp.apply(&compiled)?;
-    let (status, error) = sync_once_status();
-    heartbeat(
-        &db,
-        &node_id,
-        policy,
-        &interface,
-        compiled.version,
-        status,
-        error,
-    )
+    let mut client = xds::XdsClient::connect(xds::XdsClientConfig {
+        control_url: args.control_url.clone(),
+        agent_token: args.agent_token.clone(),
+    })
     .await?;
+    let Some((version, snapshot)) = client.fetch_policy(&node_id, &interface, -1).await? else {
+        bail!("xDS control plane returned unchanged policy for initial sync");
+    };
+    let applied = apply_latest(&mut xdp, snapshot, &args.control_url, version).await?;
+    let (status, error) = sync_once_status();
+    client
+        .report_heartbeat(&node_id, &interface, applied, status, error.as_deref())
+        .await?;
     info!(
         node_id = %node_id,
         policy,
         interface = %interface,
-        version = compiled.version,
+        xds_version = version,
+        version = applied,
         "policy synced once"
     );
     Ok(())
 }
 
-pub async fn run_agent(db: DatabaseConnection, args: AgentArgs) -> Result<()> {
-    validate_positive_interval("poll-seconds", args.poll_seconds)?;
+pub async fn run_agent(args: AgentArgs) -> Result<()> {
     validate_positive_interval("heartbeat-seconds", args.heartbeat_seconds)?;
     let node_id = resolve_node_id(args.node_id.as_deref())?;
     let policy = firewall::DEFAULT_POLICY_NAME;
     info!(
         node_id = %node_id,
         policy,
+        control_url = %args.control_url,
         configured_interface = ?args.interface,
         xdp_mode = %args.xdp_mode.as_str(),
         xdp_object = %args.xdp_object,
         program = %args.program,
-        poll_seconds = args.poll_seconds,
         heartbeat_seconds = args.heartbeat_seconds,
         rule_map_entries = args.rule_map_entries,
         geo_map_entries = args.geo_map_entries,
@@ -85,50 +85,89 @@ pub async fn run_agent(db: DatabaseConnection, args: AgentArgs) -> Result<()> {
         interface = %interface,
         "agent attached XDP"
     );
-    let mut poll = interval(Duration::from_secs(args.poll_seconds));
-    let mut heartbeat_tick = interval(Duration::from_secs(args.heartbeat_seconds));
     let mut applied_version = -1_i64;
-
-    heartbeat(&db, &node_id, policy, &interface, 0, "starting", None).await?;
+    let heartbeat_interval = Duration::from_secs(args.heartbeat_seconds);
+    let reconnect_delay = heartbeat_interval.min(Duration::from_secs(10));
+    let mut client = xds::XdsClient::connect(xds::XdsClientConfig {
+        control_url: args.control_url.clone(),
+        agent_token: args.agent_token.clone(),
+    })
+    .await?;
+    client
+        .report_heartbeat(&node_id, &interface, 0, "starting", None)
+        .await?;
 
     loop {
-        tokio::select! {
-            _ = poll.tick() => {
-                match latest_version(&db, policy).await {
-                    Ok(version) if version != applied_version => {
-                        match apply_latest(&db, &mut xdp, version).await {
-                            Ok(applied) => {
-                                applied_version = applied;
-                                heartbeat(&db, &node_id, policy, &interface, applied_version, "ok", None).await?;
-                            }
-                            Err(err) => {
-                                let details = format!("{err:#}");
-                                let message = security::public_error_message(&details);
-                                error!(error = %details, "failed to apply firewall policy");
-                                heartbeat(&db, &node_id, policy, &interface, applied_version.max(0), "error", Some(message)).await?;
+        let mut stream = match client
+            .stream_policy(&node_id, &interface, applied_version)
+            .await
+        {
+            Ok(stream) => stream,
+            Err(err) => {
+                let details = format!("{err:#}");
+                error!(error = %details, "failed to subscribe to xDS policy stream");
+                let _ = client
+                    .report_heartbeat(
+                        &node_id,
+                        &interface,
+                        applied_version.max(0),
+                        "error",
+                        Some(&details),
+                    )
+                    .await;
+                tokio::time::sleep(reconnect_delay).await;
+                client = xds::XdsClient::connect(xds::XdsClientConfig {
+                    control_url: args.control_url.clone(),
+                    agent_token: args.agent_token.clone(),
+                })
+                .await?;
+                continue;
+            }
+        };
+        let mut heartbeat_tick = interval(heartbeat_interval);
+        loop {
+            tokio::select! {
+                update = stream.message() => {
+                    match update {
+                        Ok(Some(update)) => {
+                            let (version, snapshot) = xds::XdsClient::policy_from_update(update)?;
+                            match apply_latest(&mut xdp, snapshot, &args.control_url, version).await {
+                                Ok(applied) => {
+                                    applied_version = applied;
+                                    client.report_heartbeat(&node_id, &interface, applied_version, "ok", None).await?;
+                                }
+                                Err(err) => {
+                                    let details = format!("{err:#}");
+                                    error!(error = %details, "failed to apply firewall policy");
+                                    client.report_heartbeat(&node_id, &interface, applied_version.max(0), "error", Some(&details)).await?;
+                                }
                             }
                         }
-                    }
-                    Ok(_) => {}
-                    Err(err) => {
-                        let details = format!("{err:#}");
-                        let message = security::public_error_message(&details);
-                        error!(error = %details, "failed to read firewall policy version");
-                        heartbeat(&db, &node_id, policy, &interface, applied_version.max(0), "error", Some(message)).await?;
+                        Ok(None) => {
+                            info!("xDS policy stream closed; reconnecting");
+                            tokio::time::sleep(reconnect_delay).await;
+                            break;
+                        }
+                        Err(err) => {
+                            let details = format!("{err:#}");
+                            error!(error = %details, "xDS policy stream failed; reconnecting");
+                            let _ = client.report_heartbeat(&node_id, &interface, applied_version.max(0), "error", Some(&details)).await;
+                            tokio::time::sleep(reconnect_delay).await;
+                            break;
+                        }
                     }
                 }
-            }
-            _ = heartbeat_tick.tick() => {
-                heartbeat(&db, &node_id, policy, &interface, applied_version.max(0), "ok", None).await?;
-            }
-            result = tokio::signal::ctrl_c() => {
-                result?;
-                heartbeat(&db, &node_id, policy, &interface, applied_version.max(0), "stopped", None).await?;
-                break;
+                _ = heartbeat_tick.tick() => {
+                    client.report_heartbeat(&node_id, &interface, applied_version.max(0), "ok", None).await?;
+                }
+                result = tokio::signal::ctrl_c() => {
+                    result?;
+                    client.report_heartbeat(&node_id, &interface, applied_version.max(0), "stopped", None).await?;
+                    return Ok(());
+                }
             }
         }
     }
-    Ok(())
 }
 
 fn validate_positive_interval(name: &str, seconds: u64) -> Result<()> {
@@ -200,12 +239,13 @@ fn resolve_node_id(configured: Option<&str>) -> Result<String> {
 }
 
 async fn apply_latest(
-    db: &DatabaseConnection,
     xdp: &mut xdp::XdpManager,
+    mut snapshot: firewall::PolicySnapshot,
+    control_url: &str,
     expected_version: i64,
 ) -> Result<i64> {
     let policy = firewall::DEFAULT_POLICY_NAME;
-    let snapshot = firewall::load_policy(db, policy).await?;
+    add_control_plane_allow_rules(&mut snapshot, control_url).await?;
     let compiled = firewall::compile_policy(&snapshot).await?;
     xdp.apply(&compiled)?;
     info!(
@@ -217,49 +257,75 @@ async fn apply_latest(
     Ok(compiled.version)
 }
 
-async fn latest_version(db: &DatabaseConnection, policy_name: &str) -> Result<i64> {
-    Ok(policy_version::Entity::find()
-        .filter(policy_version::Column::PolicyName.eq(policy_name))
-        .one(db)
-        .await?
-        .map_or(0, |row| row.version))
-}
-
-async fn heartbeat(
-    db: &DatabaseConnection,
-    node_id: &str,
-    policy_name: &str,
-    interface_name: &str,
-    last_applied_version: i64,
-    status: &str,
-    error: Option<String>,
+async fn add_control_plane_allow_rules(
+    snapshot: &mut firewall::PolicySnapshot,
+    control_url: &str,
 ) -> Result<()> {
-    let now = chrono::Utc::now().naive_utc();
-    let public_error = error.as_deref().map(security::public_error_message);
-    if let Some(row) = node::Entity::find_by_id(node_id.to_string())
-        .one(db)
-        .await?
-    {
-        let mut active: node::ActiveModel = row.into();
-        active.policy_name = Set(policy_name.to_string());
-        active.interface_name = Set(interface_name.to_string());
-        active.last_seen_at = Set(now);
-        active.last_applied_version = Set(last_applied_version);
-        active.status = Set(status.to_string());
-        active.error = Set(public_error);
-        active.update(db).await?;
-    } else {
-        node::ActiveModel {
-            node_id: Set(node_id.to_string()),
-            policy_name: Set(policy_name.to_string()),
-            interface_name: Set(interface_name.to_string()),
-            last_seen_at: Set(now),
-            last_applied_version: Set(last_applied_version),
-            status: Set(status.to_string()),
-            error: Set(public_error),
-        }
-        .insert(db)
-        .await?;
+    let prefixes = resolve_control_plane_prefixes(control_url).await?;
+    for cidr in prefixes {
+        snapshot.rules.push(firewall::FirewallRule {
+            priority: i32::MIN,
+            action: firewall::RuleAction::Allow,
+            cidr,
+            protocol: firewall::L4Protocol::Any,
+            port: None,
+            comment: Some("local xDS control-plane allow".to_string()),
+        });
     }
     Ok(())
+}
+
+async fn resolve_control_plane_prefixes(control_url: &str) -> Result<Vec<IpNet>> {
+    let (host, port) = control_plane_host_port(control_url)?;
+    let addresses = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .with_context(|| format!("failed to resolve xDS control plane host '{host}'"))?;
+    let mut prefixes = Vec::new();
+    for address in addresses {
+        let ip = address.ip();
+        let prefix = match ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        let cidr = IpNet::new(ip, prefix)
+            .with_context(|| format!("failed to build xDS control-plane CIDR for {ip}"))?;
+        if !prefixes.contains(&cidr) {
+            prefixes.push(cidr);
+        }
+    }
+    Ok(prefixes)
+}
+
+fn control_plane_host_port(control_url: &str) -> Result<(String, u16)> {
+    let without_scheme = control_url
+        .strip_prefix("http://")
+        .or_else(|| control_url.strip_prefix("https://"))
+        .unwrap_or(control_url);
+    let authority = without_scheme
+        .split('/')
+        .next()
+        .filter(|value| !value.is_empty())
+        .context("xDS control URL is missing a host")?;
+    if let Some(host) = authority.strip_prefix('[') {
+        let (host, rest) = host
+            .split_once(']')
+            .context("invalid bracketed IPv6 xDS control URL host")?;
+        let port = rest
+            .strip_prefix(':')
+            .map(str::parse)
+            .transpose()?
+            .unwrap_or(50051);
+        return Ok((host.to_string(), port));
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .map(|(host, port)| {
+            let port = port
+                .parse::<u16>()
+                .context("invalid xDS control URL port")?;
+            Ok::<_, anyhow::Error>((host.to_string(), port))
+        })
+        .transpose()?
+        .unwrap_or_else(|| (authority.to_string(), 50051));
+    Ok((host, port))
 }

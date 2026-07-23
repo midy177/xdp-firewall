@@ -88,7 +88,7 @@ pub struct TrustedCidrPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicySnapshot {
-    #[serde(skip_serializing)]
+    #[serde(default = "default_policy_name", skip_serializing)]
     pub policy_name: String,
     pub version: i64,
     pub rules: Vec<FirewallRule>,
@@ -96,6 +96,10 @@ pub struct PolicySnapshot {
     pub dynamic_defense: DynamicDefensePolicy,
     pub trusted_cidrs: Vec<TrustedCidrPolicy>,
     pub threat_sources: Vec<threat::ThreatSource>,
+}
+
+fn default_policy_name() -> String {
+    DEFAULT_POLICY_NAME.to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

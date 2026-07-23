@@ -2,14 +2,17 @@
 
 Distributed XDP firewall control plane written in Rust.
 
-Each server runs the same agent. A single firewall policy is stored in SQLite, PostgreSQL, or MySQL with SeaORM; agents poll the database by policy version and apply the latest enabled firewall policy to local XDP maps through Aya. SQLite is intended for a single-server deployment; PostgreSQL/MySQL are the distributed configuration source for multiple servers. The policy is initialized with built-in threat intelligence feeds for `ipsum` and `spamhaus-drop`.
+Each server runs the same agent. A single firewall policy is stored in SQLite, PostgreSQL, or MySQL with SeaORM. The API control-plane process writes configuration to the database and exposes both the Axum HTTP API/UI and a gRPC xDS stream; agents subscribe to xDS and apply the latest policy to local XDP maps through Aya. SQLite is intended for a single-server deployment; PostgreSQL/MySQL are the distributed configuration source for multiple servers. The policy is initialized with built-in threat intelligence feeds for `ipsum` and `spamhaus-drop`.
 
 ## Quick Start
 
 ```bash
 cargo run -- migrate
 cargo run -- policy seed-example
-cargo run -- agent
+XDP_FIREWALL_API_TOKEN='change-this-token' \
+XDP_FIREWALL_AGENT_TOKEN='change-this-agent-token' \
+cargo run -- api
+XDP_FIREWALL_XDS_URL=http://127.0.0.1:50051 cargo run -- agent
 ```
 
 PostgreSQL works with a `postgres://user:pass@host:5432/db` URL. MySQL works with a `mysql://user:pass@host:3306/db` URL.
@@ -18,7 +21,9 @@ PostgreSQL works with a `postgres://user:pass@host:5432/db` URL. MySQL works wit
 
 ```bash
 cargo run -- migrate
-XDP_FIREWALL_API_TOKEN='change-this-token' cargo run -- api --bind 0.0.0.0:8080
+XDP_FIREWALL_API_TOKEN='change-this-token' \
+XDP_FIREWALL_AGENT_TOKEN='change-this-agent-token' \
+cargo run -- api --bind 0.0.0.0:8080 --xds-bind 0.0.0.0:50051
 ```
 
 Useful endpoints:
@@ -46,7 +51,7 @@ curl -X POST http://127.0.0.1:8080/rules \
   -d '{"priority":10,"action":"deny","cidr":"203.0.113.0/24","protocol":"any"}'
 ```
 
-Every mutating endpoint increments the policy version so running agents can pick up the change on their next poll.
+Every mutating endpoint increments the policy version so the xDS control plane can push a fresh snapshot to running agents.
 
 List endpoints return `items`, `total`, `page`, `page_size`, and `total_pages`. The default page size is `100`; the maximum is `500`.
 
@@ -129,7 +134,26 @@ Trusted CIDRs skip these global dynamic defense checks. Configure dynamic defens
 
 ## Agent Mode
 
-Use `agent` for persistent enforcement. `sync-once` loads and applies one policy snapshot, then exits; on Linux this means the process no longer owns the XDP attachment. It is useful for validation workflows, not for keeping a node protected.
+Use `agent` for persistent enforcement. The agent does not connect to the configuration database. It subscribes to the xDS control plane configured by `--control-url` or `XDP_FIREWALL_XDS_URL`; authenticate it with `--agent-token` or `XDP_FIREWALL_AGENT_TOKEN`.
+
+`sync-once` fetches one policy snapshot from xDS, applies it, then exits; on Linux this means the process no longer owns the XDP attachment. It is useful for validation workflows, not for keeping a node protected.
+
+The control plane controls push cadence with `xdp-firewall api --xds-push-interval-seconds 5`. Agents do not poll the database. They keep a streaming gRPC subscription open and apply updates when xDS pushes a newer version. Heartbeats still run from the agent to xDS with `--heartbeat-seconds`.
+
+Before compiling each pushed snapshot, the agent resolves the xDS control-plane host and adds local in-memory allow rules for those controller IPs. This protects the controller-to-agent path from accidental ingress blocks. The current XDP program is ingress-only, so egress traffic from the agent to the controller is not restricted by this firewall.
+
+## xDS Control Plane
+
+The `api` command starts xDS by default on `0.0.0.0:50051`:
+
+```bash
+XDP_FIREWALL_AGENT_TOKEN='change-this-agent-token' \
+xdp-firewall api --bind 0.0.0.0:8080 --xds-bind 0.0.0.0:50051 --xds-push-interval-seconds 5
+```
+
+xDS runs in the same control-plane process as the HTTP API. It reads policy snapshots from the database and accepts node heartbeats. If `XDP_FIREWALL_AGENT_TOKEN` is set, agents must send the same token with `Authorization: Bearer <token>` or `x-agent-token`.
+
+`xdp-firewall xds` is still available for debugging or intentionally split control-plane deployments, but the provided Docker Compose and Kubernetes templates run xDS inside the API service to keep production configuration smaller.
 
 XDP attach mode is selected with `--xdp-mode` or `XDP_FIREWALL_XDP_MODE`:
 

@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package xdp_firewall.xds.v1;
+
+service FirewallXds {
+  rpc FetchPolicy(FetchPolicyRequest) returns (FetchPolicyResponse);
+  rpc StreamPolicy(StreamPolicyRequest) returns (stream PolicyUpdate);
+  rpc ReportHeartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message FetchPolicyRequest {
+  string node_id = 1;
+  string interface_name = 2;
+  int64 current_version = 3;
+}
+
+message FetchPolicyResponse {
+  int64 version = 1;
+  bool unchanged = 2;
+  string policy_json = 3;
+}
+
+message StreamPolicyRequest {
+  string node_id = 1;
+  string interface_name = 2;
+  int64 current_version = 3;
+}
+
+message PolicyUpdate {
+  int64 version = 1;
+  string policy_json = 2;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  string interface_name = 2;
+  int64 last_applied_version = 3;
+  string status = 4;
+  string error = 5;
+}
+
+message HeartbeatResponse {
+  bool accepted = 1;
+}

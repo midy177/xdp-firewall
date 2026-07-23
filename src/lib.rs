@@ -7,3 +7,4 @@ pub mod security;
 pub mod sync;
 pub mod threat;
 pub mod xdp;
+pub mod xds;

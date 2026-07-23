@@ -34,11 +34,13 @@ spec:
                 - BPF
                 - PERFMON
           env:
-            - name: DATABASE_URL
+            - name: XDP_FIREWALL_XDS_URL
+              value: http://xdp-firewall-api:50051
+            - name: XDP_FIREWALL_AGENT_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: xdp-firewall-db
-                  key: database_url
+                  key: agent_token
             - name: XDP_FIREWALL_NODE_ID
               valueFrom:
                 fieldRef:

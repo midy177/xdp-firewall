@@ -3,7 +3,7 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 use xdp_firewall::cli::{Cli, Command, PolicyCommand};
-use xdp_firewall::{api, db, firewall, sync};
+use xdp_firewall::{api, db, firewall, sync, xds};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -17,11 +17,11 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     info!("starting xdp-firewall");
-    let db = db::connect(&cli.database_url).await?;
 
     match cli.command {
         Command::Migrate => {
             info!("running database migrations");
+            let db = db::connect(&cli.database_url).await?;
             db::migrate(&db).await
         }
         Command::Api(args) => {
@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
                 trusted_cidrs = args.trusted_cidrs.len(),
                 "starting api command"
             );
+            let db = db::connect(&cli.database_url).await?;
             db::migrate(&db).await?;
             firewall::ensure_builtin_policy(&db, firewall::DEFAULT_POLICY_NAME).await?;
             firewall::ensure_configured_trusted_cidrs(
@@ -37,26 +38,39 @@ async fn main() -> Result<()> {
                 &args.trusted_cidrs,
             )
             .await?;
-            api::serve(db, args).await
+            let xds_args = xdp_firewall::cli::XdsArgs {
+                bind: args.xds_bind.clone(),
+                push_interval_seconds: args.xds_push_interval_seconds,
+                agent_token: args.agent_token.clone(),
+            };
+            let api_server = api::serve(db.clone(), args);
+            let xds_server = xds::serve(db, xds_args);
+            tokio::try_join!(api_server, xds_server)?;
+            Ok(())
+        }
+        Command::Xds(args) => {
+            info!("starting xds command");
+            let db = db::connect(&cli.database_url).await?;
+            db::migrate(&db).await?;
+            firewall::ensure_builtin_policy(&db, firewall::DEFAULT_POLICY_NAME).await?;
+            xds::serve(db, args).await
         }
         Command::Agent(args) => {
             info!("starting agent command");
-            db::migrate(&db).await?;
-            firewall::ensure_builtin_policy(&db, firewall::DEFAULT_POLICY_NAME).await?;
-            sync::run_agent(db, args).await
+            sync::run_agent(args).await
         }
         Command::SyncOnce(args) => {
             info!("starting sync-once command");
-            db::migrate(&db).await?;
-            firewall::ensure_builtin_policy(&db, firewall::DEFAULT_POLICY_NAME).await?;
-            sync::sync_once(db, args).await
+            sync::sync_once(args).await
         }
         Command::Policy { command } => match command {
             PolicyCommand::SeedExample(args) => {
+                let db = db::connect(&cli.database_url).await?;
                 db::migrate(&db).await?;
                 firewall::seed_example_policy(&db, args).await
             }
             PolicyCommand::Show(args) => {
+                let db = db::connect(&cli.database_url).await?;
                 db::migrate(&db).await?;
                 firewall::ensure_builtin_policy(&db, firewall::DEFAULT_POLICY_NAME).await?;
                 firewall::show_policy(&db, args).await

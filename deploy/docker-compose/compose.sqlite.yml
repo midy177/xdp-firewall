@@ -4,12 +4,14 @@ services:
     environment:
       DATABASE_URL: sqlite:///var/lib/xdp-firewall/xdp-firewall.db?mode=rwc
       XDP_FIREWALL_API_TOKEN: ${XDP_FIREWALL_API_TOKEN:?set XDP_FIREWALL_API_TOKEN to enable API authentication}
+      XDP_FIREWALL_AGENT_TOKEN: ${XDP_FIREWALL_AGENT_TOKEN:?set XDP_FIREWALL_AGENT_TOKEN to authenticate agents}
       XDP_FIREWALL_TRUSTED_CIDRS: ${XDP_FIREWALL_TRUSTED_CIDRS:-}
       RUST_LOG: ${RUST_LOG:-xdp_firewall=info}
     volumes:
       - ./sqlite-data:/var/lib/xdp-firewall
     ports:
       - "${XDP_FIREWALL_API_PORT:-8080}:8080"
+      - "${XDP_FIREWALL_XDS_PORT:-50051}:50051"
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health || exit 1"]
       interval: 10s
@@ -24,11 +26,11 @@ services:
     privileged: true
     pid: host
     environment:
-      DATABASE_URL: sqlite:///var/lib/xdp-firewall/xdp-firewall.db?mode=rwc
+      XDP_FIREWALL_XDS_URL: ${XDP_FIREWALL_XDS_URL:-http://127.0.0.1:50051}
+      XDP_FIREWALL_AGENT_TOKEN: ${XDP_FIREWALL_AGENT_TOKEN:?set XDP_FIREWALL_AGENT_TOKEN to authenticate agents}
       XDP_FIREWALL_XDP_MODE: ${XDP_FIREWALL_XDP_MODE:-auto}
       RUST_LOG: ${RUST_LOG:-xdp_firewall=info}
     volumes:
-      - ./sqlite-data:/var/lib/xdp-firewall
       - /sys/fs/bpf:/sys/fs/bpf
     command:
       - agent

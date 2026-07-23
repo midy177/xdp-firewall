@@ -1,11 +1,21 @@
 use std::{
     env,
+    error::Error,
     fs::{self, File},
-    io::{self, Write},
+    io::Write,
     path::{Path, PathBuf},
 };
 
-fn main() -> io::Result<()> {
+fn main() -> Result<(), Box<dyn Error>> {
+    println!("cargo:rerun-if-changed=proto/xdp_firewall/xds/v1/control.proto");
+    let protoc = protoc_bin_vendored::protoc_bin_path()?;
+    // SAFETY: this build script sets PROTOC before prost/tonic reads it.
+    unsafe {
+        env::set_var("PROTOC", protoc);
+    }
+    tonic_build::configure()
+        .compile_protos(&["proto/xdp_firewall/xds/v1/control.proto"], &["proto"])?;
+
     println!("cargo:rerun-if-changed=frontend/dist/index.html");
     println!("cargo:rerun-if-changed=frontend/dist/assets");
 

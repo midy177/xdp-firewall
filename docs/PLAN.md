@@ -1,5 +1,16 @@
 # XDP Firewall Plan
 
+## Active Plan
+
+- [completed] Add gRPC xDS control-plane support.
+- [completed] Change xDS policy delivery from agent polling to server-side streaming push.
+- [completed] Add control-plane push frequency control.
+- [completed] Change agent to subscribe to xDS and remove direct DB access.
+- [completed] Auto-allow control-plane IPs locally on agents before applying policy.
+- [completed] Update Docker Compose, Kubernetes, README, and deployment docs for xDS.
+- [completed] Merge API and xDS into one default control-plane service while keeping `xds` as an optional standalone command.
+- [completed] Re-validate frontend build, Rust tests, clippy, and release packaging after the merged control-plane change.
+
 ## Completed
 
 - Implemented a distributed XDP firewall control plane backed by SQLite, PostgreSQL, or MySQL.
@@ -71,6 +82,13 @@
   - `DELETE /trusted-cidrs/{id}`
 - Added `api --trusted-cidr` / `XDP_FIREWALL_TRUSTED_CIDRS` persistence into `firewall_trusted_cidrs`.
 - Removed `--trusted-cidr` / `XDP_FIREWALL_TRUSTED_CIDRS` from `agent` and `sync-once` so agents do not mutate whitelist configuration.
+- Added gRPC xDS policy delivery.
+- Changed the default control plane so `api` serves both Axum HTTP/UI and gRPC xDS.
+- Added `api --xds-bind`, `api --xds-push-interval-seconds`, and `api --agent-token`.
+- Kept `xds` as an optional standalone command for debugging or explicitly split deployments.
+- Changed `agent` and `sync-once` to fetch policy snapshots from xDS instead of connecting to the database.
+- Added agent-side local allow rules for resolved xDS controller IPs before policy compilation.
+- Updated Docker Compose and Kubernetes templates so only the API service uses `DATABASE_URL`; agents use `XDP_FIREWALL_XDS_URL` and `XDP_FIREWALL_AGENT_TOKEN`.
 - Changed country defense frontend to only show country code and allow/deny action.
 - Added backend country list endpoint:
   - `GET /countries`
@@ -112,6 +130,7 @@
 ## Remaining Tasks
 
 - Optionally add deeper integration tests for dynamic defense API persistence.
+- Retry `make docker-build IMAGE_REPO=1228022817/xdp-firewall` when Docker Hub is healthy. The code build, frontend build, and zigbuild steps pass; Docker image creation is currently blocked by Docker Hub returning `Bad Gateway` while resolving `debian:bookworm-slim`.
 
 ## Validation Commands
 

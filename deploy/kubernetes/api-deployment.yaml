@@ -33,6 +33,11 @@ spec:
                 secretKeyRef:
                   name: xdp-firewall-db
                   key: api_token
+            - name: XDP_FIREWALL_AGENT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: xdp-firewall-db
+                  key: agent_token
             - name: XDP_FIREWALL_TRUSTED_CIDRS
               value: ""
             - name: RUST_LOG
@@ -40,6 +45,8 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+            - name: grpc
+              containerPort: 50051
           resources:
             requests:
               cpu: 50m
