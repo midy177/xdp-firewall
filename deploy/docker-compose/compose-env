@@ -1,0 +1,31 @@
+# Docker Compose parameters for xdp-firewall.
+# Use with:
+# docker compose --env-file deploy/docker-compose/compose-env -f deploy/docker-compose/compose.sqlite.yml up -d
+
+XDP_FIREWALL_IMAGE=1228022817/xdp-firewall:0.1.0
+
+# Required. Change both tokens before exposing the service.
+XDP_FIREWALL_API_TOKEN=change-this-api-token
+XDP_FIREWALL_AGENT_TOKEN=change-this-agent-token
+
+# Host ports exposed by the API control-plane service.
+XDP_FIREWALL_API_PORT=8080
+XDP_FIREWALL_XDS_PORT=50051
+
+# Agent connection to the embedded xDS endpoint.
+# For the bundled host-network agent on the same server, 127.0.0.1 is correct.
+XDP_FIREWALL_XDS_URL=http://127.0.0.1:50051
+
+# Multiple trusted CIDRs are comma-separated. Do not use spaces.
+# These CIDRs skip global ip_rate_limit and flood, but still go through firewall,
+# threat intelligence, and country allow/deny rules.
+# Example: XDP_FIREWALL_TRUSTED_CIDRS=10.0.0.0/8,192.168.0.0/16,203.0.113.10/32
+XDP_FIREWALL_TRUSTED_CIDRS=
+
+# xDS control plane checks policy versions at this cadence.
+XDP_FIREWALL_XDS_PUSH_INTERVAL_SECONDS=5
+
+# XDP attach mode: auto, driver, or skb.
+XDP_FIREWALL_XDP_MODE=auto
+
+RUST_LOG=xdp_firewall=info

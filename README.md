@@ -7,6 +7,7 @@ Each server runs the same agent. A single firewall policy is stored in SQLite, P
 ## Quick Start
 
 ```bash
+export DATABASE_URL='sqlite://xdp-firewall.db?mode=rwc'
 cargo run -- migrate
 cargo run -- policy seed-example
 XDP_FIREWALL_API_TOKEN='change-this-token' \
@@ -20,6 +21,7 @@ PostgreSQL works with a `postgres://user:pass@host:5432/db` URL. MySQL works wit
 ## API
 
 ```bash
+export DATABASE_URL='sqlite://xdp-firewall.db?mode=rwc'
 cargo run -- migrate
 XDP_FIREWALL_API_TOKEN='change-this-token' \
 XDP_FIREWALL_AGENT_TOKEN='change-this-agent-token' \
@@ -114,6 +116,12 @@ Equivalent environment form:
 XDP_FIREWALL_TRUSTED_CIDRS=10.0.0.0/8,192.168.0.0/16 xdp-firewall api
 ```
 
+For Docker Compose, put the same comma-separated value in `deploy/docker-compose/compose-env` or your copied local env file:
+
+```dotenv
+XDP_FIREWALL_TRUSTED_CIDRS=10.0.0.0/8,192.168.0.0/16,203.0.113.10/32
+```
+
 The same whitelist can be managed through:
 
 - `GET /trusted-cidrs`
@@ -137,6 +145,8 @@ Trusted CIDRs skip these global dynamic defense checks. Configure dynamic defens
 Use `agent` for persistent enforcement. The agent does not connect to the configuration database. It subscribes to the xDS control plane configured by `--control-url` or `XDP_FIREWALL_XDS_URL`; authenticate it with `--agent-token` or `XDP_FIREWALL_AGENT_TOKEN`.
 
 `sync-once` fetches one policy snapshot from xDS, applies it, then exits; on Linux this means the process no longer owns the XDP attachment. It is useful for validation workflows, not for keeping a node protected.
+
+Do not use `xdp-firewall policy show` inside an agent-only container to inspect the applied policy. `policy show` is a database command, while agent containers intentionally do not receive `DATABASE_URL`. Use the API container, the `GET /policy` API, or the agent apply log instead.
 
 The control plane controls push cadence with `xdp-firewall api --xds-push-interval-seconds 5`. Agents do not poll the database. They keep a streaming gRPC subscription open and apply updates when xDS pushes a newer version. Heartbeats still run from the agent to xDS with `--heartbeat-seconds`.
 
@@ -171,7 +181,23 @@ The BPF object has conservative built-in defaults, and the agent can override ma
 - `--country-map-entries` / `XDP_FIREWALL_COUNTRY_MAP_ENTRIES`, default `676`.
 - `--rate-map-entries` / `XDP_FIREWALL_RATE_MAP_ENTRIES`, default `1048576`.
 
-These sizes are chosen at XDP load time. To change them on a running node, restart the agent so the eBPF maps are recreated with the new capacity.
+Default capacity and approximate key/value payload:
+
+| Map | Default entries | Purpose | Approximate key/value payload |
+| --- | ---: | --- | ---: |
+| `rule_cidrs` | `262144` | Ordinary firewall CIDR rules | `8 MiB` |
+| `geo_cidrs` | `262144` | Country CIDR prefixes | `6.5 MiB` |
+| `trusted_cidrs` | `4096` | Trusted CIDR whitelist for global dynamic defense | `0.1 MiB` |
+| `country_rules` | `676` | Country-code allow/deny actions | A few KiB |
+| `defense_policy` | `1` | Global dynamic defense configuration | Negligible |
+| `rate_buckets` | `1048576` | Per-source-IP `ip_rate_limit` and `flood` token buckets | `46-48 MiB` |
+| `stats` | `5` | Per-CPU counters | Negligible |
+
+The payload estimates count only the BPF key/value structs. Actual kernel memory is higher because hash tables, LRU bookkeeping, allocator rounding, per-CPU storage, and map metadata add overhead.
+
+`rule_cidrs`, `geo_cidrs`, and `trusted_cidrs` are LPM trie maps with `BPF_F_NO_PREALLOC`, so they grow with inserted prefixes instead of allocating the full capacity at startup. `rate_buckets` is the main memory driver because it can hold up to `XDP_FIREWALL_RATE_MAP_ENTRIES` source-IP state entries for dynamic defense.
+
+Default Docker Compose deployments do not set these variables. Keep the defaults unless an agent reports a map capacity error or the deployment has a measured memory target that requires explicit sizing. These sizes are chosen at XDP load time; changing them requires restarting the agent so the eBPF maps are recreated with the new capacity.
 
 ## Packaging
 
@@ -200,7 +226,7 @@ docker run --rm --privileged --net host \
   -e XDP_FIREWALL_API_TOKEN='change-this-token' \
   -v xdp-firewall-data:/var/lib/xdp-firewall \
   1228022817/xdp-firewall:0.1.0 \
-  --database-url 'sqlite:///var/lib/xdp-firewall/xdp-firewall.db?mode=rwc' api
+  api --database-url 'sqlite:///var/lib/xdp-firewall/xdp-firewall.db?mode=rwc'
 ```
 
 ## Deployment

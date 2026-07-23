@@ -8,33 +8,39 @@ use crate::xdp::{
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 pub struct Cli {
-    #[arg(
-        long,
-        env = "DATABASE_URL",
-        default_value = "sqlite://xdp-firewall.db?mode=rwc",
-        help = "SQLite, PostgreSQL, or MySQL URL, for example sqlite://xdp-firewall.db?mode=rwc, postgres://..., or mysql://..."
-    )]
-    pub database_url: String,
-
     #[command(subcommand)]
     pub command: Command,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    Migrate,
+    Migrate(DatabaseArgs),
     Api(ApiArgs),
     Xds(XdsArgs),
     Agent(AgentArgs),
     SyncOnce(SyncOnceArgs),
     Policy {
+        #[command(flatten)]
+        database: DatabaseArgs,
         #[command(subcommand)]
         command: PolicyCommand,
     },
 }
 
 #[derive(Debug, Args, Clone)]
+pub struct DatabaseArgs {
+    #[arg(
+        long,
+        env = "DATABASE_URL",
+        help = "SQLite, PostgreSQL, or MySQL URL required by control-plane database commands, for example sqlite://xdp-firewall.db?mode=rwc, postgres://..., or mysql://..."
+    )]
+    pub database_url: String,
+}
+
+#[derive(Debug, Args, Clone)]
 pub struct ApiArgs {
+    #[command(flatten)]
+    pub database: DatabaseArgs,
     #[arg(long, default_value = "0.0.0.0:8080")]
     pub bind: String,
     #[arg(
@@ -46,6 +52,7 @@ pub struct ApiArgs {
     pub xds_bind: String,
     #[arg(
         long,
+        env = "XDP_FIREWALL_XDS_PUSH_INTERVAL_SECONDS",
         default_value_t = 5,
         help = "Minimum xDS policy push interval in seconds. The control plane checks for changed policy versions at this cadence."
     )]
@@ -68,10 +75,13 @@ pub struct ApiArgs {
 
 #[derive(Debug, Args, Clone)]
 pub struct XdsArgs {
+    #[command(flatten)]
+    pub database: DatabaseArgs,
     #[arg(long, default_value = "0.0.0.0:50051")]
     pub bind: String,
     #[arg(
         long,
+        env = "XDP_FIREWALL_XDS_PUSH_INTERVAL_SECONDS",
         default_value_t = 5,
         help = "Minimum xDS policy push interval in seconds. The control plane checks for changed policy versions at this cadence."
     )]
@@ -133,30 +143,35 @@ pub struct AgentArgs {
     #[arg(
         long,
         env = "XDP_FIREWALL_RULE_MAP_ENTRIES",
+        hide = true,
         default_value_t = DEFAULT_RULE_MAP_ENTRIES
     )]
     pub rule_map_entries: u32,
     #[arg(
         long,
         env = "XDP_FIREWALL_GEO_MAP_ENTRIES",
+        hide = true,
         default_value_t = DEFAULT_GEO_MAP_ENTRIES
     )]
     pub geo_map_entries: u32,
     #[arg(
         long,
         env = "XDP_FIREWALL_TRUSTED_MAP_ENTRIES",
+        hide = true,
         default_value_t = DEFAULT_TRUSTED_MAP_ENTRIES
     )]
     pub trusted_map_entries: u32,
     #[arg(
         long,
         env = "XDP_FIREWALL_COUNTRY_MAP_ENTRIES",
+        hide = true,
         default_value_t = DEFAULT_COUNTRY_MAP_ENTRIES
     )]
     pub country_map_entries: u32,
     #[arg(
         long,
         env = "XDP_FIREWALL_RATE_MAP_ENTRIES",
+        hide = true,
         default_value_t = DEFAULT_RATE_MAP_ENTRIES
     )]
     pub rate_map_entries: u32,
@@ -203,30 +218,35 @@ pub struct SyncOnceArgs {
     #[arg(
         long,
         env = "XDP_FIREWALL_RULE_MAP_ENTRIES",
+        hide = true,
         default_value_t = DEFAULT_RULE_MAP_ENTRIES
     )]
     pub rule_map_entries: u32,
     #[arg(
         long,
         env = "XDP_FIREWALL_GEO_MAP_ENTRIES",
+        hide = true,
         default_value_t = DEFAULT_GEO_MAP_ENTRIES
     )]
     pub geo_map_entries: u32,
     #[arg(
         long,
         env = "XDP_FIREWALL_TRUSTED_MAP_ENTRIES",
+        hide = true,
         default_value_t = DEFAULT_TRUSTED_MAP_ENTRIES
     )]
     pub trusted_map_entries: u32,
     #[arg(
         long,
         env = "XDP_FIREWALL_COUNTRY_MAP_ENTRIES",
+        hide = true,
         default_value_t = DEFAULT_COUNTRY_MAP_ENTRIES
     )]
     pub country_map_entries: u32,
     #[arg(
         long,
         env = "XDP_FIREWALL_RATE_MAP_ENTRIES",
+        hide = true,
         default_value_t = DEFAULT_RATE_MAP_ENTRIES
     )]
     pub rate_map_entries: u32,

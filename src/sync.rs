@@ -246,7 +246,9 @@ async fn apply_latest(
 ) -> Result<i64> {
     let policy = firewall::DEFAULT_POLICY_NAME;
     add_control_plane_allow_rules(&mut snapshot, control_url).await?;
+    log_policy_snapshot_summary(policy, expected_version, &snapshot);
     let compiled = firewall::compile_policy(&snapshot).await?;
+    log_compiled_policy_summary(policy, expected_version, &compiled);
     xdp.apply(&compiled)?;
     info!(
         policy,
@@ -255,6 +257,49 @@ async fn apply_latest(
         "applied firewall policy"
     );
     Ok(compiled.version)
+}
+
+fn log_policy_snapshot_summary(
+    policy: &str,
+    expected_version: i64,
+    snapshot: &firewall::PolicySnapshot,
+) {
+    let dynamic = &snapshot.dynamic_defense;
+    info!(
+        policy,
+        expected_version,
+        rules = snapshot.rules.len(),
+        geo_countries = snapshot.geo_countries.len(),
+        trusted_cidrs = snapshot.trusted_cidrs.len(),
+        threat_sources = snapshot.threat_sources.len(),
+        dynamic_defense_enabled = dynamic.enabled,
+        ip_rate_limit_enabled = dynamic.ip_rate_limit_enabled,
+        ip_packets_per_second = dynamic.ip_packets_per_second,
+        ip_burst = dynamic.ip_burst,
+        flood_enabled = dynamic.flood_enabled,
+        flood_packets_per_second = dynamic.flood_packets_per_second,
+        flood_burst = dynamic.flood_burst,
+        flood_block_seconds = dynamic.flood_block_seconds,
+        "received xDS policy snapshot"
+    );
+}
+
+fn log_compiled_policy_summary(
+    policy: &str,
+    expected_version: i64,
+    compiled: &firewall::CompiledPolicy,
+) {
+    info!(
+        policy,
+        expected_version,
+        compiled_version = compiled.version,
+        rule_prefixes = compiled.rules.len(),
+        geo_prefixes = compiled.geo_prefixes.len(),
+        country_rules = compiled.country_rules.len(),
+        trusted_prefixes = compiled.trusted_prefixes.len(),
+        threat_prefixes = compiled.threat_prefixes.len(),
+        "compiled xDS policy for XDP maps"
+    );
 }
 
 async fn add_control_plane_allow_rules(

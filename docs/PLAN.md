@@ -10,6 +10,14 @@
 - [completed] Update Docker Compose, Kubernetes, README, and deployment docs for xDS.
 - [completed] Merge API and xDS into one default control-plane service while keeping `xds` as an optional standalone command.
 - [completed] Re-validate frontend build, Rust tests, clippy, and release packaging after the merged control-plane change.
+- [completed] Add Docker Compose env template and document comma-separated trusted CIDR configuration.
+- [completed] Keep default Compose configuration from exposing BPF map capacity tuning; document map sizing as advanced defaults only.
+- [completed] Document that `policy show` is a control-plane database command, not an agent applied-policy inspection command.
+- [completed] Add agent-side xDS policy snapshot summary logs with trusted CIDR and dynamic defense counts.
+- [completed] Remove default database fallback from the CLI and stop exporting `DATABASE_URL` in agent container entrypoint paths.
+- [completed] Move `--database-url` off the global CLI so `agent --help` does not show DB configuration.
+- [completed] Keep Compose trusted CIDR template empty by default to avoid inserting example prefixes into real policy.
+- [completed] Hide advanced agent map capacity flags from normal help output while keeping env/CLI overrides available.
 
 ## Completed
 

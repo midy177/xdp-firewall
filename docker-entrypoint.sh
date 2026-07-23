@@ -1,11 +1,10 @@
 #!/bin/sh
 set -eu
 
-: "${DATABASE_URL:=sqlite:///var/lib/xdp-firewall/xdp-firewall.db?mode=rwc}"
+DEFAULT_DATABASE_URL="sqlite:///var/lib/xdp-firewall/xdp-firewall.db?mode=rwc"
 : "${API_BIND:=0.0.0.0:8080}"
 : "${XDS_BIND:=0.0.0.0:50051}"
 : "${RUST_LOG:=xdp_firewall=info}"
-export DATABASE_URL
 export RUST_LOG
 
 if [ -n "${XDP_FIREWALL_API_TOKEN:-}" ]; then
@@ -15,6 +14,8 @@ else
 fi
 
 if [ "$#" -eq 0 ]; then
+    : "${DATABASE_URL:=$DEFAULT_DATABASE_URL}"
+    export DATABASE_URL
     echo "xdp-firewall entrypoint: command=api bind=${API_BIND} xds_bind=${XDS_BIND} api_token_configured=${API_TOKEN_CONFIGURED} rust_log=${RUST_LOG}"
     /usr/local/bin/xdp-firewall migrate
     exec /usr/local/bin/xdp-firewall api --bind "$API_BIND" --xds-bind "$XDS_BIND"
@@ -24,13 +25,20 @@ echo "xdp-firewall entrypoint: command=$1 api_token_configured=${API_TOKEN_CONFI
 
 case "$1" in
     xds)
+        : "${DATABASE_URL:=$DEFAULT_DATABASE_URL}"
+        export DATABASE_URL
         shift
         if [ "$#" -eq 0 ]; then
             exec /usr/local/bin/xdp-firewall xds --bind "$XDS_BIND"
         fi
         exec /usr/local/bin/xdp-firewall xds "$@"
         ;;
-    migrate|api|agent|sync-once|policy|help|-h|--help|-V|--version|--database-url)
+    migrate|api|policy)
+        : "${DATABASE_URL:=$DEFAULT_DATABASE_URL}"
+        export DATABASE_URL
+        exec /usr/local/bin/xdp-firewall "$@"
+        ;;
+    agent|sync-once|help|-h|--help|-V|--version|--database-url)
         exec /usr/local/bin/xdp-firewall "$@"
         ;;
     *)

@@ -6,27 +6,30 @@ Single-node SQLite:
 
 ```bash
 make docker-build
-export XDP_FIREWALL_API_TOKEN='change-this-token'
-export XDP_FIREWALL_AGENT_TOKEN='change-this-agent-token'
-docker compose -f deploy/docker-compose/compose.sqlite.yml up -d
+cp deploy/docker-compose/compose-env deploy/docker-compose/compose-env.local
+vi deploy/docker-compose/compose-env.local
+docker compose --env-file deploy/docker-compose/compose-env.local \
+  -f deploy/docker-compose/compose.sqlite.yml up -d
 ```
 
 PostgreSQL-backed deployment:
 
 ```bash
 make docker-build
-export XDP_FIREWALL_API_TOKEN='change-this-token'
-export XDP_FIREWALL_AGENT_TOKEN='change-this-agent-token'
-docker compose -f deploy/docker-compose/compose.postgres.yml up -d
+cp deploy/docker-compose/compose-env deploy/docker-compose/compose-env.local
+vi deploy/docker-compose/compose-env.local
+docker compose --env-file deploy/docker-compose/compose-env.local \
+  -f deploy/docker-compose/compose.postgres.yml up -d
 ```
 
 Agent pointed at an external xDS control plane:
 
 ```bash
-XDP_FIREWALL_XDS_URL=http://control-plane-host:50051 \
-XDP_FIREWALL_AGENT_TOKEN='change-this-agent-token' \
-docker compose -f deploy/docker-compose/compose.agent.yml up -d
+docker compose --env-file deploy/docker-compose/compose-env.local \
+  -f deploy/docker-compose/compose.agent.yml up -d
 ```
+
+Set `XDP_FIREWALL_XDS_URL` in `compose-env.local` to the reachable control-plane address before starting an external agent.
 
 Seed the example firewall policy through the API:
 
@@ -36,6 +39,34 @@ curl -X POST http://127.0.0.1:8080/policy/seed-example \
 ```
 
 The API control-plane service writes configuration to the database and also exposes gRPC xDS on port `50051`. Agents subscribe to that xDS endpoint. The agent service uses host networking, privileged mode, and `/sys/fs/bpf` from the host so XDP can attach to the selected network interface. Agents do not need database credentials.
+
+Run `xdp-firewall policy show` only in the API/control-plane container or in a shell that has the same `DATABASE_URL`. The agent container intentionally does not receive database credentials, and database commands require an explicit `DATABASE_URL` or `--database-url`. To inspect the live policy through the control plane, use:
+
+```bash
+docker compose --env-file deploy/docker-compose/compose-env.local \
+  -f deploy/docker-compose/compose.sqlite.yml exec api xdp-firewall policy show
+```
+
+or the authenticated API:
+
+```bash
+curl http://127.0.0.1:8080/policy \
+  -H "authorization: Bearer $XDP_FIREWALL_API_TOKEN"
+```
+
+Agent logs print a policy snapshot summary each time xDS pushes and the agent applies a version, including `trusted_cidrs`, rule counts, threat source count, and dynamic defense settings.
+
+`XDP_FIREWALL_TRUSTED_CIDRS` accepts multiple CIDRs as a comma-separated value in `compose-env.local`, with no spaces:
+
+```dotenv
+XDP_FIREWALL_TRUSTED_CIDRS=10.0.0.0/8,192.168.0.0/16,203.0.113.10/32
+```
+
+This is equivalent to starting the API with repeated clap flags:
+
+```bash
+xdp-firewall api --trusted-cidr 10.0.0.0/8 --trusted-cidr 192.168.0.0/16 --trusted-cidr 203.0.113.10/32
+```
 
 ## Kubernetes
 
@@ -76,6 +107,6 @@ Notes:
 - The agent resolves the configured xDS host and adds local in-memory allow rules for those controller IPs before applying each policy snapshot. The current XDP program is ingress-only, so egress from the agent to the controller is not limited by this firewall.
 - XDP attach mode can be set with `XDP_FIREWALL_XDP_MODE=auto|driver|skb`. Use `skb` on AWS ENA instances with jumbo MTU if native driver XDP reports that the MTU is too large.
 - Trusted source prefixes can be initialized on `api` with `--trusted-cidr` or `XDP_FIREWALL_TRUSTED_CIDRS` and then managed through the API/frontend; agents only read and apply them. Trusted prefixes skip global `ip_rate_limit` and `flood`, but still go through firewall, threat, and country allow/deny decisions.
-- XDP map sizes can be tuned with `XDP_FIREWALL_RULE_MAP_ENTRIES`, `XDP_FIREWALL_GEO_MAP_ENTRIES`, `XDP_FIREWALL_TRUSTED_MAP_ENTRIES`, `XDP_FIREWALL_COUNTRY_MAP_ENTRIES`, and `XDP_FIREWALL_RATE_MAP_ENTRIES`.
+- XDP map sizes have built-in defaults. Do not set map capacity variables unless an agent reports a map capacity error or you have a measured memory target.
 - Nodes must have bpffs mounted at `/sys/fs/bpf`.
 - Use PostgreSQL/MySQL for multi-node Kubernetes deployments. SQLite is only appropriate for a single server.
