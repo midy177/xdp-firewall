@@ -1,6 +1,8 @@
 use crate::firewall::CompiledPolicy;
 #[cfg(target_os = "linux")]
-use crate::firewall::{L4Protocol, RuleAction, XdpCountryRule, XdpGeoPrefix, XdpPrefixRule};
+use crate::firewall::{
+    L4Protocol, RuleAction, XdpCountryRule, XdpDynamicDefense, XdpGeoPrefix, XdpPrefixRule,
+};
 use anyhow::{Result, bail};
 #[cfg(target_os = "linux")]
 use std::net::IpAddr;
@@ -10,6 +12,23 @@ pub const DEFAULT_GEO_MAP_ENTRIES: u32 = 262_144;
 pub const DEFAULT_TRUSTED_MAP_ENTRIES: u32 = 4_096;
 pub const DEFAULT_COUNTRY_MAP_ENTRIES: u32 = 676;
 pub const DEFAULT_RATE_MAP_ENTRIES: u32 = 1_048_576;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum XdpAttachMode {
+    Auto,
+    Driver,
+    Skb,
+}
+
+impl XdpAttachMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Driver => "driver",
+            Self::Skb => "skb",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct XdpMapSizes {
@@ -74,6 +93,7 @@ impl XdpManager {
         object_path: &str,
         program_name: &str,
         map_sizes: XdpMapSizes,
+        attach_mode: XdpAttachMode,
     ) -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
@@ -85,12 +105,13 @@ impl XdpManager {
                     object_path,
                     program_name,
                     map_sizes,
+                    attach_mode,
                 )?,
             });
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (interface, object_path, program_name, map_sizes);
+            let _ = (interface, object_path, program_name, map_sizes, attach_mode);
             Ok(Self {})
         }
     }
@@ -178,11 +199,14 @@ mod linux {
     use anyhow::{Context, bail};
     use aya::{
         Ebpf, EbpfLoader, Pod,
-        maps::{HashMap as AyaHashMap, LpmTrie, MapData, lpm_trie::Key as LpmKey},
+        maps::{
+            Array as AyaArray, HashMap as AyaHashMap, LpmTrie, MapData, lpm_trie::Key as LpmKey,
+        },
         programs::{Xdp, XdpMode},
     };
     use std::collections::HashSet;
     use std::path::Path;
+    use tracing::info;
 
     pub struct LinuxXdpManager {
         interface: String,
@@ -191,6 +215,7 @@ mod linux {
         geo_cidrs: LpmTrie<MapData, GeoData, GeoValue>,
         trusted_cidrs: LpmTrie<MapData, TrustedData, TrustedValue>,
         country_rules: AyaHashMap<MapData, u32, CountryValue>,
+        defense_policy: AyaArray<MapData, DefenseValue>,
         rule_keys: Vec<RuleKey>,
         geo_keys: Vec<GeoKey>,
         trusted_keys: Vec<TrustedKey>,
@@ -245,8 +270,20 @@ mod linux {
     #[repr(C)]
     struct CountryValue {
         action: u8,
-        packets_per_second: u32,
-        burst: u32,
+    }
+
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    struct DefenseValue {
+        enabled: u8,
+        ip_rate_limit_enabled: u8,
+        flood_enabled: u8,
+        pad: u8,
+        ip_packets_per_second: u32,
+        ip_burst: u32,
+        flood_packets_per_second: u32,
+        flood_burst: u32,
+        flood_block_ns: u64,
     }
 
     #[derive(Clone, Copy)]
@@ -261,6 +298,7 @@ mod linux {
     unsafe impl Pod for RuleValue {}
     unsafe impl Pod for GeoValue {}
     unsafe impl Pod for CountryValue {}
+    unsafe impl Pod for DefenseValue {}
     unsafe impl Pod for TrustedValue {}
 
     impl LinuxXdpManager {
@@ -269,6 +307,7 @@ mod linux {
             object_path: &str,
             program_name: &str,
             map_sizes: XdpMapSizes,
+            attach_mode: XdpAttachMode,
         ) -> Result<Self> {
             if !Path::new(object_path).exists() {
                 bail!("XDP object '{}' does not exist", object_path);
@@ -289,11 +328,7 @@ mod linux {
                 .try_into()
                 .with_context(|| format!("program '{program_name}' is not XDP"))?;
             program.load().context("failed to load XDP program")?;
-            if let Err(driver_err) = program.attach(interface, XdpMode::Driver) {
-                program.attach(interface, XdpMode::Skb).with_context(|| {
-                    format!("driver XDP attach failed ({driver_err:#}); skb attach failed")
-                })?;
-            }
+            attach_program(program, interface, attach_mode)?;
             let rule_cidrs = ebpf
                 .take_map("rule_cidrs")
                 .context("missing XDP map 'rule_cidrs'")?
@@ -314,6 +349,11 @@ mod linux {
                 .context("missing XDP map 'trusted_cidrs'")?
                 .try_into()
                 .context("XDP map 'trusted_cidrs' has unexpected type")?;
+            let defense_policy = ebpf
+                .take_map("defense_policy")
+                .context("missing XDP map 'defense_policy'")?
+                .try_into()
+                .context("XDP map 'defense_policy' has unexpected type")?;
 
             Ok(Self {
                 interface: interface.to_string(),
@@ -322,6 +362,7 @@ mod linux {
                 geo_cidrs,
                 trusted_cidrs,
                 country_rules,
+                defense_policy,
                 rule_keys: Vec::new(),
                 geo_keys: Vec::new(),
                 trusted_keys: Vec::new(),
@@ -345,6 +386,7 @@ mod linux {
             let mut new_country_keys = Vec::new();
             let mut new_country_ids = HashSet::new();
 
+            self.put_dynamic_defense(&policy.dynamic_defense)?;
             for prefix in &policy.trusted_prefixes {
                 let key = trusted_key(prefix.addr, prefix.prefix);
                 let id = trusted_key_id(&key);
@@ -391,6 +433,25 @@ mod linux {
             self.geo_keys = new_geo_keys;
             self.trusted_keys = new_trusted_keys;
             self.country_keys = new_country_keys;
+            Ok(())
+        }
+
+        fn put_dynamic_defense(&mut self, policy: &XdpDynamicDefense) -> Result<()> {
+            self.defense_policy.set(
+                0,
+                DefenseValue {
+                    enabled: u8::from(policy.enabled),
+                    ip_rate_limit_enabled: u8::from(policy.ip_rate_limit_enabled),
+                    flood_enabled: u8::from(policy.flood_enabled),
+                    pad: 0,
+                    ip_packets_per_second: policy.ip_packets_per_second,
+                    ip_burst: policy.ip_burst,
+                    flood_packets_per_second: policy.flood_packets_per_second,
+                    flood_burst: policy.flood_burst,
+                    flood_block_ns: u64::from(policy.flood_block_seconds) * 1_000_000_000,
+                },
+                0,
+            )?;
             Ok(())
         }
 
@@ -465,8 +526,6 @@ mod linux {
                 key,
                 CountryValue {
                     action: action_code(country.action),
-                    packets_per_second: country.packets_per_second,
-                    burst: country.burst,
                 },
                 0,
             )?;
@@ -502,6 +561,43 @@ mod linux {
             }
             Ok(())
         }
+    }
+
+    fn attach_program(
+        program: &mut Xdp,
+        interface: &str,
+        attach_mode: XdpAttachMode,
+    ) -> Result<()> {
+        match attach_mode {
+            XdpAttachMode::Auto => {
+                if let Err(driver_err) = program.attach(interface, XdpMode::Driver) {
+                    info!(
+                        interface,
+                        error = %driver_err,
+                        "driver XDP attach unavailable; using skb mode"
+                    );
+                    program.attach(interface, XdpMode::Skb).with_context(|| {
+                        format!("driver XDP attach failed ({driver_err:#}); skb attach failed")
+                    })?;
+                    info!(interface, mode = "skb", "XDP program attached");
+                } else {
+                    info!(interface, mode = "driver", "XDP program attached");
+                }
+            }
+            XdpAttachMode::Driver => {
+                program
+                    .attach(interface, XdpMode::Driver)
+                    .context("failed to attach XDP program in driver mode")?;
+                info!(interface, mode = "driver", "XDP program attached");
+            }
+            XdpAttachMode::Skb => {
+                program
+                    .attach(interface, XdpMode::Skb)
+                    .context("failed to attach XDP program in skb mode")?;
+                info!(interface, mode = "skb", "XDP program attached");
+            }
+        }
+        Ok(())
     }
 
     fn rule_key(addr: IpAddr, prefix: u8, protocol: L4Protocol, port: u16) -> RuleKey {

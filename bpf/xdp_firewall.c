@@ -25,8 +25,12 @@ enum stat_index {
     STAT_RULE_DROP = 1,
     STAT_GEO_DROP = 2,
     STAT_RATE_DROP = 3,
-    STAT_MAX = 4,
+    STAT_FLOOD_DROP = 4,
+    STAT_MAX = 5,
 };
+
+#define RATE_KIND_IP 2
+#define RATE_KIND_FLOOD 3
 
 struct rule_key {
     __u32 prefixlen;
@@ -61,20 +65,33 @@ struct geo_value {
 
 struct country_value {
     __u8 action;
-    __u32 packets_per_second;
-    __u32 burst;
+};
+
+struct defense_value {
+    __u8 enabled;
+    __u8 ip_rate_limit_enabled;
+    __u8 flood_enabled;
+    __u8 pad;
+    __u32 ip_packets_per_second;
+    __u32 ip_burst;
+    __u32 flood_packets_per_second;
+    __u32 flood_burst;
+    __u64 flood_block_ns;
 };
 
 struct rate_key {
-    __u16 country;
+    __u8 kind;
     __u8 family;
     __u8 proto;
+    __u8 pad;
+    __u16 country;
     __u8 addr[16];
 };
 
 struct rate_bucket {
     __u64 tokens;
     __u64 updated_ns;
+    __u64 blocked_until_ns;
 };
 
 struct ipv6_fragment_header {
@@ -114,6 +131,13 @@ struct {
     __type(key, __u32);
     __type(value, struct country_value);
 } country_rules SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct defense_value);
+} defense_policy SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -229,12 +253,13 @@ static __always_inline __u8 *lookup_trusted(__u8 family, __u8 addr[16])
     return bpf_map_lookup_elem(&trusted_cidrs, &key);
 }
 
-static __always_inline int country_rate_limited(__u16 country, __u8 family, __u8 proto, __u8 addr[16], struct country_value *policy)
+static __always_inline int token_bucket_limited(__u8 kind, __u16 country, __u8 family, __u8 proto, __u8 addr[16], __u32 packets_per_second, __u32 burst, __u64 block_ns)
 {
-    if (policy->packets_per_second == 0 || policy->burst == 0)
+    if (packets_per_second == 0 || burst == 0)
         return 0;
 
     struct rate_key key = {};
+    key.kind = kind;
     key.country = country;
     key.family = family;
     key.proto = proto;
@@ -242,8 +267,9 @@ static __always_inline int country_rate_limited(__u16 country, __u8 family, __u8
 
     __u64 now = bpf_ktime_get_ns();
     struct rate_bucket initial = {
-        .tokens = policy->burst - 1,
+        .tokens = burst - 1,
         .updated_ns = now,
+        .blocked_until_ns = 0,
     };
     struct rate_bucket *bucket = bpf_map_lookup_elem(&rate_buckets, &key);
     if (!bucket) {
@@ -251,27 +277,50 @@ static __always_inline int country_rate_limited(__u16 country, __u8 family, __u8
         return 0;
     }
 
+    if (block_ns > 0 && bucket->blocked_until_ns > now)
+        return 1;
+
     __u64 elapsed = now - bucket->updated_ns;
-    __u64 refill = elapsed * policy->packets_per_second / 1000000000ULL;
+    __u64 refill = elapsed * packets_per_second / 1000000000ULL;
     __u64 tokens = bucket->tokens;
     if (refill > 0) {
         tokens += refill;
-        if (tokens > policy->burst)
-            tokens = policy->burst;
+        if (tokens > burst)
+            tokens = burst;
         bucket->updated_ns = now;
     }
-    if (tokens == 0)
+    if (tokens == 0) {
+        if (block_ns > 0)
+            bucket->blocked_until_ns = now + block_ns;
         return 1;
+    }
     bucket->tokens = tokens - 1;
+    return 0;
+}
+
+static __always_inline int dynamic_defense_limited(__u8 family, __u8 addr[16])
+{
+    __u32 index = 0;
+    struct defense_value *policy = bpf_map_lookup_elem(&defense_policy, &index);
+    if (!policy || !policy->enabled)
+        return 0;
+
+    if (policy->flood_enabled &&
+        token_bucket_limited(RATE_KIND_FLOOD, 0, family, PROTO_ANY, addr, policy->flood_packets_per_second, policy->flood_burst, policy->flood_block_ns)) {
+        return STAT_FLOOD_DROP;
+    }
+
+    if (policy->ip_rate_limit_enabled &&
+        token_bucket_limited(RATE_KIND_IP, 0, family, PROTO_ANY, addr, policy->ip_packets_per_second, policy->ip_burst, 0)) {
+        return STAT_RATE_DROP;
+    }
+
     return 0;
 }
 
 static __always_inline int handle_packet(__u8 family, __u8 proto, __u16 dport, __u8 src[16])
 {
-    if (lookup_trusted(family, src)) {
-        incr_stat(STAT_PASS);
-        return XDP_PASS;
-    }
+    int trusted = lookup_trusted(family, src) != 0;
 
     struct rule_value *rule = lookup_rule(family, proto, dport, src);
     if (rule) {
@@ -294,10 +343,14 @@ static __always_inline int handle_packet(__u8 family, __u8 proto, __u16 dport, _
                 incr_stat(STAT_GEO_DROP);
                 return XDP_DROP;
             }
-            if (country_rate_limited(geo->country, family, proto, src, country)) {
-                incr_stat(STAT_RATE_DROP);
-                return XDP_DROP;
-            }
+        }
+    }
+
+    if (!trusted) {
+        int defense_drop = dynamic_defense_limited(family, src);
+        if (defense_drop) {
+            incr_stat(defense_drop);
+            return XDP_DROP;
         }
     }
 

@@ -4,6 +4,8 @@ services:
     environment:
       DATABASE_URL: sqlite:///var/lib/xdp-firewall/xdp-firewall.db?mode=rwc
       XDP_FIREWALL_API_TOKEN: ${XDP_FIREWALL_API_TOKEN:?set XDP_FIREWALL_API_TOKEN to enable API authentication}
+      XDP_FIREWALL_TRUSTED_CIDRS: ${XDP_FIREWALL_TRUSTED_CIDRS:-}
+      RUST_LOG: ${RUST_LOG:-xdp_firewall=info}
     volumes:
       - ./sqlite-data:/var/lib/xdp-firewall
     ports:
@@ -23,7 +25,8 @@ services:
     pid: host
     environment:
       DATABASE_URL: sqlite:///var/lib/xdp-firewall/xdp-firewall.db?mode=rwc
-      XDP_FIREWALL_TRUSTED_CIDRS: ${XDP_FIREWALL_TRUSTED_CIDRS:-}
+      XDP_FIREWALL_XDP_MODE: ${XDP_FIREWALL_XDP_MODE:-auto}
+      RUST_LOG: ${RUST_LOG:-xdp_firewall=info}
     volumes:
       - ./sqlite-data:/var/lib/xdp-firewall
       - /sys/fs/bpf:/sys/fs/bpf

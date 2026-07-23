@@ -22,14 +22,13 @@ Agent pointed at an external or already reachable database:
 
 ```bash
 DATABASE_URL=postgres://xdp_firewall:xdp_firewall@127.0.0.1:5432/xdp_firewall \
-XDP_FIREWALL_TRUSTED_CIDRS=10.0.0.0/8,192.168.0.0/16 \
 docker compose -f deploy/docker-compose/compose.agent.yml up -d
 ```
 
-Seed an example policy through the API:
+Seed the example firewall policy through the API:
 
 ```bash
-curl -X POST http://127.0.0.1:8080/policies/edge/seed-example \
+curl -X POST http://127.0.0.1:8080/policy/seed-example \
   -H "authorization: Bearer $XDP_FIREWALL_API_TOKEN"
 ```
 
@@ -58,11 +57,12 @@ Notes:
 
 - API and agent automatically run idempotent migrations at startup.
 - API token authentication is required for non-loopback API binds unless `XDP_FIREWALL_ALLOW_UNAUTHENTICATED=true` is explicitly set. Change the template token before deploying.
-- New policies are initialized with the built-in `ipsum` and `spamhaus-drop` threat intelligence feeds.
+- The single firewall policy is initialized with default dynamic defense and built-in `ipsum` and `spamhaus-drop` threat intelligence feeds.
 - Custom threat feed hosts must be added to `XDP_FIREWALL_ALLOWED_THREAT_HOSTS`; built-in feed hosts are allowed by default.
 - The DaemonSet is privileged and uses `hostNetwork` because XDP attach is a host-network operation.
 - The agent auto-selects the default-route interface when `--interface` is omitted.
-- Trusted source prefixes can be configured with `--trusted-cidr` or `XDP_FIREWALL_TRUSTED_CIDRS`; they bypass firewall, threat, geo, and rate-limit decisions.
+- XDP attach mode can be set with `XDP_FIREWALL_XDP_MODE=auto|driver|skb`. Use `skb` on AWS ENA instances with jumbo MTU if native driver XDP reports that the MTU is too large.
+- Trusted source prefixes can be initialized on `api` with `--trusted-cidr` or `XDP_FIREWALL_TRUSTED_CIDRS` and then managed through the API/frontend; agents only read and apply them. Trusted prefixes skip global `ip_rate_limit` and `flood`, but still go through firewall, threat, and country allow/deny decisions.
 - XDP map sizes can be tuned with `XDP_FIREWALL_RULE_MAP_ENTRIES`, `XDP_FIREWALL_GEO_MAP_ENTRIES`, `XDP_FIREWALL_TRUSTED_MAP_ENTRIES`, `XDP_FIREWALL_COUNTRY_MAP_ENTRIES`, and `XDP_FIREWALL_RATE_MAP_ENTRIES`.
 - Nodes must have bpffs mounted at `/sys/fs/bpf`.
 - Use PostgreSQL/MySQL for multi-node Kubernetes deployments. SQLite is only appropriate for a single server.

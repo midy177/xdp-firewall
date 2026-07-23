@@ -2,7 +2,7 @@
 
 Distributed XDP firewall control plane written in Rust.
 
-Each server runs the same agent. Policy is stored in SQLite, PostgreSQL, or MySQL with SeaORM; agents poll the database by policy version and apply the latest enabled firewall policy to local XDP maps through Aya. SQLite is intended for a single-server deployment; PostgreSQL/MySQL are the distributed configuration source for multiple servers. A new policy is initialized with built-in threat intelligence feeds for `ipsum` and `spamhaus-drop`.
+Each server runs the same agent. A single firewall policy is stored in SQLite, PostgreSQL, or MySQL with SeaORM; agents poll the database by policy version and apply the latest enabled firewall policy to local XDP maps through Aya. SQLite is intended for a single-server deployment; PostgreSQL/MySQL are the distributed configuration source for multiple servers. The policy is initialized with built-in threat intelligence feeds for `ipsum` and `spamhaus-drop`.
 
 ## Quick Start
 
@@ -24,23 +24,23 @@ XDP_FIREWALL_API_TOKEN='change-this-token' cargo run -- api --bind 0.0.0.0:8080
 Useful endpoints:
 
 - `GET /health`
-- `GET /policies?page=1&page_size=100`
-- `GET /policies/{policy}`
-- `POST /policies/{policy}/seed-example`
-- `POST /policies/{policy}/bump-version`
-- `GET /policies/{policy}/rules?page=1&page_size=100`
-- `POST /policies/{policy}/rules`
-- `DELETE /policies/{policy}/rules/{id}`
-- `GET /policies/{policy}/geo-countries?page=1&page_size=100`
-- `POST /policies/{policy}/geo-countries`
-- `GET /policies/{policy}/threat-sources?page=1&page_size=100`
-- `POST /policies/{policy}/threat-sources`
+- `GET /countries`
+- `GET /policy`
+- `POST /policy/seed-example`
+- `POST /policy/bump-version`
+- `GET /rules?page=1&page_size=100`
+- `POST /rules`
+- `DELETE /rules/{id}`
+- `GET /geo-countries?page=1&page_size=100`
+- `POST /geo-countries`
+- `GET /threat-sources?page=1&page_size=100`
+- `POST /threat-sources`
 - `GET /nodes?page=1&page_size=100`
 
 Example:
 
 ```bash
-curl -X POST http://127.0.0.1:8080/policies/edge/rules \
+curl -X POST http://127.0.0.1:8080/rules \
   -H "authorization: Bearer $XDP_FIREWALL_API_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"priority":10,"action":"deny","cidr":"203.0.113.0/24","protocol":"any"}'
@@ -50,7 +50,7 @@ Every mutating endpoint increments the policy version so running agents can pick
 
 List endpoints return `items`, `total`, `page`, `page_size`, and `total_pages`. The default page size is `100`; the maximum is `500`.
 
-Set `XDP_FIREWALL_API_TOKEN` to protect `/policies` and `/nodes` API routes. The API refuses to bind to a non-loopback address without a token unless `XDP_FIREWALL_ALLOW_UNAUTHENTICATED=true` is explicitly set. Clients can send either `Authorization: Bearer <token>` or `X-API-Token: <token>`. `/health` and embedded frontend assets stay public for probes and page loading. When the embedded frontend is used with auth enabled, enter the token in the API token field; it is stored in browser local storage.
+Set `XDP_FIREWALL_API_TOKEN` to protect configuration and `/nodes` API routes. The API refuses to bind to a non-loopback address without a token unless `XDP_FIREWALL_ALLOW_UNAUTHENTICATED=true` is explicitly set. Clients can send either `Authorization: Bearer <token>` or `X-API-Token: <token>`. `/health`, `/countries`, and embedded frontend assets stay public for probes and page loading. When the embedded frontend is used with auth enabled, enter the token in the API token field; it is kept in memory only and is cleared when leaving the page.
 
 ## Frontend
 
@@ -66,9 +66,11 @@ The frontend source is Vue 3. `frontend/package.json` aliases Vite to Rolldown V
 
 ## Data Model
 
-- `firewall_policy_versions`: monotonically increasing policy versions.
+- `firewall_policy_versions`: monotonically increasing version for the single firewall policy.
 - `firewall_rules`: static allow/deny CIDR rules, optional protocol and port match.
-- `firewall_geo_country_policies`: per-country allow/deny/rate-limit policy.
+- `firewall_geo_country_policies`: per-country allow/deny policy.
+- `firewall_dynamic_defense`: global `ip_rate_limit` and `flood` policy.
+- `firewall_trusted_cidrs`: CIDR whitelist for global dynamic defense.
 - `firewall_threat_sources`: threat-intelligence feed definitions.
 - `firewall_nodes`: distributed node heartbeat and last applied version.
 
@@ -91,10 +93,12 @@ The userspace agent defaults to `/usr/local/share/xdp-firewall/xdp_firewall.o`. 
 
 ## Trusted CIDRs
 
-Trusted CIDRs are configured on the agent with Clap arguments or environment variables and are applied before normal firewall rules, threat intelligence, country rules, and rate limits.
+Trusted CIDRs are the whitelist for global dynamic defense. Source IPs matching these prefixes still go through ordinary firewall rules, threat intelligence, and country allow/deny rules, but skip global `ip_rate_limit` and `flood` checks.
+
+They are stored in the database so every agent sees the same whitelist. Initialize entries from the API process with Clap arguments or environment variables, or manage them later through the API/frontend. Agents read the database and apply the whitelist; they do not mutate whitelist configuration.
 
 ```bash
-xdp-firewall agent \
+xdp-firewall api \
   --trusted-cidr 10.0.0.0/8 \
   --trusted-cidr 192.168.0.0/16
 ```
@@ -102,12 +106,36 @@ xdp-firewall agent \
 Equivalent environment form:
 
 ```bash
-XDP_FIREWALL_TRUSTED_CIDRS=10.0.0.0/8,192.168.0.0/16 xdp-firewall agent
+XDP_FIREWALL_TRUSTED_CIDRS=10.0.0.0/8,192.168.0.0/16 xdp-firewall api
 ```
+
+The same whitelist can be managed through:
+
+- `GET /trusted-cidrs`
+- `POST /trusted-cidrs`
+- `DELETE /trusted-cidrs/{id}`
+
+## Dynamic Defense
+
+Global dynamic defense is enabled by default and applies after ordinary firewall, threat intelligence, and country allow/deny decisions:
+
+- `ip_rate_limit`: per-source-IP token bucket.
+- `flood`: per-source-IP token bucket with a temporary block window after the threshold is exceeded.
+
+Trusted CIDRs skip these global dynamic defense checks. Configure dynamic defense through:
+
+- `GET /dynamic-defense`
+- `PUT /dynamic-defense`
 
 ## Agent Mode
 
 Use `agent` for persistent enforcement. `sync-once` loads and applies one policy snapshot, then exits; on Linux this means the process no longer owns the XDP attachment. It is useful for validation workflows, not for keeping a node protected.
+
+XDP attach mode is selected with `--xdp-mode` or `XDP_FIREWALL_XDP_MODE`:
+
+- `auto` is the default. It tries driver/native XDP first and falls back to skb/generic XDP when the NIC or MTU does not support driver mode.
+- `driver` requires native XDP and fails startup if it cannot attach.
+- `skb` skips native XDP and attaches generic XDP directly. Use this on AWS ENA instances that keep jumbo MTU enabled and report `current MTU is larger than the maximum allowed MTU`.
 
 ## XDP Map Sizing
 

@@ -28,5 +28,6 @@ EXPOSE 8080
 
 ENV DATABASE_URL=sqlite:///var/lib/xdp-firewall/xdp-firewall.db?mode=rwc
 ENV API_BIND=0.0.0.0:8080
+ENV RUST_LOG=xdp_firewall=info
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

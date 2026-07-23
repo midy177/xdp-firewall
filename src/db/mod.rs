@@ -35,6 +35,28 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
         schema.create_table_from_entity(entities::threat_source::Entity),
     )
     .await?;
+    create_table(
+        db,
+        schema.create_table_from_entity(entities::dynamic_defense::Entity),
+    )
+    .await?;
+    create_table(
+        db,
+        schema.create_table_from_entity(entities::trusted_cidr::Entity),
+    )
+    .await?;
+    create_index(
+        db,
+        Index::create()
+            .if_not_exists()
+            .name("idx_firewall_trusted_cidrs_policy_name_cidr")
+            .table(entities::trusted_cidr::Entity.table_ref())
+            .col(entities::trusted_cidr::Column::PolicyName)
+            .col(entities::trusted_cidr::Column::Cidr)
+            .unique()
+            .to_owned(),
+    )
+    .await?;
     create_index(
         db,
         Index::create()

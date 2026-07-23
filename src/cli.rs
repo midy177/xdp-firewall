@@ -2,7 +2,7 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::xdp::{
     DEFAULT_COUNTRY_MAP_ENTRIES, DEFAULT_GEO_MAP_ENTRIES, DEFAULT_RATE_MAP_ENTRIES,
-    DEFAULT_RULE_MAP_ENTRIES, DEFAULT_TRUSTED_MAP_ENTRIES,
+    DEFAULT_RULE_MAP_ENTRIES, DEFAULT_TRUSTED_MAP_ENTRIES, XdpAttachMode,
 };
 
 #[derive(Debug, Parser)]
@@ -36,6 +36,14 @@ pub enum Command {
 pub struct ApiArgs {
     #[arg(long, default_value = "0.0.0.0:8080")]
     pub bind: String,
+    #[arg(
+        long = "trusted-cidr",
+        alias = "trusted-cidrs",
+        env = "XDP_FIREWALL_TRUSTED_CIDRS",
+        value_delimiter = ',',
+        help = "Trusted source CIDR allowlist for global ip_rate_limit and flood. Can be repeated or comma-separated. These prefixes are persisted to the policy database."
+    )]
+    pub trusted_cidrs: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -57,8 +65,14 @@ pub struct AgentArgs {
         help = "Network interface to attach XDP to. Auto-detects the default-route interface when omitted."
     )]
     pub interface: Option<String>,
-    #[arg(long, env = "XDP_FIREWALL_POLICY", default_value = "edge")]
-    pub policy: String,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_MODE",
+        value_enum,
+        default_value_t = XdpAttachMode::Auto,
+        help = "XDP attach mode: auto tries driver mode first and falls back to skb; driver fails if native XDP is unavailable; skb skips native XDP."
+    )]
+    pub xdp_mode: XdpAttachMode,
     #[arg(long, default_value = "/usr/local/share/xdp-firewall/xdp_firewall.o")]
     pub xdp_object: String,
     #[arg(long, default_value_t = 5)]
@@ -67,14 +81,6 @@ pub struct AgentArgs {
     pub heartbeat_seconds: u64,
     #[arg(long, default_value = "xdp_firewall")]
     pub program: String,
-    #[arg(
-        long = "trusted-cidr",
-        alias = "trusted-cidrs",
-        env = "XDP_FIREWALL_TRUSTED_CIDRS",
-        value_delimiter = ',',
-        help = "Trusted source CIDR allowlist. Can be repeated or comma-separated. These prefixes bypass firewall, threat, geo, and rate-limit decisions."
-    )]
-    pub trusted_cidrs: Vec<String>,
     #[arg(
         long,
         env = "XDP_FIREWALL_RULE_MAP_ENTRIES",
@@ -120,20 +126,18 @@ pub struct SyncOnceArgs {
         help = "Network interface to attach XDP to. Auto-detects the default-route interface when omitted."
     )]
     pub interface: Option<String>,
-    #[arg(long, env = "XDP_FIREWALL_POLICY", default_value = "edge")]
-    pub policy: String,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_MODE",
+        value_enum,
+        default_value_t = XdpAttachMode::Auto,
+        help = "XDP attach mode: auto tries driver mode first and falls back to skb; driver fails if native XDP is unavailable; skb skips native XDP."
+    )]
+    pub xdp_mode: XdpAttachMode,
     #[arg(long, default_value = "/usr/local/share/xdp-firewall/xdp_firewall.o")]
     pub xdp_object: String,
     #[arg(long, default_value = "xdp_firewall")]
     pub program: String,
-    #[arg(
-        long = "trusted-cidr",
-        alias = "trusted-cidrs",
-        env = "XDP_FIREWALL_TRUSTED_CIDRS",
-        value_delimiter = ',',
-        help = "Trusted source CIDR allowlist. Can be repeated or comma-separated. These prefixes bypass firewall, threat, geo, and rate-limit decisions."
-    )]
-    pub trusted_cidrs: Vec<String>,
     #[arg(
         long,
         env = "XDP_FIREWALL_RULE_MAP_ENTRIES",
@@ -167,13 +171,7 @@ pub struct SyncOnceArgs {
 }
 
 #[derive(Debug, Args, Clone)]
-pub struct SeedExampleArgs {
-    #[arg(long, default_value = "edge")]
-    pub name: String,
-}
+pub struct SeedExampleArgs {}
 
 #[derive(Debug, Args, Clone)]
-pub struct ShowPolicyArgs {
-    #[arg(long, default_value = "edge")]
-    pub name: String,
-}
+pub struct ShowPolicyArgs {}

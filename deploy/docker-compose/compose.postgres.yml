@@ -21,6 +21,8 @@ services:
     environment:
       DATABASE_URL: postgres://xdp_firewall:xdp_firewall@postgres:5432/xdp_firewall
       XDP_FIREWALL_API_TOKEN: ${XDP_FIREWALL_API_TOKEN:?set XDP_FIREWALL_API_TOKEN to enable API authentication}
+      XDP_FIREWALL_TRUSTED_CIDRS: ${XDP_FIREWALL_TRUSTED_CIDRS:-}
+      RUST_LOG: ${RUST_LOG:-xdp_firewall=info}
     ports:
       - "${XDP_FIREWALL_API_PORT:-8080}:8080"
     healthcheck:

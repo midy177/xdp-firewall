@@ -120,10 +120,10 @@ pub fn validate_source_url(value: &str) -> Result<()> {
 }
 
 async fn read_limited_body(mut response: reqwest::Response, max_bytes: usize) -> Result<String> {
-    if let Some(length) = response.content_length() {
-        if length > max_bytes as u64 {
-            bail!("threat source response is larger than {max_bytes} bytes");
-        }
+    if let Some(length) = response.content_length()
+        && length > max_bytes as u64
+    {
+        bail!("threat source response is larger than {max_bytes} bytes");
     }
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await? {

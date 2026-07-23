@@ -7,7 +7,8 @@ services:
     pid: host
     environment:
       DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL to postgres://, mysql://, or sqlite://}
-      XDP_FIREWALL_TRUSTED_CIDRS: ${XDP_FIREWALL_TRUSTED_CIDRS:-}
+      XDP_FIREWALL_XDP_MODE: ${XDP_FIREWALL_XDP_MODE:-auto}
+      RUST_LOG: ${RUST_LOG:-xdp_firewall=info}
     volumes:
       - /sys/fs/bpf:/sys/fs/bpf
     command:
