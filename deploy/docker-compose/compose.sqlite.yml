@@ -1,0 +1,32 @@
+services:
+  api:
+    image: ${XDP_FIREWALL_IMAGE:-1228022817/xdp-firewall:0.1.0}
+    environment:
+      DATABASE_URL: sqlite:///var/lib/xdp-firewall/xdp-firewall.db?mode=rwc
+      XDP_FIREWALL_API_TOKEN: ${XDP_FIREWALL_API_TOKEN:?set XDP_FIREWALL_API_TOKEN to enable API authentication}
+    volumes:
+      - ./sqlite-data:/var/lib/xdp-firewall
+    ports:
+      - "${XDP_FIREWALL_API_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  agent:
+    image: ${XDP_FIREWALL_IMAGE:-1228022817/xdp-firewall:0.1.0}
+    network_mode: host
+    uts: host
+    privileged: true
+    pid: host
+    environment:
+      DATABASE_URL: sqlite:///var/lib/xdp-firewall/xdp-firewall.db?mode=rwc
+      XDP_FIREWALL_TRUSTED_CIDRS: ${XDP_FIREWALL_TRUSTED_CIDRS:-}
+    volumes:
+      - ./sqlite-data:/var/lib/xdp-firewall
+      - /sys/fs/bpf:/sys/fs/bpf
+    command:
+      - agent
+    restart: unless-stopped

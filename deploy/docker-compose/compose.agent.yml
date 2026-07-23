@@ -1,0 +1,15 @@
+services:
+  agent:
+    image: ${XDP_FIREWALL_IMAGE:-1228022817/xdp-firewall:0.1.0}
+    network_mode: host
+    uts: host
+    privileged: true
+    pid: host
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL to postgres://, mysql://, or sqlite://}
+      XDP_FIREWALL_TRUSTED_CIDRS: ${XDP_FIREWALL_TRUSTED_CIDRS:-}
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf
+    command:
+      - agent
+    restart: unless-stopped

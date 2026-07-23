@@ -1,0 +1,9 @@
+target
+frontend/node_modules
+.git
+.agents
+.codex
+*.pcap
+*.pcapng
+*.log
+data

@@ -1,0 +1,30 @@
+[package]
+name = "xdp-firewall"
+version = "0.1.0"
+edition = "2024"
+description = "Distributed XDP firewall with database-backed policy"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+arc-swap = "1"
+axum = { version = "0.8", features = ["json", "tokio"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+ipnet = { version = "2", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+sea-orm = { version = "1", features = ["macros", "runtime-tokio-rustls", "sqlx-postgres", "sqlx-mysql", "sqlx-sqlite", "with-chrono", "with-json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = "0.14"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
