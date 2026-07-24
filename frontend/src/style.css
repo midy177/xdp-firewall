@@ -335,7 +335,8 @@ main {
 }
 
 .rule-form {
-  grid-template-columns: 92px 120px minmax(180px, 1fr) 120px 100px 38px;
+  grid-template-columns: 92px 120px minmax(220px, 520px) 120px 100px 38px;
+  justify-content: start;
 }
 
 .geo-form {
@@ -372,7 +373,8 @@ main {
 }
 
 .threat-form {
-  grid-template-columns: 160px minmax(240px, 1fr) 150px 120px 38px;
+  grid-template-columns: 160px minmax(280px, 640px) 150px 120px 38px;
+  justify-content: start;
 }
 
 .defense-form {
@@ -400,19 +402,23 @@ main {
 }
 
 .custom-rate-form {
-  grid-template-columns: 92px 120px 100px 120px 120px minmax(180px, 1fr) 38px;
+  grid-template-columns: 92px 120px 100px 120px 120px minmax(180px, 320px) 38px;
+  justify-content: start;
 }
 
 .temp-ban-form {
-  grid-template-columns: minmax(160px, 1fr) 120px 100px 130px minmax(180px, 1fr) 38px;
+  grid-template-columns: minmax(180px, 360px) 120px 100px 130px minmax(180px, 320px) 38px;
+  justify-content: start;
 }
 
 .trusted-form {
-  grid-template-columns: minmax(220px, 1fr) minmax(220px, 1fr) 38px;
+  grid-template-columns: minmax(220px, 420px) minmax(220px, 360px) 38px;
+  justify-content: start;
 }
 
 .form-submit {
-  align-self: end;
+  align-self: start;
+  margin-top: 21px;
   min-width: 0;
 }
 
@@ -420,6 +426,8 @@ main {
   position: relative;
   z-index: 1;
   display: grid;
+  grid-template-rows: 16px 38px 34px;
+  align-content: start;
   gap: 5px;
   min-width: 0;
 }
