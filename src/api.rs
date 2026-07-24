@@ -461,7 +461,7 @@ async fn create_rule(
     Json(request): Json<CreateRuleRequest>,
 ) -> ApiResult<(StatusCode, Json<Versioned<firewall_rule::Model>>)> {
     validate_action(&request.action)?;
-    validate_cidr(&request.cidr)?;
+    let cidr = normalize_cidr(&request.cidr)?;
     let protocol = request
         .protocol
         .as_deref()
@@ -473,7 +473,7 @@ async fn create_rule(
         enabled: Set(request.enabled.unwrap_or(true)),
         priority: Set(request.priority),
         action: Set(normalize_action(&request.action)?),
-        cidr: Set(request.cidr),
+        cidr: Set(cidr),
         protocol: Set(protocol),
         port: Set(port),
         comment: Set(request.comment),
@@ -1021,15 +1021,11 @@ impl From<sea_orm::DbErr> for ApiError {
     }
 }
 
-fn validate_cidr(value: &str) -> Result<()> {
-    normalize_cidr(value)?;
-    Ok(())
-}
-
 fn normalize_cidr(value: &str) -> Result<String> {
-    let net = value
+    let cidr = value.trim();
+    let net = cidr
         .parse::<ipnet::IpNet>()
-        .with_context(|| format!("invalid CIDR '{value}'"))?;
+        .with_context(|| format!("invalid CIDR '{cidr}'"))?;
     Ok(match net {
         ipnet::IpNet::V4(net) => format!("{}/{}", net.network(), net.prefix_len()),
         ipnet::IpNet::V6(net) => format!("{}/{}", net.network(), net.prefix_len()),
@@ -1037,10 +1033,13 @@ fn normalize_cidr(value: &str) -> Result<String> {
 }
 
 fn normalize_ip(value: &str) -> Result<String> {
-    let ip = value
-        .trim()
+    let ip = value.trim();
+    if ip.contains('/') {
+        bail!("source IP must be a single IP address, not CIDR");
+    }
+    let ip = ip
         .parse::<std::net::IpAddr>()
-        .with_context(|| format!("invalid IP address '{value}'"))?;
+        .with_context(|| format!("invalid IP address '{ip}'"))?;
     Ok(ip.to_string())
 }
 
@@ -1075,9 +1074,8 @@ fn validate_port(protocol: Option<&str>, port: Option<i32>) -> Result<Option<i32
         .filter(|port| *port > 0)
         .context("port must be between 1 and 65535")?;
     match protocol.unwrap_or("any") {
-        "tcp" | "udp" => Ok(Some(port)),
+        "any" | "tcp" | "udp" => Ok(Some(port)),
         "icmp" => bail!("icmp rules cannot set a port"),
-        "any" => bail!("port requires protocol tcp or udp"),
         other => bail!("unsupported protocol '{other}'"),
     }
 }
@@ -1291,6 +1289,20 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    async fn response_error(response: Response) -> String {
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            !status.is_success(),
+            "expected error response, got {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        serde_json::from_slice::<Value>(&body).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
     #[test]
     fn reads_bearer_token() {
         let mut headers = HeaderMap::new();
@@ -1402,5 +1414,145 @@ mod tests {
             firewall::L4Protocol::Tcp
         );
         assert_eq!(snapshot.dynamic_rate_limits[1].port, Some(443));
+    }
+
+    #[tokio::test]
+    async fn rule_create_normalizes_cidr_and_rejects_invalid_ports() {
+        let (app, _db) = test_router().await;
+        let created = response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules",
+                json!({
+                    "priority": 10,
+                    "action": "deny",
+                    "cidr": " 203.0.113.42/24 ",
+                    "protocol": "tcp",
+                    "port": 443
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(created["data"]["cidr"], "203.0.113.0/24");
+
+        let any_port_rule = response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules",
+                json!({
+                    "priority": 10,
+                    "action": "deny",
+                    "cidr": "203.0.113.0/24",
+                    "protocol": "any",
+                    "port": 443
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(any_port_rule["data"]["protocol"], "any");
+        assert_eq!(any_port_rule["data"]["port"], 443);
+
+        let range_error = response_error(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules",
+                json!({
+                    "priority": 10,
+                    "action": "deny",
+                    "cidr": "203.0.113.0/24",
+                    "protocol": "tcp",
+                    "port": 65536
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(range_error.contains("port must be between 1 and 65535"));
+    }
+
+    #[tokio::test]
+    async fn temporary_ban_rejects_cidr_source_and_invalid_port() {
+        let (app, _db) = test_router().await;
+        let cidr_error = response_error(
+            send_json(
+                &app,
+                Method::POST,
+                "/temp-bans",
+                json!({
+                    "ip": "203.0.113.0/24",
+                    "protocol": "tcp",
+                    "port": 443,
+                    "duration_seconds": 300
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(cidr_error.contains("source IP must be a single IP address"));
+
+        let port_error = response_error(
+            send_json(
+                &app,
+                Method::POST,
+                "/temp-bans",
+                json!({
+                    "ip": "203.0.113.10",
+                    "protocol": "tcp",
+                    "port": 0,
+                    "duration_seconds": 300
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(port_error.contains("port must be between 1 and 65535"));
+    }
+
+    #[tokio::test]
+    async fn dynamic_rate_limit_allows_port_only_limit_and_rejects_icmp_port() {
+        let (app, _db) = test_router().await;
+        let created = response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/dynamic-rate-limits",
+                json!({
+                    "enabled": true,
+                    "priority": 10,
+                    "protocol": "any",
+                    "port": 443,
+                    "packets_per_second": 1000,
+                    "burst": 2000
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(created["data"]["protocol"], "any");
+        assert_eq!(created["data"]["port"], 443);
+
+        let error = response_error(
+            send_json(
+                &app,
+                Method::POST,
+                "/dynamic-rate-limits",
+                json!({
+                    "enabled": true,
+                    "priority": 10,
+                    "protocol": "icmp",
+                    "port": 443,
+                    "packets_per_second": 1000,
+                    "burst": 2000
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(error.contains("icmp dynamic rate limits cannot set a port"));
     }
 }

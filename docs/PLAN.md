@@ -2,6 +2,14 @@
 
 ## Active Plan
 
+- [completed] Reorder the left navigation by firewall enforcement priority, with observability and documentation items after policy controls.
+- [completed] Disable each frontend form submit/add button while that form has visible field validation errors.
+- [completed] Reserve inline validation message space in frontend forms so field errors do not shift row height.
+- [completed] Allow ordinary firewall rules to use `protocol=any` with either any port or a specific destination port while preserving port range checks.
+- [completed] Make frontend protocol/port validation run immediately after port input or protocol changes so invalid combinations are visible before submit.
+- [completed] Add field-level frontend validation for CIDR, source IP, and port inputs on blur and while editing previously invalid fields.
+- [completed] Tighten frontend and backend CIDR/IP/port validation for rule, temporary-ban, trusted CIDR, and dynamic-rate-limit forms and APIs.
+- [completed] Adjust the dynamic defense frontend layout so `ip_rate_limit` and `flood` controls each occupy their own row.
 - [completed] Add deeper integration tests for dynamic defense API persistence using an in-memory SQLite database and real Axum routes.
 - [completed] Convert the external-facing design document to Chinese and replace ASCII architecture diagrams with Mermaid text-generated diagrams.
 - [completed] Write an external-facing overall design document that explains the distributed XDP firewall architecture, data plane, control plane, storage model, observability, deployment model, performance considerations, and technical difficulty.

@@ -115,11 +115,19 @@
           </label>
           <label class="field">
             <span>CIDR</span>
-            <Input v-model="ruleForm.cidr" aria-label="CIDR" placeholder="203.0.113.0/24" />
+            <Input
+              v-model="ruleForm.cidr"
+              aria-label="CIDR"
+              placeholder="203.0.113.0/24"
+              :aria-invalid="Boolean(fieldErrors.ruleCidr)"
+              @blur="validateField('ruleCidr')"
+              @input="validateTouchedField('ruleCidr')"
+            />
+            <small class="field-error" :class="{ visible: Boolean(fieldErrors.ruleCidr) }">{{ fieldErrors.ruleCidr }}</small>
           </label>
           <label class="field">
             <span>{{ t("protocol") }}</span>
-            <Select v-model="ruleForm.protocol" aria-label="Protocol">
+            <Select v-model="ruleForm.protocol" aria-label="Protocol" @change="validateFieldAfterUpdate('rulePort')">
               <option value="any">any</option>
               <option value="tcp">tcp</option>
               <option value="udp">udp</option>
@@ -128,9 +136,20 @@
           </label>
           <label class="field">
             <span>{{ t("port") }}</span>
-            <Input v-model="ruleForm.port" aria-label="Port" placeholder="80" />
+            <Input
+              v-model="ruleForm.port"
+              type="number"
+              min="1"
+              max="65535"
+              aria-label="Port"
+              placeholder="80"
+              :aria-invalid="Boolean(fieldErrors.rulePort)"
+              @blur="validateField('rulePort')"
+              @input="validateFieldAfterUpdate('rulePort')"
+            />
+            <small class="field-error" :class="{ visible: Boolean(fieldErrors.rulePort) }">{{ fieldErrors.rulePort }}</small>
           </label>
-          <Button class="form-submit" :title="t('add')" :disabled="actionBusy" @click="runAction(createRule)"><Plus :size="16" /></Button>
+          <Button class="form-submit" :title="t('add')" :disabled="actionBusy || hasFieldErrors(ruleErrorFields)" @click="runAction(createRule)"><Plus :size="16" /></Button>
         </div>
         <table>
           <thead>
@@ -228,11 +247,19 @@
         <div class="form-grid temp-ban-form">
           <label class="field">
             <span>{{ t("sourceIp") }}</span>
-            <Input v-model="tempBanForm.ip" aria-label="Temporary ban source IP" placeholder="203.0.113.10" />
+            <Input
+              v-model="tempBanForm.ip"
+              aria-label="Temporary ban source IP"
+              placeholder="203.0.113.10"
+              :aria-invalid="Boolean(fieldErrors.tempBanIp)"
+              @blur="validateField('tempBanIp')"
+              @input="validateTouchedField('tempBanIp')"
+            />
+            <small class="field-error" :class="{ visible: Boolean(fieldErrors.tempBanIp) }">{{ fieldErrors.tempBanIp }}</small>
           </label>
           <label class="field">
             <span>{{ t("protocol") }}</span>
-            <Select v-model="tempBanForm.protocol" aria-label="Temporary ban protocol">
+            <Select v-model="tempBanForm.protocol" aria-label="Temporary ban protocol" @change="validateFieldAfterUpdate('tempBanPort')">
               <option value="any">any</option>
               <option value="tcp">tcp</option>
               <option value="udp">udp</option>
@@ -241,7 +268,18 @@
           </label>
           <label class="field">
             <span>{{ t("port") }}</span>
-            <Input v-model="tempBanForm.port" aria-label="Temporary ban port" placeholder="443" />
+            <Input
+              v-model="tempBanForm.port"
+              type="number"
+              min="1"
+              max="65535"
+              aria-label="Temporary ban port"
+              placeholder="443"
+              :aria-invalid="Boolean(fieldErrors.tempBanPort)"
+              @blur="validateField('tempBanPort')"
+              @input="validateFieldAfterUpdate('tempBanPort')"
+            />
+            <small class="field-error" :class="{ visible: Boolean(fieldErrors.tempBanPort) }">{{ fieldErrors.tempBanPort }}</small>
           </label>
           <label class="field">
             <span>{{ t("durationSeconds") }}</span>
@@ -251,7 +289,7 @@
             <span>{{ t("comment") }}</span>
             <Input v-model="tempBanForm.comment" aria-label="Temporary ban comment" />
           </label>
-          <Button class="form-submit" :title="t('add')" :disabled="actionBusy" @click="runAction(createTempBan)"><Plus :size="16" /></Button>
+          <Button class="form-submit" :title="t('add')" :disabled="actionBusy || hasFieldErrors(tempBanErrorFields)" @click="runAction(createTempBan)"><Plus :size="16" /></Button>
         </div>
         <table>
           <thead>
@@ -358,34 +396,38 @@
           </label>
         </div>
         <div class="form-grid defense-form">
-          <label class="check-field">
-            <input v-model="dynamicDefense.ip_rate_limit_enabled" type="checkbox" />
-            <span>ip_rate_limit</span>
-          </label>
-          <label class="field">
-            <span>{{ t("ipPps") }}</span>
-            <Input v-model.number="dynamicDefense.ip_packets_per_second" type="number" aria-label="IP PPS" />
-          </label>
-          <label class="field">
-            <span>{{ t("ipBurst") }}</span>
-            <Input v-model.number="dynamicDefense.ip_burst" type="number" aria-label="IP burst" />
-          </label>
-          <label class="check-field">
-            <input v-model="dynamicDefense.flood_enabled" type="checkbox" />
-            <span>flood</span>
-          </label>
-          <label class="field">
-            <span>{{ t("floodPps") }}</span>
-            <Input v-model.number="dynamicDefense.flood_packets_per_second" type="number" aria-label="Flood PPS" />
-          </label>
-          <label class="field">
-            <span>{{ t("floodBurst") }}</span>
-            <Input v-model.number="dynamicDefense.flood_burst" type="number" aria-label="Flood burst" />
-          </label>
-          <label class="field">
-            <span>{{ t("blockSeconds") }}</span>
-            <Input v-model.number="dynamicDefense.flood_block_seconds" type="number" aria-label="Flood block seconds" />
-          </label>
+          <div class="defense-row">
+            <label class="check-field defense-toggle">
+              <input v-model="dynamicDefense.ip_rate_limit_enabled" type="checkbox" />
+              <span>ip_rate_limit</span>
+            </label>
+            <label class="field">
+              <span>{{ t("ipPps") }}</span>
+              <Input v-model.number="dynamicDefense.ip_packets_per_second" type="number" aria-label="IP PPS" />
+            </label>
+            <label class="field">
+              <span>{{ t("ipBurst") }}</span>
+              <Input v-model.number="dynamicDefense.ip_burst" type="number" aria-label="IP burst" />
+            </label>
+          </div>
+          <div class="defense-row">
+            <label class="check-field defense-toggle">
+              <input v-model="dynamicDefense.flood_enabled" type="checkbox" />
+              <span>flood</span>
+            </label>
+            <label class="field">
+              <span>{{ t("floodPps") }}</span>
+              <Input v-model.number="dynamicDefense.flood_packets_per_second" type="number" aria-label="Flood PPS" />
+            </label>
+            <label class="field">
+              <span>{{ t("floodBurst") }}</span>
+              <Input v-model.number="dynamicDefense.flood_burst" type="number" aria-label="Flood burst" />
+            </label>
+            <label class="field">
+              <span>{{ t("blockSeconds") }}</span>
+              <Input v-model.number="dynamicDefense.flood_block_seconds" type="number" aria-label="Flood block seconds" />
+            </label>
+          </div>
           <Button class="form-submit" :title="t('save')" :disabled="actionBusy" @click="runAction(saveDynamicDefense)"><DatabaseZap :size="16" /></Button>
         </div>
         <div class="subsection-head">
@@ -401,7 +443,7 @@
           </label>
           <label class="field">
             <span>{{ t("protocol") }}</span>
-            <Select v-model="dynamicRateForm.protocol" aria-label="Dynamic rate protocol">
+            <Select v-model="dynamicRateForm.protocol" aria-label="Dynamic rate protocol" @change="validateFieldAfterUpdate('dynamicRatePort')">
               <option value="any">any</option>
               <option value="tcp">tcp</option>
               <option value="udp">udp</option>
@@ -410,7 +452,18 @@
           </label>
           <label class="field">
             <span>{{ t("port") }}</span>
-            <Input v-model="dynamicRateForm.port" aria-label="Dynamic rate port" placeholder="443" />
+            <Input
+              v-model="dynamicRateForm.port"
+              type="number"
+              min="1"
+              max="65535"
+              aria-label="Dynamic rate port"
+              placeholder="443"
+              :aria-invalid="Boolean(fieldErrors.dynamicRatePort)"
+              @blur="validateField('dynamicRatePort')"
+              @input="validateFieldAfterUpdate('dynamicRatePort')"
+            />
+            <small class="field-error" :class="{ visible: Boolean(fieldErrors.dynamicRatePort) }">{{ fieldErrors.dynamicRatePort }}</small>
           </label>
           <label class="field">
             <span>PPS</span>
@@ -424,7 +477,7 @@
             <span>{{ t("comment") }}</span>
             <Input v-model="dynamicRateForm.comment" aria-label="Dynamic rate comment" />
           </label>
-          <Button class="form-submit" :title="t('add')" :disabled="actionBusy" @click="runAction(createDynamicRateLimit)"><Plus :size="16" /></Button>
+          <Button class="form-submit" :title="t('add')" :disabled="actionBusy || hasFieldErrors(dynamicRateErrorFields)" @click="runAction(createDynamicRateLimit)"><Plus :size="16" /></Button>
         </div>
         <table>
           <thead>
@@ -475,13 +528,21 @@
         <div class="form-grid trusted-form">
           <label class="field">
             <span>CIDR</span>
-            <Input v-model="trustedForm.cidr" aria-label="Trusted CIDR" placeholder="10.0.0.0/8" />
+            <Input
+              v-model="trustedForm.cidr"
+              aria-label="Trusted CIDR"
+              placeholder="10.0.0.0/8"
+              :aria-invalid="Boolean(fieldErrors.trustedCidr)"
+              @blur="validateField('trustedCidr')"
+              @input="validateTouchedField('trustedCidr')"
+            />
+            <small class="field-error" :class="{ visible: Boolean(fieldErrors.trustedCidr) }">{{ fieldErrors.trustedCidr }}</small>
           </label>
           <label class="field">
             <span>{{ t("comment") }}</span>
             <Input v-model="trustedForm.comment" aria-label="Comment" />
           </label>
-          <Button class="form-submit" :title="t('add')" :disabled="actionBusy" @click="runAction(createTrustedCidr)"><Plus :size="16" /></Button>
+          <Button class="form-submit" :title="t('add')" :disabled="actionBusy || hasFieldErrors(trustedErrorFields)" @click="runAction(createTrustedCidr)"><Plus :size="16" /></Button>
         </div>
         <table>
           <thead>
@@ -719,16 +780,21 @@ type PageState = { page: number; total_pages: number; total: number };
 type ApiDocEndpoint = { method: string; path: string; summary: string; body?: string; curl?: string };
 type ApiDocSection = { title: string; description: string; endpoints: ApiDocEndpoint[] };
 type Lang = "zh" | "en";
+type FieldKey = "ruleCidr" | "rulePort" | "tempBanIp" | "tempBanPort" | "dynamicRatePort" | "trustedCidr";
+const ruleErrorFields: FieldKey[] = ["ruleCidr", "rulePort"];
+const tempBanErrorFields: FieldKey[] = ["tempBanIp", "tempBanPort"];
+const dynamicRateErrorFields: FieldKey[] = ["dynamicRatePort"];
+const trustedErrorFields: FieldKey[] = ["trustedCidr"];
 
 const tabs = [
-  { id: "rules", label: "rules", icon: ListFilter },
-  { id: "geo", label: "countries", icon: Globe2 },
-  { id: "tempBans", label: "tempBans", icon: Ban },
-  { id: "threats", label: "threats", icon: ShieldCheck },
-  { id: "defense", label: "dynamicDefense", icon: ShieldCheck },
   { id: "trusted", label: "trustedCidrs", icon: KeyRound },
-  { id: "nodes", label: "nodes", icon: Server },
+  { id: "tempBans", label: "tempBans", icon: Ban },
+  { id: "rules", label: "rules", icon: ListFilter },
+  { id: "threats", label: "threats", icon: ShieldCheck },
+  { id: "geo", label: "countries", icon: Globe2 },
+  { id: "defense", label: "dynamicDefense", icon: ShieldCheck },
   { id: "drops", label: "dropEvents", icon: Activity },
+  { id: "nodes", label: "nodes", icon: Server },
   { id: "apiDocs", label: "apiDocs", icon: BookOpen }
 ] as const;
 
@@ -737,6 +803,8 @@ const language = ref<Lang>(localStorage.getItem("xdp-firewall-language") === "en
 const health = ref("loading");
 const error = ref("");
 const notice = ref("");
+const fieldErrors = reactive<Partial<Record<FieldKey, string>>>({});
+const touchedFields = reactive<Partial<Record<FieldKey, boolean>>>({});
 const loading = ref(false);
 const actionBusy = ref(false);
 const apiToken = ref("");
@@ -1022,6 +1090,7 @@ const validationMessages = {
     countryCode: () => "国家必须是两个字母的 ISO 代码",
     httpUrl: (label: string) => `${label} 必须以 http:// 或 https:// 开头`,
     icmpPort: () => "ICMP 规则不能设置端口",
+    ipNoCidr: (label: string) => `${label} 必须是单个 IP，不能填写 CIDR`,
     integer: (label: string) => `${label} 必须是整数`,
     invalid: (label: string) => `${label} 无效`,
     ipv4Prefix: () => "IPv4 CIDR 前缀必须在 0 到 32 之间",
@@ -1040,6 +1109,7 @@ const validationMessages = {
     countryCode: () => "Country must be a two-letter ISO code",
     httpUrl: (label: string) => `${label} must start with http:// or https://`,
     icmpPort: () => "ICMP rules cannot set a port",
+    ipNoCidr: (label: string) => `${label} must be a single IP address, not CIDR`,
     integer: (label: string) => `${label} must be an integer`,
     invalid: (label: string) => `${label} is invalid`,
     ipv4Prefix: () => "IPv4 CIDR prefix must be between 0 and 32",
@@ -1918,6 +1988,7 @@ async function seedExample() {
 }
 
 async function createRule() {
+  validateFields(["ruleCidr", "rulePort"]);
   const payload = validateRuleForm();
   await api("rules", {
     method: "POST",
@@ -1938,6 +2009,7 @@ async function createGeo() {
 }
 
 async function createTempBan() {
+  validateFields(["tempBanIp", "tempBanPort"]);
   const payload = validateTempBanForm();
   await api("temp-bans", {
     method: "POST",
@@ -1968,6 +2040,7 @@ async function saveDynamicDefense() {
 }
 
 async function createDynamicRateLimit() {
+  validateFields(["dynamicRatePort"]);
   const payload = validateDynamicRateLimitForm();
   await api("dynamic-rate-limits", {
     method: "POST",
@@ -1978,6 +2051,7 @@ async function createDynamicRateLimit() {
 }
 
 async function createTrustedCidr() {
+  validateFields(["trustedCidr"]);
   const payload = validateTrustedCidrForm();
   await api("trusted-cidrs", {
     method: "POST",
@@ -2125,9 +2199,6 @@ function validateDynamicRateLimitForm() {
   if (protocol === "icmp" && port !== null) {
     throwValidation(v("icmpPort"));
   }
-  if (protocol === "any" && port !== null) {
-    throwValidation(v("anyPort"));
-  }
   return {
     enabled: true,
     priority: requireInteger(t("priority"), dynamicRateForm.priority),
@@ -2144,6 +2215,76 @@ function validateTrustedCidrForm() {
     cidr: requireCidr("CIDR", trustedForm.cidr),
     comment: String(trustedForm.comment ?? "").trim() || null
   };
+}
+
+function validateFields(keys: FieldKey[]) {
+  const results = keys.map((key) => validateField(key));
+  if (results.every(Boolean)) {
+    return;
+  }
+  const message = keys.map((key) => fieldErrors[key]).find(Boolean) || t("error");
+  throwValidation(message);
+}
+
+function hasFieldErrors(keys: FieldKey[]) {
+  return keys.some((key) => Boolean(fieldErrors[key]));
+}
+
+function validateTouchedField(key: FieldKey) {
+  if (touchedFields[key] || fieldErrors[key]) {
+    queueMicrotask(() => validateField(key));
+  }
+}
+
+function validateFieldAfterUpdate(key: FieldKey) {
+  queueMicrotask(() => validateField(key));
+}
+
+function validateField(key: FieldKey): boolean {
+  touchedFields[key] = true;
+  try {
+    switch (key) {
+      case "ruleCidr":
+        requireCidr(t("ruleCidr"), ruleForm.cidr);
+        break;
+      case "rulePort":
+        validateRulePortField();
+        break;
+      case "tempBanIp":
+        requireIp(t("sourceIp"), tempBanForm.ip);
+        break;
+      case "tempBanPort":
+        validateProtocolPortField(tempBanForm.protocol, tempBanForm.port, true);
+        break;
+      case "dynamicRatePort":
+        validateProtocolPortField(dynamicRateForm.protocol, dynamicRateForm.port, true);
+        break;
+      case "trustedCidr":
+        requireCidr("CIDR", trustedForm.cidr);
+        break;
+    }
+    delete fieldErrors[key];
+    return true;
+  } catch (err) {
+    fieldErrors[key] = err instanceof Error ? err.message : String(err);
+    return false;
+  }
+}
+
+function validateRulePortField() {
+  const protocol = requireOneOf(t("ruleProtocol"), ruleForm.protocol, protocols);
+  validateProtocolPortField(protocol, ruleForm.port, true);
+}
+
+function validateProtocolPortField(protocolValue: unknown, portValue: unknown, allowAnyPort: boolean) {
+  const protocol = requireOneOf(t("protocol"), protocolValue, protocols);
+  const port = optionalPort(portValue);
+  if (protocol === "icmp" && port !== null) {
+    throwValidation(v("icmpPort"));
+  }
+  if (!allowAnyPort && protocol === "any" && port !== null) {
+    throwValidation(v("anyPort"));
+  }
 }
 
 function requireText(label: string, value: unknown): string {
@@ -2216,6 +2357,9 @@ function requireCountry(value: unknown): string {
 
 function requireIp(label: string, value: unknown): string {
   const ip = requireText(label, value);
+  if (ip.includes("/")) {
+    throwValidation(v("ipNoCidr", label));
+  }
   if (isIpv4(ip) || isIpv6(ip)) {
     return ip;
   }
@@ -2238,9 +2382,12 @@ function requireHttpUrl(label: string, value: unknown): string {
 
 function requireCidr(label: string, value: unknown): string {
   const cidr = requireText(label, value);
-  const parts = cidr.split("/");
+  const parts = cidr.split("/").map((part) => part.trim());
   if (parts.length !== 2) {
     throwValidation(v("cidrPrefixRequired", label));
+  }
+  if (!parts[1]) {
+    throwValidation(v("cidrPrefixInteger", label));
   }
   const prefix = Number(parts[1]);
   if (!Number.isInteger(prefix)) {
@@ -2290,7 +2437,6 @@ function isIpv6(value: string): boolean {
 }
 
 function throwValidation(message: string): never {
-  error.value = message;
   throw new Error(message);
 }
 </script>

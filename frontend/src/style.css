@@ -347,11 +347,26 @@ main {
 }
 
 .defense-form {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: 1fr;
+}
+
+.defense-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 180px) repeat(3, minmax(120px, 1fr));
+  gap: 8px;
+  align-items: end;
+  min-width: 0;
+}
+
+.defense-row:first-child {
+  grid-template-columns: minmax(140px, 180px) repeat(2, minmax(120px, 1fr));
+}
+
+.defense-toggle {
+  align-self: stretch;
 }
 
 .defense-form .form-submit {
-  grid-column: 1 / -1;
   justify-self: end;
 }
 
@@ -385,6 +400,24 @@ main {
   font-size: 12px;
   font-weight: 600;
   overflow-wrap: anywhere;
+}
+
+.field-error {
+  display: -webkit-box;
+  min-height: 34px;
+  max-height: 34px;
+  color: #b42318;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  visibility: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.field-error.visible {
+  visibility: visible;
 }
 
 .check-field {
@@ -649,6 +682,15 @@ pre code {
   box-shadow: 0 0 0 3px rgba(35, 100, 170, 0.13);
 }
 
+.ui-input[aria-invalid="true"] {
+  border-color: #d92d20;
+}
+
+.ui-input[aria-invalid="true"]:focus {
+  border-color: #d92d20;
+  box-shadow: 0 0 0 3px rgba(217, 45, 32, 0.13);
+}
+
 .ui-input::placeholder {
   color: #98a4b3;
 }
@@ -793,7 +835,8 @@ pre code {
     grid-template-columns: 1fr 1fr;
   }
 
-  .defense-form {
+  .defense-row,
+  .defense-row:first-child {
     grid-template-columns: 1fr 1fr;
   }
 }
@@ -802,10 +845,14 @@ pre code {
   .rule-form,
   .geo-form,
   .threat-form,
-  .defense-form,
   .custom-rate-form,
   .temp-ban-form,
   .trusted-form {
+    grid-template-columns: 1fr;
+  }
+
+  .defense-row,
+  .defense-row:first-child {
     grid-template-columns: 1fr;
   }
 
