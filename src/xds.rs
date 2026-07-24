@@ -272,7 +272,7 @@ impl GeoIpRefresh {
         let db = db.clone();
         let geo_lookup = self.geo_lookup.clone();
         tokio::spawn(async move {
-            let result: Result<()> = async {
+            let result: Result<geo::GeoRefreshReport> = async {
                 let report = refresh_geo_ip_lists(&db).await?;
                 if report.changed_country_count > 0 {
                     let lookup_prefixes = geo_lookup.rebuild_from_db(&db).await?;
@@ -286,15 +286,25 @@ impl GeoIpRefresh {
                         "refreshed changed country IP lists during xDS push tick"
                     );
                 }
-                Ok(())
+                Ok(report)
             }
             .await;
             let mut guard = state.lock().expect("geo IP refresh mutex poisoned");
             guard.running = false;
-            if result.is_ok() {
-                guard.last_success = Some(started_at);
-            } else if let Err(err) = result {
-                warn!(error = %err, "country IP refresh failed during xDS push tick");
+            match result {
+                Ok(report) if report.failed_country_count == 0 && !report.running => {
+                    guard.last_success = Some(started_at);
+                }
+                Ok(report) => {
+                    warn!(
+                        status = %report.refresh_status,
+                        failed_countries = report.failed_country_count,
+                        "country IP refresh did not complete cleanly during xDS push tick"
+                    );
+                }
+                Err(err) => {
+                    warn!(error = %err, "country IP refresh failed during xDS push tick");
+                }
             }
         });
         Ok(())
@@ -464,6 +474,8 @@ pub async fn serve(
         k8s_discovery_enabled = runtime_trusted_cidrs.k8s_discovery.is_some(),
         "xDS gRPC server listening"
     );
+    let geo_ip_refresh = GeoIpRefresh::new(GEO_IP_REFRESH_INTERVAL, geo_lookup.clone());
+    spawn_geo_refresh_loop(db.clone(), geo_ip_refresh.clone(), GEO_IP_REFRESH_INTERVAL);
     Server::builder()
         .add_service(FirewallXdsServer::new(XdsService {
             db,
@@ -472,12 +484,27 @@ pub async fn serve(
             drop_events,
             runtime_trusted_cidrs,
             temp_ban_cleanup: TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL),
-            geo_ip_refresh: GeoIpRefresh::new(GEO_IP_REFRESH_INTERVAL, geo_lookup.clone()),
+            geo_ip_refresh,
             geo_lookup,
         }))
         .serve(bind)
         .await
         .context("xDS gRPC server failed")
+}
+
+fn spawn_geo_refresh_loop(
+    db: DatabaseConnection,
+    geo_ip_refresh: GeoIpRefresh,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = geo_ip_refresh.maybe_run(&db).await {
+                warn!(error = %err, "country IP background refresh trigger failed");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
 }
 
 impl XdsClient {
@@ -947,13 +974,7 @@ async fn cleanup_expired_temp_bans(db: &DatabaseConnection) -> Result<(u64, Opti
 }
 
 async fn refresh_geo_ip_lists(db: &DatabaseConnection) -> Result<geo::GeoRefreshReport> {
-    let rows = geo_country_policy::Entity::find()
-        .filter(geo_country_policy::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
-        .filter(geo_country_policy::Column::Enabled.eq(true))
-        .all(db)
-        .await?;
-    let countries = rows.into_iter().map(|row| row.country).collect::<Vec<_>>();
-    geo::refresh_ipdeny_lists(db, &countries).await
+    geo::refresh_all_ipdeny_lists(db).await
 }
 
 async fn geo_ip_lists_missing(db: &DatabaseConnection) -> Result<bool> {

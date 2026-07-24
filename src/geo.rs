@@ -1,6 +1,6 @@
 use crate::db::entities::{geo_country_catalog, geo_ip_list_state, geo_ip_prefix};
 use crate::{db, firewall};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use maxminddb::{Reader, path};
 use mmdb_writer::Writer;
@@ -13,10 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     net::IpAddr,
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, RwLock},
     time::Duration,
 };
 use tracing::{debug, info, warn};
@@ -26,25 +23,8 @@ const IPDENY_AGGREGATED_BASE: &str = "https://www.ipdeny.com/ipblocks/data/aggre
 const IPDENY_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const IPDENY_INDEX_MAX_BYTES: usize = 2 * 1024 * 1024;
 const IPDENY_COUNTRY_MAX_BYTES: usize = 16 * 1024 * 1024;
-
-static GEO_REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
-
-struct GeoRefreshRunGuard;
-
-impl GeoRefreshRunGuard {
-    fn try_start() -> Result<Self> {
-        GEO_REFRESH_RUNNING
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .map(|_| Self)
-            .map_err(|_| anyhow!("country IP refresh is already running"))
-    }
-}
-
-impl Drop for GeoRefreshRunGuard {
-    fn drop(&mut self) {
-        GEO_REFRESH_RUNNING.store(false, Ordering::SeqCst);
-    }
-}
+const REFRESH_LOCK_COUNTRY: &str = "__refresh_lock__";
+const REFRESH_LOCK_STALE_SECONDS: i64 = 30 * 60;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GeoPrefix {
     pub addr: IpAddr,
@@ -71,11 +51,14 @@ pub struct GeoRefreshReport {
     pub countries: Vec<String>,
     pub checked_country_count: usize,
     pub changed_country_count: usize,
+    pub unchanged_country_count: usize,
+    pub failed_country_count: usize,
     pub prefix_count: usize,
     pub provider_base_url: &'static str,
     pub refresh_status: String,
     pub cached: bool,
     pub running: bool,
+    pub errors: Vec<String>,
 }
 
 impl GeoRefreshReport {
@@ -84,12 +67,21 @@ impl GeoRefreshReport {
             countries: Vec::new(),
             checked_country_count: 0,
             changed_country_count: 0,
+            unchanged_country_count: 0,
+            failed_country_count: 0,
             prefix_count: 0,
             provider_base_url: IPDENY_ROOT,
             refresh_status: refresh_status.into(),
             cached: false,
             running: false,
+            errors: Vec::new(),
         }
+    }
+
+    pub fn running() -> Self {
+        let mut report = Self::empty("running");
+        report.running = true;
+        report
     }
 }
 
@@ -261,11 +253,119 @@ pub async fn list_country_options(db: &DatabaseConnection) -> Result<Vec<Country
         .collect())
 }
 
+struct GeoRefreshDbLock {
+    db: DatabaseConnection,
+    owner: String,
+}
+
+impl GeoRefreshDbLock {
+    async fn try_acquire(db: &DatabaseConnection) -> Result<Option<Self>> {
+        let now = chrono::Utc::now().naive_utc();
+        let owner = format!(
+            "{}:{}",
+            std::process::id(),
+            now.and_utc()
+                .timestamp_nanos_opt()
+                .unwrap_or_else(|| now.and_utc().timestamp_micros() * 1_000)
+        );
+        geo_ip_list_state::Entity::insert(geo_ip_list_state::ActiveModel {
+            country: Set(REFRESH_LOCK_COUNTRY.to_string()),
+            url: Set(IPDENY_ROOT.to_string()),
+            last_modified: Set(Some("idle".to_string())),
+            etag: Set(None),
+            prefix_count: Set(0),
+            last_checked_at: Set(now),
+            last_downloaded_at: Set(None),
+            updated_at: Set(now),
+            ..Default::default()
+        })
+        .on_conflict(
+            OnConflict::column(geo_ip_list_state::Column::Country)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await?;
+
+        let Some(existing) = geo_ip_list_state::Entity::find()
+            .filter(geo_ip_list_state::Column::Country.eq(REFRESH_LOCK_COUNTRY))
+            .one(db)
+            .await?
+        else {
+            bail!("failed to initialize country IP refresh database lock");
+        };
+
+        let is_running = existing.last_modified.as_deref() == Some("running");
+        let age_seconds = (now - existing.updated_at).num_seconds();
+        if is_running && age_seconds < REFRESH_LOCK_STALE_SECONDS {
+            return Ok(None);
+        }
+
+        let updated = geo_ip_list_state::Entity::update_many()
+            .filter(geo_ip_list_state::Column::Country.eq(REFRESH_LOCK_COUNTRY))
+            .filter(geo_ip_list_state::Column::UpdatedAt.eq(existing.updated_at))
+            .col_expr(
+                geo_ip_list_state::Column::LastModified,
+                sea_orm::sea_query::Expr::value("running"),
+            )
+            .col_expr(
+                geo_ip_list_state::Column::Etag,
+                sea_orm::sea_query::Expr::value(owner.clone()),
+            )
+            .col_expr(
+                geo_ip_list_state::Column::LastCheckedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .col_expr(
+                geo_ip_list_state::Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(now),
+            )
+            .exec(db)
+            .await?;
+        Ok((updated.rows_affected > 0).then(|| Self {
+            db: db.clone(),
+            owner,
+        }))
+    }
+}
+
+impl Drop for GeoRefreshDbLock {
+    fn drop(&mut self) {
+        let db = self.db.clone();
+        let owner = self.owner.clone();
+        tokio::spawn(async move {
+            let now = chrono::Utc::now().naive_utc();
+            if let Err(err) = geo_ip_list_state::Entity::update_many()
+                .filter(geo_ip_list_state::Column::Country.eq(REFRESH_LOCK_COUNTRY))
+                .filter(geo_ip_list_state::Column::Etag.eq(owner))
+                .col_expr(
+                    geo_ip_list_state::Column::LastModified,
+                    sea_orm::sea_query::Expr::value("idle"),
+                )
+                .col_expr(
+                    geo_ip_list_state::Column::Etag,
+                    sea_orm::sea_query::Expr::value(Option::<String>::None),
+                )
+                .col_expr(
+                    geo_ip_list_state::Column::UpdatedAt,
+                    sea_orm::sea_query::Expr::value(now),
+                )
+                .exec(&db)
+                .await
+            {
+                warn!(error = %err, "failed to release country IP refresh database lock");
+            }
+        });
+    }
+}
+
 pub async fn refresh_ipdeny_lists(
     db: &DatabaseConnection,
     countries: &[String],
 ) -> Result<GeoRefreshReport> {
-    let _guard = GeoRefreshRunGuard::try_start()?;
+    let Some(_guard) = GeoRefreshDbLock::try_acquire(db).await? else {
+        return Ok(GeoRefreshReport::running());
+    };
     refresh_ipdeny_country_catalog(db).await?;
     let mut requested = BTreeSet::new();
     for country in countries {
@@ -275,7 +375,9 @@ pub async fn refresh_ipdeny_lists(
 }
 
 pub async fn refresh_all_ipdeny_lists(db: &DatabaseConnection) -> Result<GeoRefreshReport> {
-    let _guard = GeoRefreshRunGuard::try_start()?;
+    let Some(_guard) = GeoRefreshDbLock::try_acquire(db).await? else {
+        return Ok(GeoRefreshReport::running());
+    };
     let countries = refresh_ipdeny_country_catalog(db)
         .await?
         .into_iter()
@@ -289,7 +391,10 @@ async fn refresh_ipdeny_lists_for_countries(
     countries: Vec<String>,
 ) -> Result<GeoRefreshReport> {
     let mut changed_country_count = 0_usize;
+    let mut unchanged_country_count = 0_usize;
+    let mut failed_country_count = 0_usize;
     let mut prefix_count = 0_usize;
+    let mut errors = Vec::new();
     let client = ipdeny_client()?;
     for country in &countries {
         match refresh_one_country(db, &client, country).await {
@@ -297,8 +402,12 @@ async fn refresh_ipdeny_lists_for_countries(
                 changed_country_count += 1;
                 prefix_count += count;
             }
-            Ok(None) => {}
+            Ok(None) => {
+                unchanged_country_count += 1;
+            }
             Err(err) => {
+                failed_country_count += 1;
+                errors.push(format!("{country}: {err:#}"));
                 warn!(
                     country,
                     error = %err,
@@ -310,12 +419,21 @@ async fn refresh_ipdeny_lists_for_countries(
     Ok(GeoRefreshReport {
         checked_country_count: countries.len(),
         changed_country_count,
+        unchanged_country_count,
+        failed_country_count,
         countries,
         prefix_count,
         provider_base_url: IPDENY_ROOT,
-        refresh_status: "completed".to_string(),
+        refresh_status: if failed_country_count == 0 {
+            "completed".to_string()
+        } else if changed_country_count > 0 || unchanged_country_count > 0 {
+            "partial_failed".to_string()
+        } else {
+            "failed".to_string()
+        },
         cached: false,
         running: false,
+        errors,
     })
 }
 
@@ -376,6 +494,19 @@ async fn refresh_one_country(
     }
 
     let (fetched_metadata, body) = fetch_country_body(client, country, existing.as_ref()).await?;
+    if body.is_empty() {
+        if let Some(existing) = existing {
+            touch_geo_ip_list_state(
+                db,
+                existing,
+                fetched_metadata.last_modified,
+                fetched_metadata.etag,
+            )
+            .await?;
+        }
+        debug!(country, "country IP list returned not-modified");
+        return Ok(None);
+    }
     let prefixes = parse_ipdeny_body(country, &body)?;
     if prefixes.is_empty() {
         bail!("country {country} IP list is empty");

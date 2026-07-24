@@ -420,11 +420,7 @@ async fn health() -> Json<HealthResponse> {
 }
 
 async fn list_countries(State(state): State<ApiState>) -> ApiResult<Json<Vec<geo::CountryOption>>> {
-    let mut countries = geo::list_country_options(&state.db).await?;
-    if countries.is_empty() {
-        countries = geo::refresh_ipdeny_country_catalog(&state.db).await?;
-    }
-    Ok(Json(countries))
+    Ok(Json(geo::list_country_options(&state.db).await?))
 }
 
 async fn current_policy_version(db: &DatabaseConnection) -> Result<i64> {
@@ -737,7 +733,9 @@ async fn run_geo_refresh(
     } else {
         current_policy_version(&db).await?
     };
-    report = geo_refresh_response_report(report, "completed", false, false);
+    let status = report.refresh_status.clone();
+    let running = report.running;
+    report = geo_refresh_response_report(report, &status, false, running);
     Ok(CachedGeoRefresh { version, report })
 }
 

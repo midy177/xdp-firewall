@@ -2,6 +2,7 @@
 
 ## Active Plan
 
+- [completed] Fix country IP refresh self-review findings: expose partial failures, treat 304 as unchanged, coordinate refreshes across control-plane instances, avoid blocking `/countries`, and run daily refresh from the control plane even when no agent is connected.
 - [completed] Persist country IP CIDR lists in the database and add daily xDS-side IPdeny metadata checks that download only changed countries.
 - [completed] Harden country IP refresh after review: add HTTP timeout, response-size caps, per-country error tolerance, conditional ETag/Last-Modified checks, and one-at-a-time refresh coordination.
 - [completed] Make xDS country IP auto-refresh non-blocking so external IPdeny downloads cannot stall policy fetch/stream delivery.
