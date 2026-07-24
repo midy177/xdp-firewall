@@ -2,6 +2,9 @@
 
 ## Active Plan
 
+- [completed] Fix frontend validation layout regressions and harden opportunistic xDS temporary-ban cleanup after code review.
+- [completed] Clean expired temporary bans opportunistically during xDS push ticks with shared control-plane throttling and policy version bumps.
+- [completed] Fix frontend validation message layout so reserved error space does not create excessive blank form height.
 - [completed] Reorder the left navigation by firewall enforcement priority, with observability and documentation items after policy controls.
 - [completed] Disable each frontend form submit/add button while that form has visible field validation errors.
 - [completed] Reserve inline validation message space in frontend forms so field errors do not shift row height.

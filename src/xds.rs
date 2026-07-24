@@ -1,10 +1,11 @@
 use crate::cli::XdsArgs;
-use crate::db::entities::{node, policy_version};
+use crate::db::entities::{node, policy_version, temp_ban};
 use crate::{firewall, k8s, monitor, security};
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set, sea_query::OnConflict,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait,
+    QueryFilter, Set, TransactionTrait, sea_query::OnConflict,
 };
 use serde::Serialize;
 use std::{
@@ -22,6 +23,8 @@ use tonic::metadata::MetadataMap;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, warn};
+
+const TEMP_BAN_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 pub mod proto {
     tonic::include_proto!("xdp_firewall.xds.v1");
@@ -53,6 +56,19 @@ struct XdsService {
     push_interval: Duration,
     drop_events: DropEventHub,
     runtime_trusted_cidrs: RuntimeTrustedCidrs,
+    temp_ban_cleanup: TempBanCleanup,
+}
+
+#[derive(Clone)]
+struct TempBanCleanup {
+    state: Arc<Mutex<TempBanCleanupState>>,
+    interval: Duration,
+}
+
+#[derive(Default)]
+struct TempBanCleanupState {
+    last_success: Option<Instant>,
+    running: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -146,6 +162,51 @@ impl DropEventHub {
     fn notify_changed(&self) {
         let version = self.inner.change_version.fetch_add(1, Ordering::SeqCst) + 1;
         self.inner.changes_tx.send_replace(version);
+    }
+}
+
+impl TempBanCleanup {
+    fn new(interval: Duration) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(TempBanCleanupState::default())),
+            interval,
+        }
+    }
+
+    async fn maybe_run(&self, db: &DatabaseConnection) -> Result<()> {
+        let started_at = Instant::now();
+        {
+            let mut state = self.state.lock().await;
+            if state.running {
+                return Ok(());
+            }
+            if state
+                .last_success
+                .and_then(|last| started_at.checked_duration_since(last))
+                .is_some_and(|elapsed| elapsed < self.interval)
+            {
+                return Ok(());
+            }
+            state.running = true;
+        }
+
+        let result = cleanup_expired_temp_bans(db).await;
+        {
+            let mut state = self.state.lock().await;
+            state.running = false;
+            if result.is_ok() {
+                state.last_success = Some(started_at);
+            }
+        }
+
+        let (deleted, version) = result?;
+        if let Some(version) = version {
+            info!(
+                deleted_expired_temp_bans = deleted,
+                version, "cleaned up expired temporary bans during xDS push tick"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -314,6 +375,7 @@ pub async fn serve(db: DatabaseConnection, args: XdsArgs, drop_events: DropEvent
             push_interval,
             drop_events,
             runtime_trusted_cidrs,
+            temp_ban_cleanup: TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL),
         }))
         .serve(bind)
         .await
@@ -512,6 +574,7 @@ impl FirewallXds for XdsService {
         let interval = self.push_interval;
         let drop_events = self.drop_events.clone();
         let runtime_trusted_cidrs = self.runtime_trusted_cidrs.clone();
+        let temp_ban_cleanup = self.temp_ban_cleanup.clone();
         let mut drop_monitor_changes = drop_events.subscribe_changes();
         let (tx, rx) = mpsc::channel(8);
 
@@ -539,6 +602,7 @@ impl FirewallXds for XdsService {
                     sent_version,
                     sent_runtime_fingerprint.as_deref(),
                     &runtime_trusted_cidrs,
+                    &temp_ban_cleanup,
                 )
                 .await
                 {
@@ -739,12 +803,66 @@ async fn latest_version(db: &DatabaseConnection) -> Result<i64> {
         .map_or(0, |row| row.version))
 }
 
+async fn cleanup_expired_temp_bans(db: &DatabaseConnection) -> Result<(u64, Option<i64>)> {
+    let now = chrono::Utc::now().naive_utc();
+    let (deleted, version) = db
+        .transaction::<_, (u64, Option<i64>), DbErr>(|txn| {
+            Box::pin(async move {
+                let deleted = temp_ban::Entity::delete_many()
+                    .filter(temp_ban::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+                    .filter(temp_ban::Column::ExpiresAt.lte(now))
+                    .exec(txn)
+                    .await?
+                    .rows_affected;
+                let version = if deleted > 0 {
+                    Some(
+                        next_policy_version_in_transaction(txn, firewall::DEFAULT_POLICY_NAME)
+                            .await?,
+                    )
+                } else {
+                    None
+                };
+                Ok((deleted, version))
+            })
+        })
+        .await?;
+    Ok((deleted, version))
+}
+
+async fn next_policy_version_in_transaction(
+    txn: &DatabaseTransaction,
+    policy_name: &str,
+) -> std::result::Result<i64, DbErr> {
+    let current = policy_version::Entity::find()
+        .filter(policy_version::Column::PolicyName.eq(policy_name))
+        .one(txn)
+        .await?;
+    let next_version = current.as_ref().map_or(1, |row| row.version + 1);
+    if let Some(row) = current {
+        let mut active: policy_version::ActiveModel = row.into();
+        active.version = Set(next_version);
+        active.updated_at = Set(chrono::Utc::now().naive_utc());
+        active.update(txn).await?;
+    } else {
+        policy_version::ActiveModel {
+            policy_name: Set(policy_name.to_string()),
+            version: Set(next_version),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+        }
+        .insert(txn)
+        .await?;
+    }
+    Ok(next_version)
+}
+
 async fn build_policy_update(
     db: &DatabaseConnection,
     current_version: i64,
     current_runtime_fingerprint: Option<&str>,
     runtime_trusted_cidrs: &RuntimeTrustedCidrs,
+    temp_ban_cleanup: &TempBanCleanup,
 ) -> Result<Option<(PolicyUpdate, String)>> {
+    temp_ban_cleanup.maybe_run(db).await?;
     let version = latest_version(db).await?;
     let runtime_cidrs = runtime_trusted_cidrs.current().await;
     let runtime_fingerprint = cidr_fingerprint(&runtime_cidrs);
@@ -872,6 +990,7 @@ fn unauthenticated_status() -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{ActiveModelTrait, ConnectOptions, Database};
 
     #[test]
     fn constant_time_eq_matches_equal_tokens() {
@@ -899,5 +1018,68 @@ mod tests {
         drop(all_subscription);
         assert!(!hub.enabled_for_node("node-a"));
         assert!(!hub.enabled_for_node("node-b"));
+    }
+
+    #[tokio::test]
+    async fn temp_ban_cleanup_deletes_expired_rows_and_bumps_version() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.sqlx_logging(false);
+        let db = Database::connect(options).await.unwrap();
+        crate::db::migrate(&db).await.unwrap();
+
+        let now = chrono::Utc::now().naive_utc();
+        temp_ban::ActiveModel {
+            policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+            ip: Set("203.0.113.10".to_string()),
+            protocol: Set("any".to_string()),
+            port: Set(None),
+            expires_at: Set(now - chrono::Duration::seconds(1)),
+            comment: Set(Some("expired".to_string())),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        temp_ban::ActiveModel {
+            policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+            ip: Set("203.0.113.20".to_string()),
+            protocol: Set("tcp".to_string()),
+            port: Set(Some(443)),
+            expires_at: Set(now + chrono::Duration::seconds(300)),
+            comment: Set(Some("active".to_string())),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let cleanup = TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL);
+        cleanup.maybe_run(&db).await.unwrap();
+
+        let rows = temp_ban::Entity::find().all(&db).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ip, "203.0.113.20");
+        assert_eq!(latest_version(&db).await.unwrap(), 1);
+
+        temp_ban::ActiveModel {
+            policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+            ip: Set("203.0.113.30".to_string()),
+            protocol: Set("udp".to_string()),
+            port: Set(Some(53)),
+            expires_at: Set(now - chrono::Duration::seconds(1)),
+            comment: Set(Some("expired inside throttle window".to_string())),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        cleanup.maybe_run(&db).await.unwrap();
+        let rows = temp_ban::Entity::find().all(&db).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(latest_version(&db).await.unwrap(), 1);
     }
 }

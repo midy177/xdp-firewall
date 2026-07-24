@@ -334,6 +334,12 @@ main {
   background: #fafbfc;
 }
 
+.form-grid:has(.field-error.visible) {
+  column-gap: 8px;
+  row-gap: 36px;
+  padding: 10px 16px 42px;
+}
+
 .rule-form {
   grid-template-columns: 92px 120px minmax(180px, 1fr) 120px 100px 38px;
 }
@@ -388,6 +394,8 @@ main {
 }
 
 .field {
+  position: relative;
+  z-index: 1;
   display: grid;
   gap: 5px;
   min-width: 0;
@@ -403,6 +411,11 @@ main {
 }
 
 .field-error {
+  position: absolute;
+  right: 0;
+  bottom: -36px;
+  left: 0;
+  z-index: 2;
   display: -webkit-box;
   min-height: 34px;
   max-height: 34px;
@@ -411,6 +424,7 @@ main {
   line-height: 1.35;
   overflow: hidden;
   overflow-wrap: anywhere;
+  pointer-events: none;
   visibility: hidden;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
