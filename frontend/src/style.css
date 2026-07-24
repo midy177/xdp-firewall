@@ -334,18 +334,41 @@ main {
   background: #fafbfc;
 }
 
-.form-grid:has(.field-error.visible) {
-  column-gap: 8px;
-  row-gap: 36px;
-  padding: 10px 16px 42px;
-}
-
 .rule-form {
   grid-template-columns: 92px 120px minmax(180px, 1fr) 120px 100px 38px;
 }
 
 .geo-form {
   grid-template-columns: minmax(180px, 260px) 120px 38px;
+}
+
+.compact-section {
+  min-height: 46px;
+}
+
+.geo-lookup-form {
+  grid-template-columns: minmax(180px, 260px) 38px minmax(120px, 1fr);
+  align-items: end;
+}
+
+.lookup-result {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.lookup-result span {
+  color: #607080;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.lookup-result strong {
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
+  color: #17202a;
+  font-size: 14px;
 }
 
 .threat-form {
@@ -411,14 +434,8 @@ main {
 }
 
 .field-error {
-  position: absolute;
-  right: 0;
-  bottom: -36px;
-  left: 0;
-  z-index: 2;
   display: -webkit-box;
   min-height: 34px;
-  max-height: 34px;
   color: #b42318;
   font-size: 12px;
   line-height: 1.35;
@@ -849,6 +866,14 @@ pre code {
     grid-template-columns: 1fr 1fr;
   }
 
+  .geo-lookup-form {
+    grid-template-columns: minmax(0, 1fr) 38px;
+  }
+
+  .geo-lookup-form .lookup-result {
+    grid-column: 1 / -1;
+  }
+
   .defense-row,
   .defense-row:first-child {
     grid-template-columns: 1fr 1fr;
@@ -858,6 +883,7 @@ pre code {
 @media (max-width: 560px) {
   .rule-form,
   .geo-form,
+  .geo-lookup-form,
   .threat-form,
   .custom-rate-form,
   .temp-ban-form,

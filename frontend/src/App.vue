@@ -194,6 +194,9 @@
             <h2>{{ t("countries") }}</h2>
             <p>{{ t("countriesHint") }}</p>
           </div>
+          <Button variant="secondary" :title="t('refreshCountryIps')" :disabled="actionBusy" @click="runAction(refreshGeoCountries)">
+            <RefreshCcw :class="{ spin: loading }" :size="16" />
+          </Button>
         </div>
         <div class="form-grid geo-form">
           <label class="field">
@@ -210,6 +213,25 @@
             </Select>
           </label>
           <Button class="form-submit" :title="t('add')" :disabled="actionBusy" @click="runAction(createGeo)"><Plus :size="16" /></Button>
+        </div>
+        <div class="subsection-head compact-section">
+          <div>
+            <h3>{{ t("countryLookup") }}</h3>
+            <p>{{ t("countryLookupHint") }}</p>
+          </div>
+        </div>
+        <div class="form-grid geo-lookup-form">
+          <label class="field">
+            <span>{{ t("ipAddress") }}</span>
+            <Input v-model="geoLookupForm.ip" aria-label="Geo lookup IP" placeholder="8.8.8.8" @keyup.enter="runAction(lookupGeoIp)" />
+          </label>
+          <Button class="form-submit" :title="t('query')" :disabled="actionBusy" @click="runAction(lookupGeoIp)">
+            <Globe2 :size="16" />
+          </Button>
+          <div class="lookup-result">
+            <span>{{ t("country") }}</span>
+            <strong>{{ geoLookupResult ? geoLookupLabel : '-' }}</strong>
+          </div>
         </div>
         <table>
           <thead>
@@ -310,7 +332,7 @@
               <td>{{ ban.ip }}</td>
               <td>{{ ban.protocol }}</td>
               <td>{{ ban.port ?? '*' }}</td>
-              <td>{{ ban.expires_at }}</td>
+              <td>{{ formatLocalTime(ban.expires_at) }}</td>
               <td class="clip">{{ ban.comment ?? '' }}</td>
               <td class="right"><Button variant="ghost" :title="t('delete')" :disabled="actionBusy" @click="runAction(() => deleteItem(`/temp-bans/${ban.id}`))"><Trash2 :size="15" /></Button></td>
             </tr>
@@ -600,7 +622,7 @@
               <td>{{ node.interface_name }}</td>
               <td>{{ node.last_applied_version }}</td>
               <td><Badge :tone="node.status === 'ok' ? 'green' : 'amber'">{{ node.status }}</Badge></td>
-              <td>{{ node.last_seen_at }}</td>
+              <td>{{ formatLocalTime(node.last_seen_at) }}</td>
               <td class="clip">{{ node.error ?? '' }}</td>
             </tr>
           </tbody>
@@ -676,7 +698,7 @@
               <td colspan="7" class="empty">{{ t("emptyDropEvents") }}</td>
             </tr>
             <tr v-for="event in filteredDropEvents" :key="event.local_id">
-              <td>{{ event.time }}</td>
+              <td>{{ formatLocalTime(event.time) }}</td>
               <td class="clip">{{ event.node_id }}</td>
               <td><Badge :tone="dropReasonTone(event.reason)">{{ dropReasonLabel(event.reason) }}</Badge></td>
               <td>{{ event.src }}</td>
@@ -774,11 +796,13 @@ type DynamicDefense = {
 };
 type NodeState = { node_id: string; interface_name: string; last_applied_version: number; status: string; last_seen_at: string; error?: string };
 type DropEvent = { local_id: number; node_id: string; interface_name: string; time: string; event_time_ns: number; cpu: number; reason: string; src: string; family: number; proto: string; dport: number; country?: string; action: string };
-type Snapshot = { version: number; rules: unknown[]; geo_countries: unknown[]; temp_bans: unknown[]; dynamic_defense: DynamicDefense; dynamic_rate_limits: unknown[]; trusted_cidrs: unknown[]; threat_sources: unknown[] };
+type Snapshot = { version: number; rules: unknown[]; geo_countries: unknown[]; geo_prefixes: unknown[]; temp_bans: unknown[]; dynamic_defense: DynamicDefense; dynamic_rate_limits: unknown[]; trusted_cidrs: unknown[]; threat_sources: unknown[] };
 type Page<T> = { items: T[]; total: number; page: number; page_size: number; total_pages: number };
 type PageState = { page: number; total_pages: number; total: number };
 type ApiDocEndpoint = { method: string; path: string; summary: string; body?: string; curl?: string };
 type ApiDocSection = { title: string; description: string; endpoints: ApiDocEndpoint[] };
+type GeoRefreshResponse = { countries: string[]; checked_country_count: number; changed_country_count: number; prefix_count: number; provider_base_url: string; refresh_status?: string; cached?: boolean; running?: boolean };
+type GeoLookupResponse = { ip: string; country?: string | null; country_name?: string | null };
 type Lang = "zh" | "en";
 type FieldKey = "ruleCidr" | "rulePort" | "tempBanIp" | "tempBanPort" | "dynamicRatePort" | "trustedCidr";
 const ruleErrorFields: FieldKey[] = ["ruleCidr", "rulePort"];
@@ -836,6 +860,8 @@ const nodePage = reactive<PageState>({ page: 1, total_pages: 0, total: 0 });
 
 const ruleForm = reactive({ priority: 10, action: "deny", cidr: "203.0.113.0/24", protocol: "any", port: "" });
 const geoForm = reactive({ country: "CN", action: "allow" });
+const geoLookupForm = reactive({ ip: "8.8.8.8" });
+const geoLookupResult = ref<GeoLookupResponse | null>(null);
 const threatForm = reactive({ name: "ipsum", url: "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt", format: "ipsum", min_score: 3 });
 const trustedForm = reactive({ cidr: "10.0.0.0/8", comment: "" });
 const dynamicRateForm = reactive({ priority: 10, protocol: "tcp", port: "443", packets_per_second: 1000, burst: 2000, comment: "" });
@@ -880,6 +906,8 @@ const messages = {
     countries: "国家",
     countriesHint: "按国家代码配置允许或拒绝",
     country: "国家",
+    countryLookup: "IP 归属查询",
+    countryLookupHint: "使用控制面内存 MMDB 查询源 IP 所属国家",
     customRateLimits: "自定义限流",
     customRateLimitsHint: "按协议或目的端口配置限流；优先级高于全局 IP 限流和 Flood",
     delete: "删除",
@@ -911,6 +939,7 @@ const messages = {
     firewall: "防火墙配置",
     highest: "最高",
     ipBurst: "IP 突发",
+    ipAddress: "IP 地址",
     ipPps: "IP PPS",
     interface: "网卡",
     name: "名称",
@@ -934,7 +963,9 @@ const messages = {
     priorityWhitelist: "白名单",
     priorityWhitelistDetail: "最高优先级，命中后直接允许",
     protocol: "协议",
+    query: "查询",
     refresh: "刷新",
+    refreshCountryIps: "更新国家 IP 列表",
     rules: "规则",
     rulesHint: "按优先级匹配 CIDR、协议和端口，数字越小优先级越高",
     ruleAction: "规则动作",
@@ -990,6 +1021,8 @@ const messages = {
     countries: "Countries",
     countriesHint: "Allow or deny by country code",
     country: "Country",
+    countryLookup: "IP Country Lookup",
+    countryLookupHint: "Query the control-plane in-memory MMDB for an IP country",
     customRateLimits: "Custom Rate Limits",
     customRateLimitsHint: "Rate-limit by protocol or destination port before global IP limit and flood",
     delete: "Delete",
@@ -1021,6 +1054,7 @@ const messages = {
     firewall: "Firewall Config",
     highest: "highest",
     ipBurst: "IP burst",
+    ipAddress: "IP address",
     ipPps: "IP PPS",
     interface: "Interface",
     name: "Name",
@@ -1044,7 +1078,9 @@ const messages = {
     priorityWhitelist: "Whitelist",
     priorityWhitelistDetail: "Highest priority; matching sources are allowed immediately",
     protocol: "Protocol",
+    query: "Query",
     refresh: "Refresh",
+    refreshCountryIps: "Refresh country IP lists",
     rules: "Rules",
     rulesHint: "Match CIDR, protocol, and port by priority; lower numbers have higher priority",
     ruleAction: "Rule action",
@@ -1129,6 +1165,7 @@ const apiDocsZh: ApiDocSection[] = [
     endpoints: [
       { method: "GET", path: "/health", summary: "健康检查，公开接口。" },
       { method: "GET", path: "/countries", summary: "返回国家下拉列表，公开接口。" },
+      { method: "GET", path: "/geo/lookup?ip=8.8.8.8", summary: "通过控制面内存 MMDB 查询 IP 归属国家。" },
       { method: "GET", path: "/policy", summary: "返回当前单一策略快照。" },
       { method: "POST", path: "/policy/bump-version", summary: "手动递增策略版本，触发 xDS 推送。" },
       { method: "POST", path: "/policy/seed-example", summary: "初始化示例规则，保留白名单和动态防御配置。" }
@@ -1161,9 +1198,10 @@ const apiDocsZh: ApiDocSection[] = [
   },
   {
     title: "国家规则",
-    description: "按国家代码允许或拒绝。国家 CIDR 由控制面编译策略时加载。",
+    description: "按国家代码允许或拒绝。国家名称和更新时间来自 IPdeny /ipblocks/ 页面，CIDR 从 aggregated 列表下载。",
     endpoints: [
       { method: "GET", path: "/geo-countries?page=1&page_size=100", summary: "分页列出国家规则。" },
+      { method: "POST", path: "/geo-countries/refresh", summary: "异步启动所有国家 IP 列表刷新；5 分钟内重复调用直接返回上一次刷新结果。" },
       {
         method: "POST",
         path: "/geo-countries",
@@ -1315,6 +1353,7 @@ const apiDocsEn: ApiDocSection[] = [
     endpoints: [
       { method: "GET", path: "/health", summary: "Health check. Public." },
       { method: "GET", path: "/countries", summary: "Country dropdown options. Public." },
+      { method: "GET", path: "/geo/lookup?ip=8.8.8.8", summary: "Query the control-plane in-memory MMDB for an IP country." },
       { method: "GET", path: "/policy", summary: "Return the current single policy snapshot." },
       { method: "POST", path: "/policy/bump-version", summary: "Increment the policy version and trigger xDS push." },
       { method: "POST", path: "/policy/seed-example", summary: "Seed example rules while preserving whitelist and dynamic defense settings." }
@@ -1347,9 +1386,10 @@ const apiDocsEn: ApiDocSection[] = [
   },
   {
     title: "Country Rules",
-    description: "Allow or deny by country code. Country CIDRs are loaded when compiling policy.",
+    description: "Allow or deny by country code. Country names and update metadata come from IPdeny /ipblocks/; CIDRs are downloaded from aggregated lists.",
     endpoints: [
       { method: "GET", path: "/geo-countries?page=1&page_size=100", summary: "List country rules." },
+      { method: "POST", path: "/geo-countries/refresh", summary: "Start an async refresh for all country IP lists; repeated calls within 5 minutes return the previous result." },
       {
         method: "POST",
         path: "/geo-countries",
@@ -1574,6 +1614,80 @@ const filteredDropEvents = computed(() => {
   });
 });
 
+const geoLookupLabel = computed(() => {
+  const result = geoLookupResult.value;
+  if (!result?.country) {
+    return "-";
+  }
+  return result.country_name ? `${result.country} · ${result.country_name}` : result.country;
+});
+
+function formatLocalTime(value: string | null | undefined) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return "-";
+  }
+  const date = new Date(timestampWithUtcDefault(text));
+  if (Number.isNaN(date.getTime())) {
+    return text;
+  }
+  return date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  });
+}
+
+function timestampWithUtcDefault(value: string) {
+  if (/([zZ]|[+-]\d{2}:?\d{2})$/.test(value)) {
+    return value;
+  }
+  if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(value)) {
+    return `${value.replace(" ", "T")}Z`;
+  }
+  return value;
+}
+
+function countryRefreshNotice(result: GeoRefreshResponse) {
+  if (language.value === "zh") {
+    if (result.running && result.cached) {
+      return "国家 IP 刷新正在后台执行，当前显示上一次刷新结果";
+    }
+    if (result.running) {
+      return "国家 IP 刷新已在后台启动";
+    }
+    if (result.refresh_status === "rate_limited" && result.cached) {
+      return "国家 IP 刷新处于限流窗口内，已返回上一次刷新结果";
+    }
+    if (result.refresh_status === "rate_limited") {
+      return "国家 IP 刷新处于限流窗口内，暂无上一次刷新结果";
+    }
+    if (result.changed_country_count === 0) {
+      return `已检查 ${result.checked_country_count} 个国家，远端未更新`;
+    }
+    return `已更新 ${result.changed_country_count}/${result.checked_country_count} 个国家，拉取 ${result.prefix_count} 条 CIDR`;
+  }
+  if (result.running && result.cached) {
+    return "Country IP refresh is running in the background; showing the previous result";
+  }
+  if (result.running) {
+    return "Country IP refresh started in the background";
+  }
+  if (result.refresh_status === "rate_limited" && result.cached) {
+    return "Country IP refresh is rate limited; showing the previous result";
+  }
+  if (result.refresh_status === "rate_limited") {
+    return "Country IP refresh is rate limited; no previous result is available yet";
+  }
+  if (result.changed_country_count === 0) {
+    return `Checked ${result.checked_country_count} countries; no upstream changes`;
+  }
+  return `Updated ${result.changed_country_count}/${result.checked_country_count} countries and fetched ${result.prefix_count} CIDRs`;
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   error.value = "";
   const headers = new Headers(init?.headers);
@@ -1614,6 +1728,7 @@ function isProtectedApiPath(path: string): boolean {
   return (
     clean.startsWith("policy") ||
     clean.startsWith("rules") ||
+    clean.startsWith("geo/") ||
     clean.startsWith("geo-countries") ||
     clean.startsWith("temp-bans") ||
     clean.startsWith("threat-sources") ||
@@ -2006,6 +2121,19 @@ async function createGeo() {
   });
   await refreshAll();
   showNotice(t("saved"));
+}
+
+async function refreshGeoCountries() {
+  const result = await api<Versioned<GeoRefreshResponse>>("geo-countries/refresh", {
+    method: "POST"
+  });
+  await refreshAll();
+  showNotice(countryRefreshNotice(result.data));
+}
+
+async function lookupGeoIp() {
+  const ip = requireIp(t("ipAddress"), geoLookupForm.ip);
+  geoLookupResult.value = await api<GeoLookupResponse>(`geo/lookup?ip=${encodeURIComponent(ip)}`);
 }
 
 async function createTempBan() {

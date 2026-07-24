@@ -48,6 +48,12 @@ pub struct GeoCountryPolicy {
     pub action: RuleAction,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeoIpPrefixPolicy {
+    pub cidr: IpNet,
+    pub country: String,
+}
+
 pub const DEFAULT_IP_RATE_LIMIT_PPS: u32 = 5_000;
 pub const DEFAULT_IP_RATE_LIMIT_BURST: u32 = 10_000;
 pub const DEFAULT_FLOOD_PPS: u32 = 20_000;
@@ -113,6 +119,8 @@ pub struct PolicySnapshot {
     pub version: i64,
     pub rules: Vec<FirewallRule>,
     pub geo_countries: Vec<GeoCountryPolicy>,
+    #[serde(default)]
+    pub geo_prefixes: Vec<GeoIpPrefixPolicy>,
     #[serde(default)]
     pub temp_bans: Vec<TempBanPolicy>,
     pub dynamic_defense: DynamicDefensePolicy,
@@ -226,6 +234,21 @@ pub async fn load_policy(db: &DatabaseConnection, policy_name: &str) -> Result<P
         .into_iter()
         .map(parse_geo_country_policy)
         .collect::<Result<Vec<_>>>()?;
+    let geo_country_codes = geo_countries
+        .iter()
+        .map(|policy| policy.country.clone())
+        .collect::<Vec<_>>();
+    let geo_prefixes = geo::load_persisted_geo_prefixes(db, &geo_country_codes)
+        .await?
+        .into_iter()
+        .map(|prefix| {
+            Ok(GeoIpPrefixPolicy {
+                cidr: geo_prefix_to_ipnet(prefix.addr, prefix.prefix)?,
+                country: geo::decode_country(prefix.country)
+                    .with_context(|| "invalid persisted geo country code")?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let threat_sources = threat_source::Entity::find()
         .filter(threat_source::Column::PolicyName.eq(policy_name))
@@ -277,6 +300,7 @@ pub async fn load_policy(db: &DatabaseConnection, policy_name: &str) -> Result<P
         version,
         rules,
         geo_countries,
+        geo_prefixes,
         temp_bans,
         dynamic_defense,
         dynamic_rate_limits,
@@ -310,20 +334,21 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
     for limit in &snapshot.dynamic_rate_limits {
         validate_dynamic_rate_limit_policy(limit)?;
     }
-    let countries = snapshot
-        .geo_countries
+    let geo_prefixes = snapshot
+        .geo_prefixes
         .iter()
-        .map(|policy| policy.country.clone())
-        .collect::<Vec<_>>();
-    let geo_prefixes = geo::fetch_ipdeny_prefixes(&countries)
-        .await?
-        .into_iter()
-        .map(|prefix| XdpGeoPrefix {
-            addr: prefix.addr,
-            prefix: prefix.prefix,
-            country: prefix.country,
+        .map(|prefix| {
+            let (addr, len) = match prefix.cidr {
+                IpNet::V4(net) => (IpAddr::V4(net.network()), net.prefix_len()),
+                IpNet::V6(net) => (IpAddr::V6(net.network()), net.prefix_len()),
+            };
+            Ok(XdpGeoPrefix {
+                addr,
+                prefix: len,
+                country: geo::encode_country(&prefix.country)?,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     let threat_prefixes = threat::fetch_threat_prefixes(&snapshot.threat_sources)
         .await?
         .into_iter()
@@ -681,6 +706,10 @@ fn parse_geo_country_policy(row: geo_country_policy::Model) -> Result<GeoCountry
         country: geo::normalize_country(&row.country)?,
         action: parse_action(&row.action)?,
     })
+}
+
+fn geo_prefix_to_ipnet(addr: IpAddr, prefix: u8) -> Result<IpNet> {
+    IpNet::new(addr, prefix).with_context(|| format!("invalid geo prefix {addr}/{prefix}"))
 }
 
 fn parse_dynamic_defense(row: dynamic_defense::Model) -> Result<DynamicDefensePolicy> {

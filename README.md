@@ -40,6 +40,8 @@ Useful endpoints:
 - `DELETE /rules/{id}`
 - `GET /geo-countries?page=1&page_size=100`
 - `POST /geo-countries`
+- `POST /geo-countries/refresh`
+- `GET /geo/lookup?ip=8.8.8.8`
 - `GET /temp-bans?page=1&page_size=100`
 - `POST /temp-bans`
 - `GET /threat-sources?page=1&page_size=100`
@@ -169,6 +171,30 @@ Ingress packets are evaluated in this order:
 4. Country allow/deny rules.
 5. Custom dynamic defense rate limits: protocol and/or destination-port token buckets.
 6. Global dynamic defense: `ip_rate_limit` and `flood`.
+
+## Country IP Lists
+
+Country metadata is crawled from the IPdeny country block page:
+
+```text
+https://www.ipdeny.com/ipblocks/
+```
+
+That page provides the provider-wide `Zone files last updated` value plus country names and two-letter country codes, such as `CHINA (CN)`.
+
+Country IP prefixes are still downloaded from IPdeny aggregated country lists:
+
+```text
+https://www.ipdeny.com/ipblocks/data/aggregated/{country}-aggregated.zone
+```
+
+For example, China is `https://www.ipdeny.com/ipblocks/data/aggregated/cn-aggregated.zone`.
+
+The control plane stores the country catalog in `firewall_geo_country_catalog`, per-country source metadata in `firewall_geo_ip_list_states`, and each country's CIDR list as one JSON-array row in `firewall_geo_ip_prefixes`. `GET /countries` is served from the persisted country catalog instead of a hard-coded list. `POST /geo-countries/refresh` starts an asynchronous refresh for all countries; the background task checks the crawled IPdeny page metadata and downloads/replaces a country's single JSON CIDR row only when the upstream timestamp changed or the country has no local CIDR state. Manual refresh starts are limited to once every 5 minutes per control-plane process; calls during the window return the last completed refresh result instead of starting another crawl. A policy version bump and xDS redistribution happen only when at least one country list changed.
+
+The xDS control plane also performs the same IPdeny index check opportunistically during policy push processing, at most once per day. If an enabled country has no persisted CIDR list row, the daily throttle is bypassed so newly added country rules can be populated immediately. Agents do not download country IP lists; persisted CIDRs are included in the xDS policy snapshot.
+
+On control-plane startup and after a changed country refresh, Rust rebuilds an in-memory MMDB from the persisted `firewall_geo_ip_prefixes.cidrs_json` arrays. MMDB records include both `country.iso_code` and `country.names.en`. The UI country page can query this lookup through `GET /geo/lookup?ip=8.8.8.8`, and realtime Drop events are enriched with a country code from the same MMDB when the agent/BPF event does not already include one.
 
 ## Temporary Bans
 

@@ -1,7 +1,10 @@
 pub mod dynamic_defense;
 pub mod dynamic_rate_limit;
 pub mod firewall_rule;
+pub mod geo_country_catalog;
 pub mod geo_country_policy;
+pub mod geo_ip_list_state;
+pub mod geo_ip_prefix;
 pub mod node;
 pub mod policy_version;
 pub mod temp_ban;

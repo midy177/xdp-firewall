@@ -3,7 +3,7 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
 use xdp_firewall::cli::{Cli, Command, PolicyCommand, XdsArgs};
-use xdp_firewall::{api, db, firewall, monitor, sync, xds};
+use xdp_firewall::{api, db, firewall, geo, monitor, sync, xds};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -42,8 +42,14 @@ async fn main() -> Result<()> {
                 trusted_cidrs: args.trusted_cidrs.clone(),
             };
             let drop_events = xds::DropEventHub::new();
-            let api_server = api::serve(db.clone(), args, drop_events.clone());
-            let xds_server = xds::serve(db, xds_args, drop_events);
+            let geo_lookup = geo::GeoIpLookup::default();
+            let loaded_geo_prefixes = geo_lookup.rebuild_from_db(&db).await?;
+            info!(
+                geo_prefixes = loaded_geo_prefixes,
+                "loaded country IP lookup database"
+            );
+            let api_server = api::serve(db.clone(), args, drop_events.clone(), geo_lookup.clone());
+            let xds_server = xds::serve(db, xds_args, drop_events, geo_lookup);
             tokio::try_join!(api_server, xds_server)?;
             Ok(())
         }
@@ -52,7 +58,13 @@ async fn main() -> Result<()> {
             let db = db::connect(&args.database.database_url).await?;
             db::migrate(&db).await?;
             firewall::ensure_builtin_policy(&db, firewall::DEFAULT_POLICY_NAME).await?;
-            xds::serve(db, args, xds::DropEventHub::new()).await
+            let geo_lookup = geo::GeoIpLookup::default();
+            let loaded_geo_prefixes = geo_lookup.rebuild_from_db(&db).await?;
+            info!(
+                geo_prefixes = loaded_geo_prefixes,
+                "loaded country IP lookup database"
+            );
+            xds::serve(db, args, xds::DropEventHub::new(), geo_lookup).await
         }
         Command::Agent(args) => {
             info!("starting agent command");

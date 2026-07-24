@@ -2,6 +2,25 @@
 
 ## Active Plan
 
+- [completed] Persist country IP CIDR lists in the database and add daily xDS-side IPdeny metadata checks that download only changed countries.
+- [completed] Harden country IP refresh after review: add HTTP timeout, response-size caps, per-country error tolerance, conditional ETag/Last-Modified checks, and one-at-a-time refresh coordination.
+- [completed] Make xDS country IP auto-refresh non-blocking so external IPdeny downloads cannot stall policy fetch/stream delivery.
+- [completed] Advance the policy version in the same transaction that persists changed country CIDR JSON rows.
+- [completed] Skip malformed persisted country CIDR rows with warning logs instead of tearing down the whole policy pipeline.
+- [completed] Replace frontend validation layout's `:has()`/absolute-position dependency with per-field reserved error space and fix the geo lookup responsive layout.
+- [completed] Store each country's persisted CIDR list as one database row containing a JSON CIDR array instead of one row per CIDR.
+- [completed] Crawl the IPdeny `/ipblocks/` country page for country full names, country codes, and provider update metadata.
+- [completed] Store country full names in the persisted catalog and include both `country.iso_code` and `country.names.en` in the generated MMDB.
+- [completed] Add structured API logs for Geo IP lookup requests, including IP, hit status, country code, and country name.
+- [completed] Lower successful `/health` request logs to debug level to reduce healthcheck noise.
+- [completed] Generate an in-memory MMDB from persisted country CIDRs on control-plane startup and after country IP list refreshes.
+- [completed] Add `GET /geo/lookup` and a country-page UI lookup tool for querying IP country from the control-plane MMDB.
+- [completed] Enrich realtime Drop events with country codes from the control-plane MMDB when the agent/BPF event does not already include a country.
+- [completed] Serve the country dropdown from the persisted IPdeny country catalog instead of a hard-coded country list.
+- [completed] Change manual `POST /geo-countries/refresh` to start an asynchronous all-country refresh and return the previous result during the 5-minute rate-limit window.
+- [completed] Treat missing or empty persisted country CIDR JSON rows as stale even when IPdeny metadata has not changed.
+- [completed] Add a geo IP list state table plus API/frontend refresh action that checks IPdeny Last-Modified/ETag and only downloads/bump xDS when country lists changed.
+- [completed] Format frontend timestamps in the browser's local timezone instead of rendering raw API timestamp strings.
 - [completed] Fix frontend validation layout regressions and harden opportunistic xDS temporary-ban cleanup after code review.
 - [completed] Clean expired temporary bans opportunistically during xDS push ticks with shared control-plane throttling and policy version bumps.
 - [completed] Fix frontend validation message layout so reserved error space does not create excessive blank form height.

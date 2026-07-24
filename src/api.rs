@@ -1,7 +1,7 @@
 use crate::cli::{ApiArgs, SeedExampleArgs};
 use crate::db::entities::{
-    dynamic_defense, dynamic_rate_limit, firewall_rule, geo_country_policy, node, temp_ban,
-    threat_source, trusted_cidr,
+    dynamic_defense, dynamic_rate_limit, firewall_rule, geo_country_policy, node, policy_version,
+    temp_ban, threat_source, trusted_cidr,
 };
 use crate::{db, firewall, geo, security, threat, xds};
 use anyhow::{Context, Result, bail};
@@ -22,11 +22,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     convert::Infallible,
     net::SocketAddr,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const API_TOKEN_ENV: &str = "XDP_FIREWALL_API_TOKEN";
 const ALLOW_UNAUTHENTICATED_ENV: &str = "XDP_FIREWALL_ALLOW_UNAUTHENTICATED";
@@ -37,6 +38,7 @@ const FRONTEND_CACHE_CONTROL: &str = "no-store, max-age=0";
 const FRONTEND_ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 const DEFAULT_TEMP_BAN_SECONDS: i64 = 300;
 const MAX_TEMP_BAN_SECONDS: i64 = 31_536_000;
+const GEO_REFRESH_RATE_LIMIT: Duration = Duration::from_secs(300);
 
 mod frontend_assets {
     include!(concat!(env!("OUT_DIR"), "/frontend_assets.rs"));
@@ -47,6 +49,39 @@ struct ApiState {
     db: DatabaseConnection,
     api_token: Option<String>,
     drop_events: xds::DropEventHub,
+    geo_lookup: geo::GeoIpLookup,
+    geo_refresh_limiter: GeoRefreshLimiter,
+}
+
+#[derive(Clone, Default)]
+struct GeoRefreshLimiter {
+    state: Arc<StdMutex<GeoRefreshLimiterState>>,
+}
+
+#[derive(Default)]
+struct GeoRefreshLimiterState {
+    last_started: Option<Instant>,
+    running: bool,
+    last_result: Option<CachedGeoRefresh>,
+}
+
+struct GeoRefreshPermit {
+    limiter: GeoRefreshLimiter,
+}
+
+#[derive(Clone)]
+struct CachedGeoRefresh {
+    version: i64,
+    report: geo::GeoRefreshReport,
+}
+
+enum GeoRefreshDecision {
+    Start {
+        permit: GeoRefreshPermit,
+        previous: Option<CachedGeoRefresh>,
+    },
+    Running(Option<CachedGeoRefresh>),
+    RateLimited(Option<CachedGeoRefresh>),
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +104,18 @@ struct PaginationQuery {
 #[derive(Debug, Deserialize)]
 struct DropEventQuery {
     node_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeoLookupQuery {
+    ip: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GeoLookupResponse {
+    ip: String,
+    country: Option<String>,
+    country_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -177,6 +224,7 @@ pub async fn serve(
     db: DatabaseConnection,
     args: ApiArgs,
     drop_events: xds::DropEventHub,
+    geo_lookup: geo::GeoIpLookup,
 ) -> Result<()> {
     let bind = args
         .bind
@@ -199,6 +247,8 @@ pub async fn serve(
         db,
         api_token,
         drop_events,
+        geo_lookup,
+        geo_refresh_limiter: GeoRefreshLimiter::default(),
     });
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -234,6 +284,8 @@ fn router(state: ApiState) -> Router {
             "/geo-countries",
             get(list_geo_countries).post(create_geo_country),
         )
+        .route("/geo-countries/refresh", post(refresh_geo_countries))
+        .route("/geo/lookup", get(lookup_geo_ip))
         .route("/geo-countries/{id}", delete(delete_geo_country))
         .route(
             "/threat-sources",
@@ -289,6 +341,8 @@ async fn log_request(request: axum::extract::Request, next: Next) -> Response {
         error!(%method, %path, status = status.as_u16(), elapsed_ms, "API request failed");
     } else if status.is_client_error() {
         warn!(%method, %path, status = status.as_u16(), elapsed_ms, "API request rejected");
+    } else if path == "/health" {
+        debug!(%method, %path, status = status.as_u16(), elapsed_ms, "API request completed");
     } else {
         info!(%method, %path, status = status.as_u16(), elapsed_ms, "API request completed");
     }
@@ -365,8 +419,20 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
-async fn list_countries() -> Json<&'static [geo::Country]> {
-    Json(geo::countries())
+async fn list_countries(State(state): State<ApiState>) -> ApiResult<Json<Vec<geo::CountryOption>>> {
+    let mut countries = geo::list_country_options(&state.db).await?;
+    if countries.is_empty() {
+        countries = geo::refresh_ipdeny_country_catalog(&state.db).await?;
+    }
+    Ok(Json(countries))
+}
+
+async fn current_policy_version(db: &DatabaseConnection) -> Result<i64> {
+    Ok(policy_version::Entity::find()
+        .filter(policy_version::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .one(db)
+        .await?
+        .map_or(0, |row| row.version))
 }
 
 async fn stream_drop_events(
@@ -539,6 +605,152 @@ async fn create_geo_country(
     .await?;
     let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
     Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
+}
+
+async fn refresh_geo_countries(
+    State(state): State<ApiState>,
+) -> ApiResult<Json<Versioned<geo::GeoRefreshReport>>> {
+    match state
+        .geo_refresh_limiter
+        .start_or_cached(GEO_REFRESH_RATE_LIMIT)
+    {
+        GeoRefreshDecision::Start { permit, previous } => {
+            let db = state.db.clone();
+            let geo_lookup = state.geo_lookup.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                match run_geo_refresh(db, geo_lookup).await {
+                    Ok(result) => {
+                        info!(
+                            version = result.version,
+                            checked_countries = result.report.checked_country_count,
+                            changed_countries = result.report.changed_country_count,
+                            prefixes = result.report.prefix_count,
+                            "country IP refresh completed"
+                        );
+                        _permit.finish_success(result);
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "country IP refresh failed");
+                    }
+                }
+            });
+            let version = previous
+                .as_ref()
+                .map(|cached| cached.version)
+                .unwrap_or(current_policy_version(&state.db).await?);
+            let report = previous
+                .map(|cached| geo_refresh_response_report(cached.report, "running", true, true))
+                .unwrap_or_else(|| {
+                    geo_refresh_response_report(
+                        geo::GeoRefreshReport::empty("running"),
+                        "running",
+                        false,
+                        true,
+                    )
+                });
+            Ok(Json(Versioned {
+                version,
+                data: report,
+            }))
+        }
+        GeoRefreshDecision::Running(cached) => {
+            let version = cached
+                .as_ref()
+                .map(|cached| cached.version)
+                .unwrap_or(current_policy_version(&state.db).await?);
+            let report = cached
+                .map(|cached| geo_refresh_response_report(cached.report, "running", true, true))
+                .unwrap_or_else(|| {
+                    geo_refresh_response_report(
+                        geo::GeoRefreshReport::empty("running"),
+                        "running",
+                        false,
+                        true,
+                    )
+                });
+            Ok(Json(Versioned {
+                version,
+                data: report,
+            }))
+        }
+        GeoRefreshDecision::RateLimited(cached) => {
+            let version = cached
+                .as_ref()
+                .map(|cached| cached.version)
+                .unwrap_or(current_policy_version(&state.db).await?);
+            let report = cached
+                .map(|cached| {
+                    geo_refresh_response_report(cached.report, "rate_limited", true, false)
+                })
+                .unwrap_or_else(|| {
+                    geo_refresh_response_report(
+                        geo::GeoRefreshReport::empty("rate_limited"),
+                        "rate_limited",
+                        false,
+                        false,
+                    )
+                });
+            Ok(Json(Versioned {
+                version,
+                data: report,
+            }))
+        }
+    }
+}
+
+async fn lookup_geo_ip(
+    State(state): State<ApiState>,
+    Query(query): Query<GeoLookupQuery>,
+) -> ApiResult<Json<GeoLookupResponse>> {
+    let ip: std::net::IpAddr = query
+        .ip
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid IP '{}'", query.ip.trim()))?;
+    let country = state.geo_lookup.lookup_country_record(ip);
+    info!(
+        ip = %ip,
+        hit = country.is_some(),
+        country = country.as_ref().map(|country| country.code.as_str()).unwrap_or("-"),
+        country_name = country
+            .as_ref()
+            .and_then(|country| country.name.as_deref())
+            .unwrap_or("-"),
+        "geo IP lookup completed"
+    );
+    Ok(Json(GeoLookupResponse {
+        ip: ip.to_string(),
+        country: country.as_ref().map(|country| country.code.clone()),
+        country_name: country.and_then(|country| country.name),
+    }))
+}
+
+async fn run_geo_refresh(
+    db: DatabaseConnection,
+    geo_lookup: geo::GeoIpLookup,
+) -> Result<CachedGeoRefresh> {
+    let mut report = geo::refresh_all_ipdeny_lists(&db).await?;
+    let version = if report.changed_country_count > 0 {
+        geo_lookup.rebuild_from_db(&db).await?;
+        current_policy_version(&db).await?
+    } else {
+        current_policy_version(&db).await?
+    };
+    report = geo_refresh_response_report(report, "completed", false, false);
+    Ok(CachedGeoRefresh { version, report })
+}
+
+fn geo_refresh_response_report(
+    mut report: geo::GeoRefreshReport,
+    status: &str,
+    cached: bool,
+    running: bool,
+) -> geo::GeoRefreshReport {
+    report.refresh_status = status.to_string();
+    report.cached = cached;
+    report.running = running;
+    report
 }
 
 async fn delete_geo_country(
@@ -971,6 +1183,55 @@ impl From<node::Model> for NodeResponse {
     }
 }
 
+impl GeoRefreshLimiter {
+    fn start_or_cached(&self, interval: Duration) -> GeoRefreshDecision {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .expect("geo refresh limiter mutex poisoned");
+        if state.running {
+            return GeoRefreshDecision::Running(state.last_result.clone());
+        }
+        if let Some(last_started) = state.last_started {
+            let elapsed = now.saturating_duration_since(last_started);
+            if elapsed < interval {
+                return GeoRefreshDecision::RateLimited(state.last_result.clone());
+            }
+        }
+        state.running = true;
+        state.last_started = Some(now);
+        GeoRefreshDecision::Start {
+            permit: GeoRefreshPermit {
+                limiter: self.clone(),
+            },
+            previous: state.last_result.clone(),
+        }
+    }
+}
+
+impl GeoRefreshPermit {
+    fn finish_success(&self, result: CachedGeoRefresh) {
+        let mut state = self
+            .limiter
+            .state
+            .lock()
+            .expect("geo refresh limiter mutex poisoned");
+        state.last_result = Some(result);
+    }
+}
+
+impl Drop for GeoRefreshPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .limiter
+            .state
+            .lock()
+            .expect("geo refresh limiter mutex poisoned");
+        state.running = false;
+    }
+}
+
 impl ApiError {
     fn unauthorized(message: impl Into<String>) -> Self {
         Self {
@@ -1247,6 +1508,8 @@ mod tests {
             db: db.clone(),
             api_token: None,
             drop_events: xds::DropEventHub::new(),
+            geo_lookup: geo::GeoIpLookup::default(),
+            geo_refresh_limiter: GeoRefreshLimiter::default(),
         });
         (app, db)
     }
@@ -1320,6 +1583,33 @@ mod tests {
         headers.insert(API_TOKEN_HEADER, "secret-token".parse().unwrap());
 
         assert_eq!(request_token(&headers), Some("secret-token"));
+    }
+
+    #[test]
+    fn geo_refresh_limiter_returns_cached_result_for_concurrent_and_repeated_refreshes() {
+        let limiter = GeoRefreshLimiter::default();
+        let permit = match limiter.start_or_cached(Duration::from_secs(300)) {
+            GeoRefreshDecision::Start { permit, previous } => {
+                assert!(previous.is_none());
+                permit
+            }
+            _ => panic!("first refresh should start"),
+        };
+        match limiter.start_or_cached(Duration::from_secs(300)) {
+            GeoRefreshDecision::Running(None) => {}
+            _ => panic!("concurrent refresh without cache should return running state"),
+        }
+
+        permit.finish_success(CachedGeoRefresh {
+            version: 7,
+            report: geo::GeoRefreshReport::empty("completed"),
+        });
+
+        drop(permit);
+        match limiter.start_or_cached(Duration::from_secs(300)) {
+            GeoRefreshDecision::RateLimited(Some(cached)) => assert_eq!(cached.version, 7),
+            _ => panic!("repeated refresh should return cached result"),
+        }
     }
 
     #[tokio::test]

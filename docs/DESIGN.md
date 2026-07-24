@@ -184,6 +184,9 @@ flowchart TB
 - `firewall_policy_versions`：策略版本。
 - `firewall_rules`：普通 CIDR allow/deny 规则。
 - `firewall_geo_country_policies`：国家 allow/deny 规则。
+- `firewall_geo_country_catalog`：从 IPdeny `/ipblocks/` 页面发现并持久化的国家列表，包含国家短码、完整名称、下载 URL 和上游更新时间。
+- `firewall_geo_ip_list_states`：每个国家 IP 列表的远端更新时间、检查时间和前缀数量。
+- `firewall_geo_ip_prefixes`：已下载并持久化的国家 CIDR 列表，每个国家一行，CIDR 以 JSON 数组保存，agent 不直接访问 IPdeny。
 - `firewall_dynamic_defense`：全局 IP 限流和 flood 配置。
 - `firewall_dynamic_rate_limits`：按协议和目的端口配置的自定义限流。
 - `firewall_temp_bans`：临时源 IP 封禁。
@@ -199,6 +202,8 @@ flowchart TB
 - agent 本地识别到的控制面 IP 字面量。
 
 运行时注入项只进入 xDS 下发快照，不写入数据库，也不显示为用户管理的白名单行。
+
+控制面启动时会从 `firewall_geo_ip_prefixes.cidrs_json` 生成内存 MMDB；国家 IP 列表有变更并写入数据库后，也会重新生成 MMDB。MMDB 记录包含 `country.iso_code` 和 `country.names.en`，用于控制台 IP 归属查询和实时 Drop 事件国家短码补全，不替代下发给 eBPF 的 `geo_cidrs` LPM trie。
 
 ## 规则优先级
 
@@ -389,6 +394,7 @@ agent 打印：
 - 规则数量、国家规则数量、白名单数量、威胁源数量。
 - 动态防御开关和参数。
 - 每次心跳的 XDP counters。
+- 实时 Drop 事件会经 xDS 上报到控制面；如果事件本身没有国家短码，控制面用内存 MMDB 按源 IP 补全。
 
 counter 分类：
 
@@ -434,6 +440,8 @@ Axum API 提供：
 - 策略读取和版本管理。
 - 普通规则 CRUD。
 - 国家规则 CRUD。
+- 国家列表刷新和 IP 归属查询。
+- 手动国家列表刷新会异步覆盖所有国家；控制面进程内按 5 分钟窗口限制启动频率，窗口内重复请求直接返回上一次刷新结果。
 - 白名单 CRUD。
 - 威胁源 CRUD。
 - 动态防御配置。

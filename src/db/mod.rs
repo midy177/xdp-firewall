@@ -3,7 +3,8 @@ pub mod entities;
 use anyhow::{Context, Result};
 use sea_orm::sea_query::Index;
 use sea_orm::{
-    ConnectionTrait, Database, DatabaseConnection, DbBackend, EntityName, Schema, Statement,
+    ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction, DbBackend, DbErr,
+    EntityName, Schema, Statement,
 };
 
 pub async fn connect(url: &str) -> Result<DatabaseConnection> {
@@ -32,6 +33,21 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
     .await?;
     create_table(
         db,
+        schema.create_table_from_entity(entities::geo_country_catalog::Entity),
+    )
+    .await?;
+    create_table(
+        db,
+        schema.create_table_from_entity(entities::geo_ip_list_state::Entity),
+    )
+    .await?;
+    create_table(
+        db,
+        schema.create_table_from_entity(entities::geo_ip_prefix::Entity),
+    )
+    .await?;
+    create_table(
+        db,
         schema.create_table_from_entity(entities::threat_source::Entity),
     )
     .await?;
@@ -48,6 +64,39 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
     create_table(
         db,
         schema.create_table_from_entity(entities::temp_ban::Entity),
+    )
+    .await?;
+    create_index(
+        db,
+        Index::create()
+            .if_not_exists()
+            .name("idx_firewall_geo_country_catalog_code")
+            .table(entities::geo_country_catalog::Entity.table_ref())
+            .col(entities::geo_country_catalog::Column::Code)
+            .unique()
+            .to_owned(),
+    )
+    .await?;
+    create_index(
+        db,
+        Index::create()
+            .if_not_exists()
+            .name("idx_firewall_geo_ip_list_states_country")
+            .table(entities::geo_ip_list_state::Entity.table_ref())
+            .col(entities::geo_ip_list_state::Column::Country)
+            .unique()
+            .to_owned(),
+    )
+    .await?;
+    create_index(
+        db,
+        Index::create()
+            .if_not_exists()
+            .name("idx_firewall_geo_ip_prefixes_country")
+            .table(entities::geo_ip_prefix::Entity.table_ref())
+            .col(entities::geo_ip_prefix::Column::Country)
+            .unique()
+            .to_owned(),
     )
     .await?;
     create_index(
@@ -145,6 +194,35 @@ pub async fn next_policy_version(db: &DatabaseConnection, policy_name: &str) -> 
             updated_at: Set(chrono::Utc::now().naive_utc()),
         }
         .insert(db)
+        .await?;
+    }
+    Ok(next_version)
+}
+
+pub async fn next_policy_version_in_transaction(
+    txn: &DatabaseTransaction,
+    policy_name: &str,
+) -> std::result::Result<i64, DbErr> {
+    use entities::policy_version::{ActiveModel, Entity};
+    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+
+    let current = Entity::find()
+        .filter(entities::policy_version::Column::PolicyName.eq(policy_name))
+        .one(txn)
+        .await?;
+    let next_version = current.as_ref().map_or(1, |row| row.version + 1);
+    if let Some(row) = current {
+        let mut active: ActiveModel = row.into();
+        active.version = Set(next_version);
+        active.updated_at = Set(chrono::Utc::now().naive_utc());
+        active.update(txn).await?;
+    } else {
+        ActiveModel {
+            policy_name: Set(policy_name.to_string()),
+            version: Set(next_version),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+        }
+        .insert(txn)
         .await?;
     }
     Ok(next_version)

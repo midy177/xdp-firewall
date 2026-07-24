@@ -1,11 +1,11 @@
 use crate::cli::XdsArgs;
-use crate::db::entities::{node, policy_version, temp_ban};
-use crate::{firewall, k8s, monitor, security};
+use crate::db::entities::{geo_country_policy, geo_ip_prefix, node, policy_version, temp_ban};
+use crate::{firewall, geo, k8s, monitor, security};
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, DatabaseTransaction, DbErr, EntityTrait,
-    QueryFilter, Set, TransactionTrait, sea_query::OnConflict,
+    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, Set, TransactionTrait,
+    sea_query::OnConflict,
 };
 use serde::Serialize;
 use std::{
@@ -25,6 +25,7 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{info, warn};
 
 const TEMP_BAN_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+const GEO_IP_REFRESH_INTERVAL: Duration = Duration::from_secs(86_400);
 
 pub mod proto {
     tonic::include_proto!("xdp_firewall.xds.v1");
@@ -57,6 +58,8 @@ struct XdsService {
     drop_events: DropEventHub,
     runtime_trusted_cidrs: RuntimeTrustedCidrs,
     temp_ban_cleanup: TempBanCleanup,
+    geo_ip_refresh: GeoIpRefresh,
+    geo_lookup: geo::GeoIpLookup,
 }
 
 #[derive(Clone)]
@@ -67,6 +70,19 @@ struct TempBanCleanup {
 
 #[derive(Default)]
 struct TempBanCleanupState {
+    last_success: Option<Instant>,
+    running: bool,
+}
+
+#[derive(Clone)]
+struct GeoIpRefresh {
+    state: Arc<StdMutex<GeoIpRefreshState>>,
+    interval: Duration,
+    geo_lookup: geo::GeoIpLookup,
+}
+
+#[derive(Default)]
+struct GeoIpRefreshState {
     last_success: Option<Instant>,
     running: bool,
 }
@@ -210,6 +226,81 @@ impl TempBanCleanup {
     }
 }
 
+impl GeoIpRefresh {
+    fn new(interval: Duration, geo_lookup: geo::GeoIpLookup) -> Self {
+        Self {
+            state: Arc::new(StdMutex::new(GeoIpRefreshState::default())),
+            interval,
+            geo_lookup,
+        }
+    }
+
+    async fn maybe_run(&self, db: &DatabaseConnection) -> Result<()> {
+        let started_at = Instant::now();
+        let due = {
+            let state = self.state.lock().expect("geo IP refresh mutex poisoned");
+            !state.running
+                && !state
+                    .last_success
+                    .and_then(|last| started_at.checked_duration_since(last))
+                    .is_some_and(|elapsed| elapsed < self.interval)
+        };
+        let missing_lists = if due {
+            false
+        } else {
+            geo_ip_lists_missing(db).await?
+        };
+        if !due && !missing_lists {
+            return Ok(());
+        }
+
+        {
+            let mut state = self.state.lock().expect("geo IP refresh mutex poisoned");
+            if state.running {
+                return Ok(());
+            }
+            let within_interval = state
+                .last_success
+                .and_then(|last| started_at.checked_duration_since(last))
+                .is_some_and(|elapsed| elapsed < self.interval);
+            if within_interval && !missing_lists {
+                return Ok(());
+            }
+            state.running = true;
+        }
+        let state = self.state.clone();
+        let db = db.clone();
+        let geo_lookup = self.geo_lookup.clone();
+        tokio::spawn(async move {
+            let result: Result<()> = async {
+                let report = refresh_geo_ip_lists(&db).await?;
+                if report.changed_country_count > 0 {
+                    let lookup_prefixes = geo_lookup.rebuild_from_db(&db).await?;
+                    let version = latest_version(&db).await?;
+                    info!(
+                        checked_countries = report.checked_country_count,
+                        changed_countries = report.changed_country_count,
+                        prefixes = report.prefix_count,
+                        lookup_prefixes,
+                        version,
+                        "refreshed changed country IP lists during xDS push tick"
+                    );
+                }
+                Ok(())
+            }
+            .await;
+            let mut guard = state.lock().expect("geo IP refresh mutex poisoned");
+            guard.running = false;
+            if result.is_ok() {
+                guard.last_success = Some(started_at);
+            } else if let Err(err) = result {
+                warn!(error = %err, "country IP refresh failed during xDS push tick");
+            }
+        });
+        Ok(())
+    }
+}
+
 impl Default for DropEventHub {
     fn default() -> Self {
         Self::new()
@@ -348,7 +439,12 @@ impl RuntimeTrustedCidrs {
     }
 }
 
-pub async fn serve(db: DatabaseConnection, args: XdsArgs, drop_events: DropEventHub) -> Result<()> {
+pub async fn serve(
+    db: DatabaseConnection,
+    args: XdsArgs,
+    drop_events: DropEventHub,
+    geo_lookup: geo::GeoIpLookup,
+) -> Result<()> {
     let bind: SocketAddr = args
         .bind
         .parse()
@@ -376,6 +472,8 @@ pub async fn serve(db: DatabaseConnection, args: XdsArgs, drop_events: DropEvent
             drop_events,
             runtime_trusted_cidrs,
             temp_ban_cleanup: TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL),
+            geo_ip_refresh: GeoIpRefresh::new(GEO_IP_REFRESH_INTERVAL, geo_lookup.clone()),
+            geo_lookup,
         }))
         .serve(bind)
         .await
@@ -533,6 +631,10 @@ impl FirewallXds for XdsService {
             return Err(unauthenticated_status());
         }
         let request = request.into_inner();
+        self.geo_ip_refresh
+            .maybe_run(&self.db)
+            .await
+            .map_err(internal_status)?;
         let version = latest_version(&self.db).await.map_err(internal_status)?;
         if version <= request.current_version && !self.runtime_trusted_cidrs.enabled() {
             return Ok(Response::new(FetchPolicyResponse {
@@ -575,6 +677,7 @@ impl FirewallXds for XdsService {
         let drop_events = self.drop_events.clone();
         let runtime_trusted_cidrs = self.runtime_trusted_cidrs.clone();
         let temp_ban_cleanup = self.temp_ban_cleanup.clone();
+        let geo_ip_refresh = self.geo_ip_refresh.clone();
         let mut drop_monitor_changes = drop_events.subscribe_changes();
         let (tx, rx) = mpsc::channel(8);
 
@@ -603,6 +706,7 @@ impl FirewallXds for XdsService {
                     sent_runtime_fingerprint.as_deref(),
                     &runtime_trusted_cidrs,
                     &temp_ban_cleanup,
+                    &geo_ip_refresh,
                 )
                 .await
                 {
@@ -703,8 +807,18 @@ impl FirewallXds for XdsService {
             return Err(unauthenticated_status());
         }
         let mut stream = request.into_inner();
+        let geo_lookup = self.geo_lookup.clone();
         let mut accepted = 0_u64;
         while let Some(event) = stream.message().await? {
+            let country = (!event.country.trim().is_empty())
+                .then(|| event.country.trim().to_ascii_uppercase())
+                .or_else(|| {
+                    event
+                        .src
+                        .parse()
+                        .ok()
+                        .and_then(|ip| geo_lookup.lookup_country(ip))
+                });
             self.drop_events.publish(DropEventView {
                 node_id: event.node_id,
                 interface_name: event.interface_name,
@@ -716,7 +830,7 @@ impl FirewallXds for XdsService {
                 family: event.family,
                 proto: event.proto,
                 dport: event.dport,
-                country: (!event.country.trim().is_empty()).then_some(event.country),
+                country,
                 action: event.action,
             });
             accepted += 1;
@@ -816,8 +930,11 @@ async fn cleanup_expired_temp_bans(db: &DatabaseConnection) -> Result<(u64, Opti
                     .rows_affected;
                 let version = if deleted > 0 {
                     Some(
-                        next_policy_version_in_transaction(txn, firewall::DEFAULT_POLICY_NAME)
-                            .await?,
+                        crate::db::next_policy_version_in_transaction(
+                            txn,
+                            firewall::DEFAULT_POLICY_NAME,
+                        )
+                        .await?,
                     )
                 } else {
                     None
@@ -829,30 +946,34 @@ async fn cleanup_expired_temp_bans(db: &DatabaseConnection) -> Result<(u64, Opti
     Ok((deleted, version))
 }
 
-async fn next_policy_version_in_transaction(
-    txn: &DatabaseTransaction,
-    policy_name: &str,
-) -> std::result::Result<i64, DbErr> {
-    let current = policy_version::Entity::find()
-        .filter(policy_version::Column::PolicyName.eq(policy_name))
-        .one(txn)
+async fn refresh_geo_ip_lists(db: &DatabaseConnection) -> Result<geo::GeoRefreshReport> {
+    let rows = geo_country_policy::Entity::find()
+        .filter(geo_country_policy::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(geo_country_policy::Column::Enabled.eq(true))
+        .all(db)
         .await?;
-    let next_version = current.as_ref().map_or(1, |row| row.version + 1);
-    if let Some(row) = current {
-        let mut active: policy_version::ActiveModel = row.into();
-        active.version = Set(next_version);
-        active.updated_at = Set(chrono::Utc::now().naive_utc());
-        active.update(txn).await?;
-    } else {
-        policy_version::ActiveModel {
-            policy_name: Set(policy_name.to_string()),
-            version: Set(next_version),
-            updated_at: Set(chrono::Utc::now().naive_utc()),
+    let countries = rows.into_iter().map(|row| row.country).collect::<Vec<_>>();
+    geo::refresh_ipdeny_lists(db, &countries).await
+}
+
+async fn geo_ip_lists_missing(db: &DatabaseConnection) -> Result<bool> {
+    let rows = geo_country_policy::Entity::find()
+        .filter(geo_country_policy::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(geo_country_policy::Column::Enabled.eq(true))
+        .all(db)
+        .await?;
+    for row in rows {
+        let country = geo::normalize_country(&row.country)?;
+        let has_country_list = geo_ip_prefix::Entity::find()
+            .filter(geo_ip_prefix::Column::Country.eq(country))
+            .one(db)
+            .await?
+            .is_some();
+        if !has_country_list {
+            return Ok(true);
         }
-        .insert(txn)
-        .await?;
     }
-    Ok(next_version)
+    Ok(false)
 }
 
 async fn build_policy_update(
@@ -861,8 +982,10 @@ async fn build_policy_update(
     current_runtime_fingerprint: Option<&str>,
     runtime_trusted_cidrs: &RuntimeTrustedCidrs,
     temp_ban_cleanup: &TempBanCleanup,
+    geo_ip_refresh: &GeoIpRefresh,
 ) -> Result<Option<(PolicyUpdate, String)>> {
     temp_ban_cleanup.maybe_run(db).await?;
+    geo_ip_refresh.maybe_run(db).await?;
     let version = latest_version(db).await?;
     let runtime_cidrs = runtime_trusted_cidrs.current().await;
     let runtime_fingerprint = cidr_fingerprint(&runtime_cidrs);
