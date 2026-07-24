@@ -130,7 +130,7 @@ main {
 
 .summary-grid {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
   gap: 10px;
   margin-bottom: 16px;
 }
@@ -159,7 +159,7 @@ main {
 
 .priority-strip {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 16px;
 }
@@ -221,6 +221,7 @@ main {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   min-height: 58px;
   padding: 0 16px;
   border-bottom: 1px solid #e4e9ee;
@@ -240,6 +241,89 @@ main {
   margin: 4px 0 0;
   color: #6b7886;
   font-size: 12px;
+}
+
+.subsection-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 54px;
+  padding: 0 16px;
+  border-top: 1px solid #e4e9ee;
+  border-bottom: 1px solid #e4e9ee;
+  background: #ffffff;
+}
+
+.subsection-head h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.subsection-head p {
+  margin: 4px 0 0;
+  color: #6b7886;
+  font-size: 12px;
+}
+
+.panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.header-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  color: #25313d;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.header-toggle input {
+  width: 16px;
+  height: 16px;
+}
+
+.drop-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-height: 44px;
+  padding: 0 16px;
+  border-bottom: 1px solid #e4e9ee;
+  color: #607080;
+  font-size: 12px;
+}
+
+.inline-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.inline-select span {
+  white-space: nowrap;
+}
+
+.inline-select select {
+  width: min(260px, 52vw);
+}
+
+.compact-input {
+  width: min(220px, 46vw);
+}
+
+.port-filter-input {
+  width: 96px;
 }
 
 .form-grid {
@@ -269,6 +353,14 @@ main {
 .defense-form .form-submit {
   grid-column: 1 / -1;
   justify-self: end;
+}
+
+.custom-rate-form {
+  grid-template-columns: 92px 120px 100px 120px 120px minmax(180px, 1fr) 38px;
+}
+
+.temp-ban-form {
+  grid-template-columns: minmax(160px, 1fr) 120px 100px 130px minmax(180px, 1fr) 38px;
 }
 
 .trusted-form {
@@ -372,6 +464,94 @@ tbody tr:hover {
 
 .priority-cell > span {
   font-variant-numeric: tabular-nums;
+}
+
+.docs-panel {
+  overflow-x: hidden;
+}
+
+.docs-body {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  background: #fafbfc;
+}
+
+.doc-block {
+  border: 1px solid #d9e0e7;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 14px;
+}
+
+.doc-block h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.doc-block p {
+  margin: 6px 0 12px;
+  color: #607080;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.endpoint-list {
+  display: grid;
+  gap: 10px;
+}
+
+.endpoint-row {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  border-top: 1px solid #edf0f3;
+  padding-top: 10px;
+}
+
+.endpoint-row:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.endpoint-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.endpoint-main code {
+  border-radius: 6px;
+  background: #eef2f6;
+  color: #17202a;
+  padding: 4px 7px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.endpoint-main span {
+  color: #475467;
+  font-size: 13px;
+}
+
+pre {
+  margin: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  border-radius: 8px;
+  background: #101820;
+  color: #edf2f7;
+  padding: 12px;
+}
+
+pre code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
 }
 
 .error {
@@ -607,6 +787,8 @@ tbody tr:hover {
   .rule-form,
   .geo-form,
   .threat-form,
+  .custom-rate-form,
+  .temp-ban-form,
   .trusted-form {
     grid-template-columns: 1fr 1fr;
   }
@@ -621,6 +803,8 @@ tbody tr:hover {
   .geo-form,
   .threat-form,
   .defense-form,
+  .custom-rate-form,
+  .temp-ban-form,
   .trusted-form {
     grid-template-columns: 1fr;
   }

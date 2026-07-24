@@ -40,6 +40,8 @@ Useful endpoints:
 - `DELETE /rules/{id}`
 - `GET /geo-countries?page=1&page_size=100`
 - `POST /geo-countries`
+- `GET /temp-bans?page=1&page_size=100`
+- `POST /temp-bans`
 - `GET /threat-sources?page=1&page_size=100`
 - `POST /threat-sources`
 - `GET /nodes?page=1&page_size=100`
@@ -76,7 +78,9 @@ The frontend source is Vue 3. `frontend/package.json` aliases Vite to Rolldown V
 - `firewall_policy_versions`: monotonically increasing version for the single firewall policy.
 - `firewall_rules`: static allow/deny CIDR rules, optional protocol and port match.
 - `firewall_geo_country_policies`: per-country allow/deny policy.
+- `firewall_temp_bans`: temporary source-IP bans with optional protocol and destination-port match.
 - `firewall_dynamic_defense`: global `ip_rate_limit` and `flood` policy.
+- `firewall_dynamic_rate_limits`: custom dynamic defense rate limits by protocol and/or destination port.
 - `firewall_trusted_cidrs`: highest-priority source CIDR whitelist.
 - `firewall_threat_sources`: threat-intelligence feed definitions.
 - `firewall_nodes`: distributed node heartbeat and last applied version.
@@ -102,7 +106,7 @@ The userspace agent defaults to `/usr/local/share/xdp-firewall/xdp_firewall.o`. 
 
 Trusted CIDRs are the highest-priority source whitelist. Source IPs matching these prefixes are allowed before ordinary firewall rules, threat-intelligence deny prefixes, country allow/deny rules, and global dynamic defense checks.
 
-They are stored in the database so the control plane can push the same whitelist to every agent over xDS. Initialize entries from the API process with Clap arguments or environment variables, or manage them later through the API/frontend. Agents apply the pushed whitelist; they do not mutate whitelist configuration.
+Database-managed whitelist entries are created through the API/frontend and are stored in the database so the control plane can push the same whitelist to every agent over xDS. Agents apply the pushed whitelist; they do not mutate whitelist configuration.
 
 ```bash
 xdp-firewall api \
@@ -116,6 +120,8 @@ Equivalent environment form:
 XDP_FIREWALL_TRUSTED_CIDRS=10.0.0.0/8,192.168.0.0/16 xdp-firewall api
 ```
 
+When `api` or `xds` is started with trusted CIDR flags or `XDP_FIREWALL_TRUSTED_CIDRS`, those prefixes are runtime-only additions injected into xDS snapshots. They are not written to `firewall_trusted_cidrs` and do not change API/frontend-managed database whitelist entries.
+
 For Docker Compose, put the same comma-separated value in `deploy/docker-compose/compose-env` or your copied local env file:
 
 ```dotenv
@@ -128,14 +134,60 @@ The same whitelist can be managed through:
 - `POST /trusted-cidrs`
 - `DELETE /trusted-cidrs/{id}`
 
+## Kubernetes Runtime Discovery
+
+The control plane can optionally discover Kubernetes network addresses and inject them into xDS snapshots as runtime-only trusted CIDRs. This is useful when agents must always allow cluster control and cluster-internal address ranges without storing those ranges in the policy database.
+
+Enable it on the API/control-plane process:
+
+```bash
+xdp-firewall api --k8s-discovery
+```
+
+or:
+
+```bash
+XDP_FIREWALL_K8S_DISCOVERY=true xdp-firewall api
+```
+
+When enabled, the control plane reads the Kubernetes API with its service account token and discovers:
+
+- Node `InternalIP` and `ExternalIP` as host CIDRs.
+- Node `spec.podCIDRs` / `spec.podCIDR`.
+- `networking.k8s.io/v1 ServiceCIDR` ranges when the API is available.
+- Existing Service `clusterIP/clusterIPs` as a partial fallback when `ServiceCIDR` is not available.
+
+Discovered CIDRs are cached in the control plane and merged into the xDS snapshot before it is sent to agents. The cache refreshes no more often than the xDS push interval, and discovery failures fall back to the last successful discovery plus static runtime CIDRs instead of interrupting policy delivery. They are not persisted and are not shown as API/frontend-managed whitelist rows.
+
 ## Enforcement Priority
 
 Ingress packets are evaluated in this order:
 
 1. Whitelist (`trusted_cidrs`): matching source CIDRs are allowed immediately.
-2. Ordinary firewall rules and threat-intelligence deny prefixes: lower numeric `priority` values have higher priority.
-3. Country allow/deny rules.
-4. Global dynamic defense: `ip_rate_limit` and `flood`.
+2. Temporary bans: matching source IPs are dropped until their expiration time.
+3. Ordinary firewall rules and threat-intelligence deny prefixes: the XDP map uses longest-prefix matching first; when two entries produce the same effective key, lower numeric `priority` values have higher priority, and threat-intelligence deny prefixes win over duplicate user rules.
+4. Country allow/deny rules.
+5. Custom dynamic defense rate limits: protocol and/or destination-port token buckets.
+6. Global dynamic defense: `ip_rate_limit` and `flood`.
+
+## Temporary Bans
+
+Temporary bans block one source IP, optionally scoped by protocol and destination port. The default duration is 300 seconds.
+
+- `GET /temp-bans?page=1&page_size=100`
+- `POST /temp-bans`
+- `DELETE /temp-bans/{id}`
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8080/temp-bans \
+  -H "X-API-Token: $XDP_FIREWALL_API_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"ip":"203.0.113.10","protocol":"tcp","port":443,"duration_seconds":300,"comment":"manual block"}'
+```
+
+Only unexpired temporary bans are sent to agents. The BPF map stores a monotonic expiration timestamp, so an already-applied ban stops dropping packets when it expires even if no new policy version is pushed. Whitelist entries remain higher priority than temporary bans so trusted control-plane, Kubernetes, or operator CIDRs are still allowed.
 
 ## Dynamic Defense
 
@@ -148,6 +200,11 @@ Whitelist entries are evaluated before dynamic defense, so matching sources are 
 
 - `GET /dynamic-defense`
 - `PUT /dynamic-defense`
+- `GET /dynamic-rate-limits?page=1&page_size=100`
+- `POST /dynamic-rate-limits`
+- `DELETE /dynamic-rate-limits/{id}`
+
+Custom dynamic rate limits are enabled rows with `priority`, `protocol`, optional `port`, `packets_per_second`, `burst`, and optional `comment`. Lower numeric priority is higher priority when multiple rows compile to the same effective key. A row with `protocol=any` and `port=443` rate-limits traffic to destination port 443 for protocols that expose a destination port; `protocol=tcp` with no port rate-limits all TCP traffic per source IP. Custom limits run before the global `ip_rate_limit` and `flood` checks.
 
 ## Agent Mode
 
@@ -159,7 +216,7 @@ Do not use `xdp-firewall policy show` inside an agent-only container to inspect 
 
 The control plane controls push cadence with `xdp-firewall api --xds-push-interval-seconds 5`. Agents do not poll the database. They keep a streaming gRPC subscription open and apply updates when xDS pushes a newer version. Heartbeats still run from the agent to xDS with `--heartbeat-seconds`.
 
-Before compiling each pushed snapshot, the agent resolves the xDS control-plane host and adds local in-memory allow rules for those controller IPs. This protects the controller-to-agent path from accidental ingress blocks. The current XDP program is ingress-only, so egress traffic from the agent to the controller is not restricted by this firewall.
+Before compiling each pushed snapshot, if the xDS control-plane host is an IP literal, the agent adds a local in-memory trusted CIDR for that controller IP. Hostnames are not resolved for this bypass to avoid DNS-based policy bypass. The current XDP program is ingress-only, so egress traffic from the agent to the controller is not restricted by this firewall.
 
 ## Agent Monitor
 
@@ -169,13 +226,63 @@ Before compiling each pushed snapshot, the agent resolves the xDS control-plane 
 xdp-firewall monitor --once
 ```
 
-By default it prints one line every five seconds. Use `--interval-seconds` to change the cadence, `--once` for a single sample, or `--json` for JSON lines. Each sample includes node identity, detected interface, xDS control URL, interface state, MTU, bpffs mount status, agent-only mode, whether `DATABASE_URL` is present, whether a local SQLite file exists in `/var/lib/xdp-firewall`, local agent process count, xDS connectivity, and the current xDS policy snapshot summary when xDS is reachable.
+By default it prints one line every five seconds. Use `--interval-seconds` to change the cadence, `--once` for a single sample, or `--json` for JSON lines. Each sample includes node identity, detected interface, xDS control URL, interface state, MTU, bpffs mount status, agent-only mode, whether `DATABASE_URL` is present, whether a local SQLite file exists in `/var/lib/xdp-firewall`, local `xdp-firewall` process count, xDS connectivity, and the current xDS policy snapshot summary when xDS is reachable.
 
 Example output:
 
 ```text
-time=2026-07-23T12:13:12Z node_id=node-1 interface=ens5 control_url=http://127.0.0.1:50051 operstate=up mtu=9001 carrier=1 bpffs_mounted=true agent_only=true database_url_present=false local_db_file_present=false agent_processes=1 xds_status=ok policy_version=5 rules=0 geo_countries=0 trusted_cidrs=3 threat_sources=2 dynamic_defense=true ip_rate_limit=true flood=true
+time=2026-07-23T12:13:12Z node_id=node-1 interface=ens5 control_url=http://127.0.0.1:50051 operstate=up mtu=9001 carrier=1 bpffs_mounted=true agent_only=true database_url_present=false local_db_file_present=false xdp_firewall_processes=1 xds_status=ok policy_version=5 rules=0 geo_countries=0 trusted_cidrs=3 threat_sources=2 dynamic_defense=true ip_rate_limit=true flood=true
 ```
+
+## Drop Visibility
+
+The agent owns the loaded XDP maps and logs cumulative packet counters after each policy apply and on every heartbeat:
+
+```bash
+docker compose logs -f agent | grep "xdp stats"
+```
+
+Counters:
+
+- `rule_drop`: ordinary firewall rules and threat-intelligence deny prefixes.
+- `geo_drop`: country deny rules.
+- `temp_ban_drop`: temporary source-IP ban.
+- `custom_rate_drop`: custom dynamic defense protocol/port rate limit.
+- `rate_drop`: global `ip_rate_limit`.
+- `flood_drop`: global `flood` temporary block/limit.
+- `parse_drop`: malformed packet parse drops.
+- `drop_total`: sum of all drop counters.
+- `pass`: allowed packets, including whitelist matches.
+
+These counters show which class is dropping traffic. Use realtime drop events when you need source IP and packet metadata.
+
+The embedded frontend has a realtime Drop page. Press Start to subscribe to all nodes, or select one node to subscribe only to that agent. The API tells agents through xDS to enable Drop monitoring only while a matching frontend subscriber is connected. When the last matching subscriber disconnects, xDS pushes the disabled state and agents stop reading the perf event buffer. The events are kept in memory and are not persisted to the database.
+
+The HTTP stream also supports node filtering directly:
+
+```bash
+curl -H "X-API-Token: $XDP_FIREWALL_API_TOKEN" \
+  "http://127.0.0.1:8080/drop-events/stream?node_id=node-1"
+```
+
+For realtime drop events, start the agent with the current image and run:
+
+```bash
+xdp-firewall monitor --drop
+```
+
+The agent pins the drop event map at `/sys/fs/bpf/xdp-firewall/<interface>/drop_events`; `monitor --drop` opens that pinned map and prints one line per dropped packet. It also temporarily enables the pinned `/sys/fs/bpf/xdp-firewall/<interface>/drop_config` switch while the command is running and resets it on Ctrl-C or SIGTERM. SIGKILL cannot be caught. Use `--json` for JSON lines.
+
+Realtime event `reason` values are product-oriented:
+
+- `firewall_rule`: ordinary firewall rule.
+- `threat_intel`: built-in or configured threat intelligence prefix.
+- `temporary_ban`: temporary source-IP ban.
+- `country`: country rule.
+- `dynamic_defense.custom_rate_limit`: custom protocol/port rate limit.
+- `dynamic_defense.ip_rate_limit`: global per-source-IP rate limit.
+- `dynamic_defense.flood`: flood temporary block/limit.
+- `parse_error`: malformed packet parse drop.
 
 ## xDS Control Plane
 
@@ -186,7 +293,7 @@ XDP_FIREWALL_AGENT_TOKEN='change-this-agent-token' \
 xdp-firewall api --bind 0.0.0.0:8080 --xds-bind 0.0.0.0:50051 --xds-push-interval-seconds 5
 ```
 
-xDS runs in the same control-plane process as the HTTP API. It reads policy snapshots from the database and accepts node heartbeats. If `XDP_FIREWALL_AGENT_TOKEN` is set, agents must send the same token with `Authorization: Bearer <token>` or `x-agent-token`.
+xDS runs in the same control-plane process as the HTTP API. It reads policy snapshots from the database and accepts node heartbeats. `XDP_FIREWALL_AGENT_TOKEN` is required when xDS binds to a non-loopback address. Agents must send the token with `Authorization: Bearer <token>` or `x-agent-token`.
 
 `xdp-firewall xds` is still available for debugging or intentionally split control-plane deployments, but the provided Docker Compose and Kubernetes templates run xDS inside the API service to keep production configuration smaller.
 
@@ -205,6 +312,8 @@ The BPF object has conservative built-in defaults, and the agent can override ma
 - `--trusted-map-entries` / `XDP_FIREWALL_TRUSTED_MAP_ENTRIES`, default `4096`.
 - `--country-map-entries` / `XDP_FIREWALL_COUNTRY_MAP_ENTRIES`, default `676`.
 - `--rate-map-entries` / `XDP_FIREWALL_RATE_MAP_ENTRIES`, default `1048576`.
+- `--custom-rate-limit-map-entries` / `XDP_FIREWALL_CUSTOM_RATE_LIMIT_MAP_ENTRIES`, default `4096`.
+- `--temp-ban-map-entries` / `XDP_FIREWALL_TEMP_BAN_MAP_ENTRIES`, default `4096`.
 
 Default capacity and approximate key/value payload:
 
@@ -213,14 +322,16 @@ Default capacity and approximate key/value payload:
 | `rule_cidrs` | `262144` | Ordinary firewall CIDR rules | `8 MiB` |
 | `geo_cidrs` | `262144` | Country CIDR prefixes | `6.5 MiB` |
 | `trusted_cidrs` | `4096` | Highest-priority source CIDR whitelist | `0.1 MiB` |
+| `temp_bans` | `4096` | Temporary exact source-IP bans | `0.1 MiB` |
 | `country_rules` | `676` | Country-code allow/deny actions | A few KiB |
 | `defense_policy` | `1` | Global dynamic defense configuration | Negligible |
+| `custom_rate_limits` | `4096` | Custom protocol/port dynamic rate-limit definitions | `0.1 MiB` |
 | `rate_buckets` | `1048576` | Per-source-IP `ip_rate_limit` and `flood` token buckets | `46-48 MiB` |
-| `stats` | `5` | Per-CPU counters | Negligible |
+| `stats` | `8` | Per-CPU counters: pass, rule, country, temp ban, custom rate, global rate, flood, and parse drops | Negligible |
 
 The payload estimates count only the BPF key/value structs. Actual kernel memory is higher because hash tables, LRU bookkeeping, allocator rounding, per-CPU storage, and map metadata add overhead.
 
-`rule_cidrs`, `geo_cidrs`, and `trusted_cidrs` are LPM trie maps with `BPF_F_NO_PREALLOC`, so they grow with inserted prefixes instead of allocating the full capacity at startup. `rate_buckets` is the main memory driver because it can hold up to `XDP_FIREWALL_RATE_MAP_ENTRIES` source-IP state entries for dynamic defense.
+`rule_cidrs`, `geo_cidrs`, and `trusted_cidrs` are LPM trie maps with `BPF_F_NO_PREALLOC`, so they grow with inserted prefixes instead of allocating the full capacity at startup. `temp_bans` and `custom_rate_limits` are small hash maps for configured exact-match keys. `rate_buckets` is the main memory driver because it can hold up to `XDP_FIREWALL_RATE_MAP_ENTRIES` source-IP state entries for dynamic defense.
 
 Default Docker Compose deployments do not set these variables. Keep the defaults unless an agent reports a map capacity error or the deployment has a measured memory target that requires explicit sizing. These sizes are chosen at XDP load time; changing them requires restarting the agent so the eBPF maps are recreated with the new capacity.
 

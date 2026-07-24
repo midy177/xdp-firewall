@@ -42,6 +42,38 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
     .await?;
     create_table(
         db,
+        schema.create_table_from_entity(entities::dynamic_rate_limit::Entity),
+    )
+    .await?;
+    create_table(
+        db,
+        schema.create_table_from_entity(entities::temp_ban::Entity),
+    )
+    .await?;
+    create_index(
+        db,
+        Index::create()
+            .if_not_exists()
+            .name("idx_firewall_dynamic_rate_limits_policy_name_priority")
+            .table(entities::dynamic_rate_limit::Entity.table_ref())
+            .col(entities::dynamic_rate_limit::Column::PolicyName)
+            .col(entities::dynamic_rate_limit::Column::Priority)
+            .to_owned(),
+    )
+    .await?;
+    create_index(
+        db,
+        Index::create()
+            .if_not_exists()
+            .name("idx_firewall_temp_bans_policy_name_expires_at")
+            .table(entities::temp_ban::Entity.table_ref())
+            .col(entities::temp_ban::Column::PolicyName)
+            .col(entities::temp_ban::Column::ExpiresAt)
+            .to_owned(),
+    )
+    .await?;
+    create_table(
+        db,
         schema.create_table_from_entity(entities::trusted_cidr::Entity),
     )
     .await?;

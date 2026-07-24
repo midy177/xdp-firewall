@@ -2,6 +2,37 @@
 
 ## Active Plan
 
+- [completed] Add deeper integration tests for dynamic defense API persistence using an in-memory SQLite database and real Axum routes.
+- [completed] Convert the external-facing design document to Chinese and replace ASCII architecture diagrams with Mermaid text-generated diagrams.
+- [completed] Write an external-facing overall design document that explains the distributed XDP firewall architecture, data plane, control plane, storage model, observability, deployment model, performance considerations, and technical difficulty.
+- [completed] Fix temporary-ban lookup so expired specific keys cannot shadow broader active temporary bans in the BPF fallback chain.
+- [completed] Let the embedded API documentation page remain readable without an API token by avoiding protected data loads when the active route is API docs.
+- [completed] Update BPF stats documentation to include the eighth `temp_ban_drop` counter and keep README map sizing aligned with `STAT_MAX`.
+- [completed] Add an embedded frontend API usage documentation page covering auth, pagination, policy, rules, countries, temporary bans, threat sources, dynamic defense, whitelist, nodes, and realtime Drop streams.
+- [completed] Add temporary source-IP bans with optional protocol and destination-port match.
+- [completed] Persist temporary bans in the control-plane database with default 5-minute duration and paginated API CRUD.
+- [completed] Compile only unexpired temporary bans into xDS snapshots and agent XDP maps.
+- [completed] Enforce temporary bans after whitelist and before ordinary firewall/threat/country/dynamic-defense checks.
+- [completed] Add frontend temporary-ban UI with duration, protocol/port validation, and realtime Drop reason labels.
+- [completed] Add custom dynamic defense rate-limit rules keyed by protocol and/or destination port.
+- [completed] Persist custom dynamic rate-limit rules in the control-plane database and expose paginated API CRUD.
+- [completed] Compile custom dynamic rate limits into a dedicated XDP map and enforce them before global `ip_rate_limit` and `flood`.
+- [completed] Add frontend dynamic-defense UI for custom protocol/port limits with client-side validation.
+- [completed] Update Drop counters/reasons so custom dynamic rate-limit drops are distinguishable from global dynamic defense.
+- [completed] Add an API/control-plane switch for Kubernetes runtime address discovery.
+- [completed] When enabled, discover Kubernetes node IPs, node `podCIDRs`, and Service CIDRs from the Kubernetes API.
+- [completed] Inject discovered Kubernetes node IPs, Pod CIDRs, and Service CIDRs as runtime-only trusted CIDRs immediately before xDS policy snapshots are sent to agents.
+- [completed] Keep Kubernetes-discovered trusted CIDRs out of the policy database; they must be recomputed from Kubernetes state and only exist in the xDS-delivered snapshot.
+- [completed] Change `api/xds --trusted-cidr` and `XDP_FIREWALL_TRUSTED_CIDRS` to runtime-only xDS whitelist injection; do not persist CLI/env trusted CIDRs into the database.
+- [completed] Add Kubernetes RBAC for discovery: `nodes` get/list, `services` get/list fallback, and `networking.k8s.io/servicecidrs` get/list when supported.
+- [completed] Add fallback behavior for clusters without `ServiceCIDR`: collect existing Service `clusterIP/clusterIPs` as partial runtime whitelist entries and expose/log that Service CIDR discovery is partial.
+- [completed] Add shared control-plane Kubernetes discovery caching so each agent stream does not list Kubernetes resources independently on every xDS tick.
+- [completed] Keep xDS policy delivery running when Kubernetes discovery fails by reusing cached/static runtime trusted CIDRs and logging the discovery error.
+- [completed] Treat forbidden `ServiceCIDR` reads like unavailable ServiceCIDR and fall back to existing Service `clusterIP/clusterIPs`.
+- [completed] Add realtime Drop filtering by node: frontend/API can subscribe to all nodes or one node, and xDS only enables Drop reporting on matching agents.
+- [completed] Keep the Kubernetes API/control-plane deployment single-replica by default because realtime Drop subscriptions are process-local until a shared pub/sub backend is added.
+- [completed] Carry firewall rule priority into compiled XDP rules so duplicate effective keys choose the lower numeric priority, with threat-intelligence deny prefixes first.
+- [completed] Drop malformed IPv4/IPv6 TCP and UDP truncation paths as `parse_error` instead of passing them before policy evaluation.
 - [completed] Add gRPC xDS control-plane support.
 - [completed] Change xDS policy delivery from agent polling to server-side streaming push.
 - [completed] Add control-plane push frequency control.
@@ -24,6 +55,25 @@
 - [completed] Change trusted CIDR whitelist semantics to highest-priority allow before firewall, threat, country, and dynamic defense checks.
 - [completed] Update frontend UI to show global enforcement priority and mark the highest-priority ordinary rule on the current rules page.
 - [completed] Rename frontend trusted CIDR wording from rate-limit whitelist to whitelist.
+- [completed] Add agent-side XDP pass/drop counter logs grouped by rule, country, ip_rate_limit, and flood.
+- [completed] Rename monitor process count output to `xdp_firewall_processes` to avoid implying all matching processes are enforcement agents.
+- [completed] Add `monitor --drop` realtime drop event stream using a pinned XDP perf event map.
+- [completed] Add product-oriented realtime Drop reasons: firewall rule, threat intelligence, country, dynamic defense IP limit, dynamic defense flood, and parse error.
+- [completed] Add BPF `drop_config` switch so Drop event emission is disabled unless monitoring is actively subscribed.
+- [completed] Add xDS Drop event reporting from agents to the control plane.
+- [completed] Add API/frontend realtime Drop subscription that enables agent monitoring only while subscribers are connected.
+- [completed] Fix Drop monitoring lifecycle edge cases: pre-agent UI subscriptions update xDS state, idle browser disconnects release subscriptions, and agent observation failures do not stop enforcement.
+- [completed] Size `drop_events` by possible CPU id range instead of online CPU count to avoid sparse CPU id loss.
+- [completed] Drop malformed IPv6 extension-header packets instead of passing them before policy evaluation.
+- [completed] Give threat-intelligence deny prefixes precedence over duplicate user allow keys in the XDP rule map.
+- [completed] Support clearing trusted CIDRs with an explicitly empty CLI/env startup declaration while preserving no-op behavior when the declaration is omitted.
+- [completed] Require xDS agent token for non-loopback xDS binds and use constant-time token comparison.
+- [completed] Make xDS policy streams close on disconnected or slow clients instead of leaking polling tasks.
+- [completed] Change xDS node heartbeat writes to database upsert.
+- [completed] Add dynamic defense read-side invariant checks so enabled rate/flood config cannot silently compile to fail-open zero values.
+- [completed] Stop DNS-resolving xDS control-plane hostnames for local bypass; only IP literals are auto-added as local trusted CIDRs.
+- [completed] Sync non-empty API CLI/env trusted CIDR declarations by disabling omitted stale entries.
+- [completed] Preserve trusted CIDRs and existing dynamic defense settings when seeding example policy.
 
 ## Completed
 
@@ -81,6 +131,16 @@
 - Added BPF rate bucket key separation for global ip/flood buckets.
 - Added BPF flood drop stat index.
 - Changed BPF trusted CIDR handling so trusted sources are allowed before ordinary firewall, threat intelligence, country, and dynamic defense checks.
+- Added agent heartbeat logs for BPF `stats` counters:
+  - `pass`
+  - `drop_total`
+  - `rule_drop`
+  - `geo_drop`
+  - `rate_drop`
+  - `flood_drop`
+  - `parse_drop`
+- Added BPF `drop_events` perf event map and event emission for rule, country, rate, flood, and parse drops.
+- Added bpffs pinning for `/sys/fs/bpf/xdp-firewall/<interface>/drop_events` so a separate `monitor --drop` process can stream live events.
 - Removed country rate-limit behavior from the BPF data path.
 - Added DB entity and migration for `firewall_dynamic_defense`.
 - Added DB entity and migration for `firewall_trusted_cidrs`.
@@ -90,6 +150,21 @@
 - Added dynamic defense API:
   - `GET /policies/{policy}/dynamic-defense`
   - `PUT /policies/{policy}/dynamic-defense`
+- Added custom dynamic defense rate-limit API:
+  - `GET /dynamic-rate-limits`
+  - `POST /dynamic-rate-limits`
+  - `DELETE /dynamic-rate-limits/{id}`
+- Added `firewall_dynamic_rate_limits` for protocol and/or destination-port token bucket rules.
+- Added BPF `custom_rate_limits` map and `custom_rate_drop` counter.
+- Added frontend custom dynamic rate-limit configuration to the dynamic defense page.
+- Added temporary source-IP ban API:
+  - `GET /temp-bans`
+  - `POST /temp-bans`
+  - `DELETE /temp-bans/{id}`
+- Added `firewall_temp_bans` for default 5-minute temporary source-IP bans with optional protocol and destination-port match.
+- Added BPF `temp_bans` map and `temp_ban_drop` counter/realtime reason.
+- Added frontend temporary ban page.
+- Added embedded frontend API usage documentation with bilingual endpoint examples and curl snippets.
 - Added trusted CIDR API:
   - `GET /trusted-cidrs`
   - `POST /trusted-cidrs`
@@ -101,7 +176,11 @@
 - Added `api --xds-bind`, `api --xds-push-interval-seconds`, and `api --agent-token`.
 - Kept `xds` as an optional standalone command for debugging or explicitly split deployments.
 - Changed `agent` and `sync-once` to fetch policy snapshots from xDS instead of connecting to the database.
-- Added agent-side local allow rules for resolved xDS controller IPs before policy compilation.
+- Added agent-side local trusted CIDRs for IP-literal xDS controller addresses before policy compilation.
+- Changed xDS controller auto-bypass to skip hostnames so DNS cannot grant arbitrary source IP bypass.
+- Required `XDP_FIREWALL_AGENT_TOKEN` for non-loopback xDS binds.
+- Changed xDS stream push to use non-blocking sends and stream closed checks so disconnected or slow clients do not leak tasks.
+- Changed node heartbeats to UPSERT.
 - Updated Docker Compose and Kubernetes templates so only the API service uses `DATABASE_URL`; agents use `XDP_FIREWALL_XDS_URL` and `XDP_FIREWALL_AGENT_TOKEN`.
 - Changed country defense frontend to only show country code and allow/deny action.
 - Added backend country list endpoint:
@@ -110,6 +189,7 @@
 - Changed dynamic defense defaults to enabled:
   - `ip_rate_limit` enabled, PPS `5000`, burst `10000`
   - `flood` enabled, PPS `20000`, burst `40000`, block seconds `60`
+- Added read-side dynamic defense validation; enabled rate/flood fields must be set and greater than zero before a policy can be compiled or pushed.
 - Added frontend dynamic defense page.
 - Added frontend trusted CIDR whitelist page.
 - Removed user-facing multi-policy support:
@@ -126,24 +206,37 @@
 
 - Ordinary firewall rules are CIDR/protocol/port allow or deny rules.
 - Threat intelligence is compiled into deny prefix rules.
+- Temporary bans are exact source-IP deny entries with optional protocol and destination-port match.
+- Temporary bans default to 300 seconds and are evaluated after trusted CIDR whitelist but before ordinary firewall rules and threat intelligence.
 - Country defense must only use country code plus allow/deny.
 - Country defense must not expose or use PPS/Burst rate-limit fields in the frontend.
 - Global dynamic defense owns rate-limit behavior:
   - `ip_rate_limit`: per-source-IP token bucket.
   - `flood`: per-source-IP token bucket plus temporary block window after threshold exceed.
+- Custom dynamic defense rate limits are protocol and/or destination-port token buckets and are evaluated before global `ip_rate_limit` and `flood`.
 - Global dynamic defense is enabled by default for new or missing dynamic defense rows.
 - The product exposes exactly one firewall policy; no user-facing multi-policy creation or selection is allowed.
 - `edge` remains the internal DB key only to avoid a destructive schema migration.
 - `trusted-cidr` is the highest-priority source whitelist.
 - If source IP matches `trusted-cidr`, it is allowed before ordinary firewall, threat intelligence, country, and dynamic defense checks.
 - `trusted-cidr` must be persisted in DB so the control plane can push the same whitelist to all agents.
-- `trusted-cidr` must support initialization from API Clap/env and management through API/frontend.
+- `trusted-cidr` API/frontend entries are persisted in DB and pushed to agents.
+- `api/xds --trusted-cidr` and `XDP_FIREWALL_TRUSTED_CIDRS` are runtime-only control-plane additions injected into xDS snapshots and must not mutate DB rows.
+- `policy seed-example` must not delete trusted CIDRs and must not overwrite an existing dynamic defense row.
 - `agent` and `sync-once` must not connect to the database or mutate firewall configuration tables; they receive policy snapshots and send heartbeat state through xDS.
+- Drop visibility supports both counter-level class totals and realtime event streaming with source IP, protocol, destination port, country metadata, and product-oriented reasons including custom dynamic rate limits.
+- Realtime Drop event collection is demand-driven: the frontend/API subscription count controls an xDS flag, and agents do not open the perf event reader when there are no subscribers.
+- Realtime Drop events are broadcast in memory by the control plane and are not persisted to the policy database.
+- Observation-plane failures, including Drop monitor map or reader errors, must be logged and must not terminate packet-enforcement agents.
+- Threat intelligence deny prefixes win over duplicate ordinary rule keys so user allow rules cannot silently mask a threat feed entry with the same CIDR/protocol/port key.
+- Kubernetes runtime discovery must be a control-plane-only feature guarded by an explicit switch.
+- Kubernetes-discovered node IPs, Pod CIDRs, and Service CIDRs are runtime trusted CIDRs injected into xDS snapshots only; they must not be stored in `firewall_trusted_cidrs` or shown as user-managed DB whitelist entries.
+- Service CIDR discovery should prefer `networking.k8s.io/v1 ServiceCIDR`; if unavailable, fallback to existing Service ClusterIPs and mark the result as partial.
+- Agents must continue to receive a single merged trusted CIDR list over xDS and must not call the Kubernetes API directly.
 
 ## Remaining Tasks
 
-- Optionally add deeper integration tests for dynamic defense API persistence.
-- Retry `make docker-build IMAGE_REPO=1228022817/xdp-firewall` when Docker Hub is healthy. The code build, frontend build, and zigbuild steps pass; Docker image creation is currently blocked by Docker Hub returning `Bad Gateway` while resolving `debian:bookworm-slim`.
+- None.
 
 ## Validation Commands
 

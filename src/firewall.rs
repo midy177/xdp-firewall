@@ -1,6 +1,7 @@
 use crate::cli::{SeedExampleArgs, ShowPolicyArgs};
 use crate::db::entities::{
-    dynamic_defense, firewall_rule, geo_country_policy, policy_version, threat_source, trusted_cidr,
+    dynamic_defense, dynamic_rate_limit, firewall_rule, geo_country_policy, policy_version,
+    temp_ban, threat_source, trusted_cidr,
 };
 use crate::{geo, threat};
 use anyhow::{Context, Result, bail};
@@ -10,7 +11,7 @@ use sea_orm::{
     sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
+use std::{collections::HashSet, net::IpAddr};
 use tracing::info;
 
 pub const DEFAULT_POLICY_NAME: &str = "edge";
@@ -65,6 +66,25 @@ pub struct DynamicDefensePolicy {
     pub flood_block_seconds: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DynamicRateLimitPolicy {
+    pub priority: i32,
+    pub protocol: L4Protocol,
+    pub port: Option<u16>,
+    pub packets_per_second: u32,
+    pub burst: u32,
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TempBanPolicy {
+    pub ip: IpAddr,
+    pub protocol: L4Protocol,
+    pub port: Option<u16>,
+    pub expires_at: chrono::NaiveDateTime,
+    pub comment: Option<String>,
+}
+
 impl Default for DynamicDefensePolicy {
     fn default() -> Self {
         Self {
@@ -93,7 +113,10 @@ pub struct PolicySnapshot {
     pub version: i64,
     pub rules: Vec<FirewallRule>,
     pub geo_countries: Vec<GeoCountryPolicy>,
+    #[serde(default)]
+    pub temp_bans: Vec<TempBanPolicy>,
     pub dynamic_defense: DynamicDefensePolicy,
+    pub dynamic_rate_limits: Vec<DynamicRateLimitPolicy>,
     pub trusted_cidrs: Vec<TrustedCidrPolicy>,
     pub threat_sources: Vec<threat::ThreatSource>,
 }
@@ -108,7 +131,9 @@ pub struct CompiledPolicy {
     pub trusted_prefixes: Vec<XdpTrustedPrefix>,
     pub rules: Vec<XdpPrefixRule>,
     pub country_rules: Vec<XdpCountryRule>,
+    pub temp_bans: Vec<XdpTempBan>,
     pub dynamic_defense: XdpDynamicDefense,
+    pub dynamic_rate_limits: Vec<XdpDynamicRateLimit>,
     pub geo_prefixes: Vec<XdpGeoPrefix>,
     pub threat_prefixes: Vec<XdpPrefixRule>,
 }
@@ -123,9 +148,17 @@ pub struct XdpTrustedPrefix {
 pub struct XdpPrefixRule {
     pub addr: IpAddr,
     pub prefix: u8,
+    pub priority: i32,
     pub action: RuleAction,
     pub protocol: L4Protocol,
     pub port: u16,
+    pub source: XdpRuleSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XdpRuleSource {
+    FirewallRule,
+    ThreatIntel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +174,14 @@ pub struct XdpCountryRule {
     pub action: RuleAction,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XdpTempBan {
+    pub addr: IpAddr,
+    pub protocol: L4Protocol,
+    pub port: u16,
+    pub expires_at: chrono::NaiveDateTime,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct XdpDynamicDefense {
     pub enabled: bool,
@@ -151,6 +192,14 @@ pub struct XdpDynamicDefense {
     pub flood_packets_per_second: u32,
     pub flood_burst: u32,
     pub flood_block_seconds: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct XdpDynamicRateLimit {
+    pub protocol: L4Protocol,
+    pub port: u16,
+    pub packets_per_second: u32,
+    pub burst: u32,
 }
 
 pub async fn load_policy(db: &DatabaseConnection, policy_name: &str) -> Result<PolicySnapshot> {
@@ -193,6 +242,26 @@ pub async fn load_policy(db: &DatabaseConnection, policy_name: &str) -> Result<P
         .map(parse_dynamic_defense)
         .transpose()?
         .unwrap_or_default();
+    validate_dynamic_defense_policy(&dynamic_defense)?;
+    let dynamic_rate_limits = dynamic_rate_limit::Entity::find()
+        .filter(dynamic_rate_limit::Column::PolicyName.eq(policy_name))
+        .filter(dynamic_rate_limit::Column::Enabled.eq(true))
+        .order_by_asc(dynamic_rate_limit::Column::Priority)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(parse_dynamic_rate_limit)
+        .collect::<Result<Vec<_>>>()?;
+    let now = chrono::Utc::now().naive_utc();
+    let temp_bans = temp_ban::Entity::find()
+        .filter(temp_ban::Column::PolicyName.eq(policy_name))
+        .filter(temp_ban::Column::ExpiresAt.gt(now))
+        .order_by_asc(temp_ban::Column::ExpiresAt)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(parse_temp_ban)
+        .collect::<Result<Vec<_>>>()?;
     let trusted_cidrs = trusted_cidr::Entity::find()
         .filter(trusted_cidr::Column::PolicyName.eq(policy_name))
         .filter(trusted_cidr::Column::Enabled.eq(true))
@@ -208,7 +277,9 @@ pub async fn load_policy(db: &DatabaseConnection, policy_name: &str) -> Result<P
         version,
         rules,
         geo_countries,
+        temp_bans,
         dynamic_defense,
+        dynamic_rate_limits,
         trusted_cidrs,
         threat_sources,
     })
@@ -235,6 +306,10 @@ pub async fn ensure_builtin_policy(db: &DatabaseConnection, policy_name: &str) -
 }
 
 pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy> {
+    validate_dynamic_defense_policy(&snapshot.dynamic_defense)?;
+    for limit in &snapshot.dynamic_rate_limits {
+        validate_dynamic_rate_limit_policy(limit)?;
+    }
     let countries = snapshot
         .geo_countries
         .iter()
@@ -255,9 +330,11 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
         .map(|prefix| XdpPrefixRule {
             addr: prefix.addr,
             prefix: prefix.prefix,
+            priority: i32::MIN,
             action: RuleAction::Deny,
             protocol: L4Protocol::Any,
             port: 0,
+            source: XdpRuleSource::ThreatIntel,
         })
         .collect();
     let trusted_prefixes = snapshot
@@ -282,9 +359,11 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
             XdpPrefixRule {
                 addr,
                 prefix,
+                priority: rule.priority,
                 action: rule.action,
                 protocol: rule.protocol,
                 port: rule.port.unwrap_or(0),
+                source: XdpRuleSource::FirewallRule,
             }
         })
         .collect();
@@ -298,6 +377,17 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let temp_bans = snapshot
+        .temp_bans
+        .iter()
+        .filter(|ban| ban.expires_at > chrono::Utc::now().naive_utc())
+        .map(|ban| XdpTempBan {
+            addr: ban.ip,
+            protocol: ban.protocol,
+            port: ban.port.unwrap_or(0),
+            expires_at: ban.expires_at,
+        })
+        .collect();
     let dynamic_defense = XdpDynamicDefense {
         enabled: snapshot.dynamic_defense.enabled,
         ip_rate_limit_enabled: snapshot.dynamic_defense.ip_rate_limit_enabled,
@@ -311,13 +401,25 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
         flood_burst: snapshot.dynamic_defense.flood_burst.unwrap_or(0),
         flood_block_seconds: snapshot.dynamic_defense.flood_block_seconds.unwrap_or(0),
     };
+    let dynamic_rate_limits = snapshot
+        .dynamic_rate_limits
+        .iter()
+        .map(|limit| XdpDynamicRateLimit {
+            protocol: limit.protocol,
+            port: limit.port.unwrap_or(0),
+            packets_per_second: limit.packets_per_second,
+            burst: limit.burst,
+        })
+        .collect();
 
     Ok(CompiledPolicy {
         version: snapshot.version,
         trusted_prefixes,
         rules,
         country_rules,
+        temp_bans,
         dynamic_defense,
+        dynamic_rate_limits,
         geo_prefixes,
         threat_prefixes,
     })
@@ -338,14 +440,6 @@ pub async fn seed_example_policy(db: &DatabaseConnection, args: SeedExampleArgs)
         .filter(threat_source::Column::PolicyName.eq(policy_name))
         .exec(db)
         .await?;
-    trusted_cidr::Entity::delete_many()
-        .filter(trusted_cidr::Column::PolicyName.eq(policy_name))
-        .exec(db)
-        .await?;
-    dynamic_defense::Entity::delete_by_id(policy_name.to_string())
-        .exec(db)
-        .await?;
-
     let now = chrono::Utc::now().naive_utc();
     firewall_rule::ActiveModel {
         policy_name: Set(policy_name.to_string()),
@@ -387,9 +481,7 @@ pub async fn seed_example_policy(db: &DatabaseConnection, args: SeedExampleArgs)
     }
     .insert(db)
     .await?;
-    default_dynamic_defense_active_model(policy_name, now)
-        .insert(db)
-        .await?;
+    ensure_default_dynamic_defense_exists(db, policy_name, now).await?;
     insert_builtin_threat_sources(db, policy_name).await?;
     let version = crate::db::next_policy_version(db, policy_name).await?;
     println!("seeded firewall policy at version {version}");
@@ -416,8 +508,48 @@ fn default_dynamic_defense_active_model(
 }
 
 async fn insert_default_dynamic_defense(db: &DatabaseConnection, policy_name: &str) -> Result<()> {
-    default_dynamic_defense_active_model(policy_name, chrono::Utc::now().naive_utc())
-        .insert(db)
+    upsert_default_dynamic_defense(db, policy_name, chrono::Utc::now().naive_utc()).await
+}
+
+async fn ensure_default_dynamic_defense_exists(
+    db: &DatabaseConnection,
+    policy_name: &str,
+    now: chrono::NaiveDateTime,
+) -> Result<()> {
+    if dynamic_defense::Entity::find_by_id(policy_name.to_string())
+        .one(db)
+        .await?
+        .is_none()
+    {
+        default_dynamic_defense_active_model(policy_name, now)
+            .insert(db)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn upsert_default_dynamic_defense(
+    db: &DatabaseConnection,
+    policy_name: &str,
+    now: chrono::NaiveDateTime,
+) -> Result<()> {
+    dynamic_defense::Entity::insert(default_dynamic_defense_active_model(policy_name, now))
+        .on_conflict(
+            OnConflict::column(dynamic_defense::Column::PolicyName)
+                .update_columns([
+                    dynamic_defense::Column::Enabled,
+                    dynamic_defense::Column::IpRateLimitEnabled,
+                    dynamic_defense::Column::IpPacketsPerSecond,
+                    dynamic_defense::Column::IpBurst,
+                    dynamic_defense::Column::FloodEnabled,
+                    dynamic_defense::Column::FloodPacketsPerSecond,
+                    dynamic_defense::Column::FloodBurst,
+                    dynamic_defense::Column::FloodBlockSeconds,
+                    dynamic_defense::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec_without_returning(db)
         .await?;
     Ok(())
 }
@@ -435,19 +567,22 @@ pub async fn ensure_configured_trusted_cidrs(
     values: &[String],
 ) -> Result<()> {
     let cidrs = normalize_trusted_cidrs(values)?;
-    if cidrs.is_empty() {
+    let explicitly_configured =
+        !values.is_empty() || std::env::var_os("XDP_FIREWALL_TRUSTED_CIDRS").is_some();
+    if cidrs.is_empty() && !explicitly_configured {
         return Ok(());
     }
 
     let now = chrono::Utc::now().naive_utc();
     let mut changed = 0_u64;
-    for cidr in cidrs {
-        let existing = trusted_cidr::Entity::find()
-            .filter(trusted_cidr::Column::PolicyName.eq(policy))
-            .filter(trusted_cidr::Column::Cidr.eq(&cidr))
-            .one(db)
-            .await?;
-        if let Some(row) = existing {
+    let desired = cidrs.iter().cloned().collect::<HashSet<_>>();
+    let existing_rows = trusted_cidr::Entity::find()
+        .filter(trusted_cidr::Column::PolicyName.eq(policy))
+        .all(db)
+        .await?;
+
+    for row in existing_rows {
+        if desired.contains(&row.cidr) {
             if !row.enabled {
                 let mut active: trusted_cidr::ActiveModel = row.into();
                 active.enabled = Set(true);
@@ -455,7 +590,23 @@ pub async fn ensure_configured_trusted_cidrs(
                 active.update(db).await?;
                 changed += 1;
             }
-        } else {
+        } else if row.enabled {
+            let mut active: trusted_cidr::ActiveModel = row.into();
+            active.enabled = Set(false);
+            active.updated_at = Set(now);
+            active.update(db).await?;
+            changed += 1;
+        }
+    }
+
+    for cidr in cidrs {
+        if trusted_cidr::Entity::find()
+            .filter(trusted_cidr::Column::PolicyName.eq(policy))
+            .filter(trusted_cidr::Column::Cidr.eq(&cidr))
+            .one(db)
+            .await?
+            .is_none()
+        {
             trusted_cidr::ActiveModel {
                 policy_name: Set(policy.to_string()),
                 enabled: Set(true),
@@ -562,6 +713,43 @@ fn parse_dynamic_defense(row: dynamic_defense::Model) -> Result<DynamicDefensePo
     })
 }
 
+fn parse_dynamic_rate_limit(row: dynamic_rate_limit::Model) -> Result<DynamicRateLimitPolicy> {
+    let port = row
+        .port
+        .map(|port| u16::try_from(port).context("dynamic rate limit port is outside u16 range"))
+        .transpose()?;
+    let policy = DynamicRateLimitPolicy {
+        priority: row.priority,
+        protocol: parse_protocol(&row.protocol)?,
+        port,
+        packets_per_second: u32::try_from(row.packets_per_second)
+            .context("dynamic rate limit packets_per_second is negative")?,
+        burst: u32::try_from(row.burst).context("dynamic rate limit burst is negative")?,
+        comment: row.comment,
+    };
+    validate_dynamic_rate_limit_policy(&policy)?;
+    Ok(policy)
+}
+
+fn parse_temp_ban(row: temp_ban::Model) -> Result<TempBanPolicy> {
+    let port = row
+        .port
+        .map(|port| u16::try_from(port).context("temporary ban port is outside u16 range"))
+        .transpose()?;
+    let policy = TempBanPolicy {
+        ip: row
+            .ip
+            .parse()
+            .with_context(|| format!("invalid temporary ban IP '{}'", row.ip))?,
+        protocol: parse_protocol(&row.protocol)?,
+        port,
+        expires_at: row.expires_at,
+        comment: row.comment,
+    };
+    validate_temp_ban_policy(&policy)?;
+    Ok(policy)
+}
+
 fn parse_trusted_cidr(row: trusted_cidr::Model) -> Result<TrustedCidrPolicy> {
     Ok(TrustedCidrPolicy {
         cidr: row
@@ -570,6 +758,59 @@ fn parse_trusted_cidr(row: trusted_cidr::Model) -> Result<TrustedCidrPolicy> {
             .with_context(|| format!("invalid trusted CIDR '{}'", row.cidr))?,
         comment: row.comment,
     })
+}
+
+fn validate_dynamic_defense_policy(policy: &DynamicDefensePolicy) -> Result<()> {
+    if !policy.enabled {
+        return Ok(());
+    }
+    if policy.ip_rate_limit_enabled {
+        require_positive_dynamic_value(
+            "dynamic defense ip packets_per_second",
+            policy.ip_packets_per_second,
+        )?;
+        require_positive_dynamic_value("dynamic defense ip burst", policy.ip_burst)?;
+    }
+    if policy.flood_enabled {
+        require_positive_dynamic_value(
+            "dynamic defense flood packets_per_second",
+            policy.flood_packets_per_second,
+        )?;
+        require_positive_dynamic_value("dynamic defense flood burst", policy.flood_burst)?;
+        require_positive_dynamic_value(
+            "dynamic defense flood block seconds",
+            policy.flood_block_seconds,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_dynamic_rate_limit_policy(policy: &DynamicRateLimitPolicy) -> Result<()> {
+    if policy.packets_per_second == 0 {
+        bail!("dynamic rate limit packets_per_second must be greater than 0");
+    }
+    if policy.burst == 0 {
+        bail!("dynamic rate limit burst must be greater than 0");
+    }
+    if matches!(policy.protocol, L4Protocol::Icmp) && policy.port.is_some() {
+        bail!("dynamic rate limit icmp cannot set a port");
+    }
+    Ok(())
+}
+
+fn validate_temp_ban_policy(policy: &TempBanPolicy) -> Result<()> {
+    if matches!(policy.protocol, L4Protocol::Icmp) && policy.port.is_some() {
+        bail!("temporary ban icmp cannot set a port");
+    }
+    Ok(())
+}
+
+fn require_positive_dynamic_value(name: &str, value: Option<u32>) -> Result<()> {
+    match value {
+        Some(value) if value > 0 => Ok(()),
+        Some(_) => bail!("{name} must be greater than 0 when dynamic defense is enabled"),
+        None => bail!("{name} must be set when dynamic defense is enabled"),
+    }
 }
 
 async fn insert_builtin_threat_sources(db: &DatabaseConnection, policy_name: &str) -> Result<()> {
@@ -631,5 +872,65 @@ mod tests {
         .unwrap();
 
         assert_eq!(cidrs, vec!["10.0.0.0/8", "192.168.0.0/16"]);
+    }
+
+    #[test]
+    fn rejects_enabled_dynamic_defense_with_zero_values() {
+        let policy = DynamicDefensePolicy {
+            enabled: true,
+            ip_rate_limit_enabled: true,
+            ip_packets_per_second: Some(0),
+            ip_burst: Some(DEFAULT_IP_RATE_LIMIT_BURST),
+            flood_enabled: false,
+            flood_packets_per_second: None,
+            flood_burst: None,
+            flood_block_seconds: None,
+        };
+
+        assert!(validate_dynamic_defense_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn rejects_enabled_dynamic_defense_with_missing_values() {
+        let policy = DynamicDefensePolicy {
+            enabled: true,
+            ip_rate_limit_enabled: false,
+            ip_packets_per_second: None,
+            ip_burst: None,
+            flood_enabled: true,
+            flood_packets_per_second: Some(DEFAULT_FLOOD_PPS),
+            flood_burst: None,
+            flood_block_seconds: Some(DEFAULT_FLOOD_BLOCK_SECONDS),
+        };
+
+        assert!(validate_dynamic_defense_policy(&policy).is_err());
+    }
+
+    #[test]
+    fn accepts_custom_dynamic_rate_limit_by_port_only() {
+        let policy = DynamicRateLimitPolicy {
+            priority: 10,
+            protocol: L4Protocol::Any,
+            port: Some(443),
+            packets_per_second: 1_000,
+            burst: 2_000,
+            comment: None,
+        };
+
+        assert!(validate_dynamic_rate_limit_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn rejects_custom_dynamic_rate_limit_icmp_port() {
+        let policy = DynamicRateLimitPolicy {
+            priority: 10,
+            protocol: L4Protocol::Icmp,
+            port: Some(443),
+            packets_per_second: 1_000,
+            burst: 2_000,
+            comment: None,
+        };
+
+        assert!(validate_dynamic_rate_limit_policy(&policy).is_err());
     }
 }

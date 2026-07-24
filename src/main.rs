@@ -33,20 +33,17 @@ async fn main() -> Result<()> {
             let db = db::connect(&args.database.database_url).await?;
             db::migrate(&db).await?;
             firewall::ensure_builtin_policy(&db, firewall::DEFAULT_POLICY_NAME).await?;
-            firewall::ensure_configured_trusted_cidrs(
-                &db,
-                firewall::DEFAULT_POLICY_NAME,
-                &args.trusted_cidrs,
-            )
-            .await?;
             let xds_args = XdsArgs {
                 database: args.database.clone(),
+                k8s: args.k8s.clone(),
                 bind: args.xds_bind.clone(),
                 push_interval_seconds: args.xds_push_interval_seconds,
                 agent_token: args.agent_token.clone(),
+                trusted_cidrs: args.trusted_cidrs.clone(),
             };
-            let api_server = api::serve(db.clone(), args);
-            let xds_server = xds::serve(db, xds_args);
+            let drop_events = xds::DropEventHub::new();
+            let api_server = api::serve(db.clone(), args, drop_events.clone());
+            let xds_server = xds::serve(db, xds_args, drop_events);
             tokio::try_join!(api_server, xds_server)?;
             Ok(())
         }
@@ -55,7 +52,7 @@ async fn main() -> Result<()> {
             let db = db::connect(&args.database.database_url).await?;
             db::migrate(&db).await?;
             firewall::ensure_builtin_policy(&db, firewall::DEFAULT_POLICY_NAME).await?;
-            xds::serve(db, args).await
+            xds::serve(db, args, xds::DropEventHub::new()).await
         }
         Command::Agent(args) => {
             info!("starting agent command");

@@ -21,7 +21,7 @@
         <div>
           <p class="eyebrow">{{ t("firewall") }}</p>
           <div class="policy-row">
-            <Button variant="secondary" :title="t('refresh')" :disabled="actionBusy" @click="runAction(refreshAll)">
+            <Button variant="secondary" :title="t('refresh')" :disabled="actionBusy" @click="runAction(refreshCurrentView)">
               <RefreshCcw :class="{ spin: loading }" :size="16" />
             </Button>
             <Button :title="t('seed')" :disabled="actionBusy" @click="runAction(seedExample)">
@@ -55,6 +55,10 @@
           <strong>{{ geoPage.total }}</strong>
         </div>
         <div class="summary-item">
+          <span>{{ t("tempBans") }}</span>
+          <strong>{{ tempBanPage.total }}</strong>
+        </div>
+        <div class="summary-item">
           <span>{{ t("threatSources") }}</span>
           <strong>{{ threatPage.total }}</strong>
         </div>
@@ -63,12 +67,20 @@
           <strong>{{ dynamicDefense.enabled ? t("enabledShort") : t("disabledShort") }}</strong>
         </div>
         <div class="summary-item">
+          <span>{{ t("customRateLimits") }}</span>
+          <strong>{{ dynamicRatePage.total }}</strong>
+        </div>
+        <div class="summary-item">
           <span>{{ t("trustedCidrs") }}</span>
           <strong>{{ trustedPage.total }}</strong>
         </div>
         <div class="summary-item">
           <span>{{ t("nodes") }}</span>
           <strong>{{ nodePage.total }}</strong>
+        </div>
+        <div class="summary-item">
+          <span>{{ t("dropEvents") }}</span>
+          <strong>{{ dropEvents.length }}</strong>
         </div>
       </div>
 
@@ -206,6 +218,73 @@
         </div>
       </section>
 
+      <section v-if="tab === 'tempBans'" class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>{{ t("tempBans") }}</h2>
+            <p>{{ t("tempBansHint") }}</p>
+          </div>
+        </div>
+        <div class="form-grid temp-ban-form">
+          <label class="field">
+            <span>{{ t("sourceIp") }}</span>
+            <Input v-model="tempBanForm.ip" aria-label="Temporary ban source IP" placeholder="203.0.113.10" />
+          </label>
+          <label class="field">
+            <span>{{ t("protocol") }}</span>
+            <Select v-model="tempBanForm.protocol" aria-label="Temporary ban protocol">
+              <option value="any">any</option>
+              <option value="tcp">tcp</option>
+              <option value="udp">udp</option>
+              <option value="icmp">icmp</option>
+            </Select>
+          </label>
+          <label class="field">
+            <span>{{ t("port") }}</span>
+            <Input v-model="tempBanForm.port" aria-label="Temporary ban port" placeholder="443" />
+          </label>
+          <label class="field">
+            <span>{{ t("durationSeconds") }}</span>
+            <Input v-model.number="tempBanForm.duration_seconds" type="number" aria-label="Temporary ban duration seconds" />
+          </label>
+          <label class="field">
+            <span>{{ t("comment") }}</span>
+            <Input v-model="tempBanForm.comment" aria-label="Temporary ban comment" />
+          </label>
+          <Button class="form-submit" :title="t('add')" :disabled="actionBusy" @click="runAction(createTempBan)"><Plus :size="16" /></Button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>{{ t("sourceIp") }}</th>
+              <th>{{ t("protocol") }}</th>
+              <th>{{ t("port") }}</th>
+              <th>{{ t("expiresAt") }}</th>
+              <th>{{ t("comment") }}</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-if="!loading && tempBans.length === 0">
+              <td colspan="6" class="empty">{{ t("emptyTempBans") }}</td>
+            </tr>
+            <tr v-for="ban in tempBans" :key="ban.id">
+              <td>{{ ban.ip }}</td>
+              <td>{{ ban.protocol }}</td>
+              <td>{{ ban.port ?? '*' }}</td>
+              <td>{{ ban.expires_at }}</td>
+              <td class="clip">{{ ban.comment ?? '' }}</td>
+              <td class="right"><Button variant="ghost" :title="t('delete')" :disabled="actionBusy" @click="runAction(() => deleteItem(`/temp-bans/${ban.id}`))"><Trash2 :size="15" /></Button></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="pager">
+          <Button variant="secondary" :disabled="tempBanPage.page <= 1" @click="runAction(() => loadTempBans(tempBanPage.page - 1))"><ChevronLeft :size="15" /></Button>
+          <span>{{ pageLabel(tempBanPage) }}</span>
+          <Button variant="secondary" :disabled="!hasNext(tempBanPage)" @click="runAction(() => loadTempBans(tempBanPage.page + 1))"><ChevronRight :size="15" /></Button>
+        </div>
+      </section>
+
       <section v-if="tab === 'threats'" class="panel">
         <div class="panel-head">
           <div>
@@ -273,12 +352,12 @@
             <h2>{{ t("dynamicDefense") }}</h2>
             <p>{{ t("dynamicDefenseHint") }}</p>
           </div>
+          <label class="header-toggle">
+            <input v-model="dynamicDefense.enabled" type="checkbox" />
+            <span>{{ dynamicDefense.enabled ? t("enabledShort") : t("disabledShort") }}</span>
+          </label>
         </div>
         <div class="form-grid defense-form">
-          <label class="check-field">
-            <input v-model="dynamicDefense.enabled" type="checkbox" />
-            <span>{{ t("enabled") }}</span>
-          </label>
           <label class="check-field">
             <input v-model="dynamicDefense.ip_rate_limit_enabled" type="checkbox" />
             <span>ip_rate_limit</span>
@@ -308,6 +387,81 @@
             <Input v-model.number="dynamicDefense.flood_block_seconds" type="number" aria-label="Flood block seconds" />
           </label>
           <Button class="form-submit" :title="t('save')" :disabled="actionBusy" @click="runAction(saveDynamicDefense)"><DatabaseZap :size="16" /></Button>
+        </div>
+        <div class="subsection-head">
+          <div>
+            <h3>{{ t("customRateLimits") }}</h3>
+            <p>{{ t("customRateLimitsHint") }}</p>
+          </div>
+        </div>
+        <div class="form-grid custom-rate-form">
+          <label class="field">
+            <span>{{ t("priority") }}</span>
+            <Input v-model.number="dynamicRateForm.priority" type="number" aria-label="Dynamic rate priority" />
+          </label>
+          <label class="field">
+            <span>{{ t("protocol") }}</span>
+            <Select v-model="dynamicRateForm.protocol" aria-label="Dynamic rate protocol">
+              <option value="any">any</option>
+              <option value="tcp">tcp</option>
+              <option value="udp">udp</option>
+              <option value="icmp">icmp</option>
+            </Select>
+          </label>
+          <label class="field">
+            <span>{{ t("port") }}</span>
+            <Input v-model="dynamicRateForm.port" aria-label="Dynamic rate port" placeholder="443" />
+          </label>
+          <label class="field">
+            <span>PPS</span>
+            <Input v-model.number="dynamicRateForm.packets_per_second" type="number" aria-label="Dynamic rate PPS" />
+          </label>
+          <label class="field">
+            <span>{{ t("burst") }}</span>
+            <Input v-model.number="dynamicRateForm.burst" type="number" aria-label="Dynamic rate burst" />
+          </label>
+          <label class="field">
+            <span>{{ t("comment") }}</span>
+            <Input v-model="dynamicRateForm.comment" aria-label="Dynamic rate comment" />
+          </label>
+          <Button class="form-submit" :title="t('add')" :disabled="actionBusy" @click="runAction(createDynamicRateLimit)"><Plus :size="16" /></Button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>{{ t("priority") }}</th>
+              <th>{{ t("protocol") }}</th>
+              <th>{{ t("port") }}</th>
+              <th>PPS</th>
+              <th>{{ t("burst") }}</th>
+              <th>{{ t("comment") }}</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-if="!loading && dynamicRateLimits.length === 0">
+              <td colspan="7" class="empty">{{ t("emptyCustomRateLimits") }}</td>
+            </tr>
+            <tr v-for="limit in dynamicRateLimits" :key="limit.id">
+              <td>
+                <div class="priority-cell">
+                  <span>{{ limit.priority }}</span>
+                  <Badge v-if="isHighestDynamicRateLimit(limit)" tone="amber">{{ t("highest") }}</Badge>
+                </div>
+              </td>
+              <td>{{ limit.protocol }}</td>
+              <td>{{ limit.port ?? '*' }}</td>
+              <td>{{ limit.packets_per_second }}</td>
+              <td>{{ limit.burst }}</td>
+              <td class="clip">{{ limit.comment ?? '' }}</td>
+              <td class="right"><Button variant="ghost" :title="t('delete')" :disabled="actionBusy" @click="runAction(() => deleteItem(`/dynamic-rate-limits/${limit.id}`))"><Trash2 :size="15" /></Button></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="pager">
+          <Button variant="secondary" :disabled="dynamicRatePage.page <= 1" @click="runAction(() => loadDynamicRateLimits(dynamicRatePage.page - 1))"><ChevronLeft :size="15" /></Button>
+          <span>{{ pageLabel(dynamicRatePage) }}</span>
+          <Button variant="secondary" :disabled="!hasNext(dynamicRatePage)" @click="runAction(() => loadDynamicRateLimits(dynamicRatePage.page + 1))"><ChevronRight :size="15" /></Button>
         </div>
       </section>
 
@@ -397,6 +551,119 @@
         </div>
       </section>
 
+      <section v-if="tab === 'drops'" class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>{{ t("dropEvents") }}</h2>
+            <p>{{ t("dropEventsHint") }}</p>
+          </div>
+          <div class="panel-actions">
+            <Button v-if="!dropStreaming" :disabled="actionBusy" @click="startDropStream">
+              <Activity :size="16" />
+              <span>{{ t("start") }}</span>
+            </Button>
+            <Button v-else variant="secondary" @click="stopDropStream">
+              <Square :size="16" />
+              <span>{{ t("stop") }}</span>
+            </Button>
+            <Button variant="ghost" :title="t('clear')" @click="clearDropEvents"><Trash2 :size="15" /></Button>
+          </div>
+        </div>
+        <div class="drop-status">
+          <Badge :tone="dropStreaming ? 'green' : 'amber'">{{ dropStreaming ? t("streaming") : t("stopped") }}</Badge>
+          <label class="inline-select">
+            <span>{{ t("dropScope") }}</span>
+            <Select v-model="dropNodeFilter" :disabled="dropStreaming" aria-label="Drop node filter">
+              <option value="all">{{ t("allNodes") }}</option>
+              <option v-for="node in nodes" :key="node.node_id" :value="node.node_id">{{ node.node_id }}</option>
+            </Select>
+          </label>
+          <label class="inline-select">
+            <span>{{ t("sourceIp") }}</span>
+            <Input v-model="dropFilters.src" class="compact-input" aria-label="Drop source IP filter" placeholder="203.0.113.10" />
+          </label>
+          <label class="inline-select">
+            <span>{{ t("protocol") }}</span>
+            <Select v-model="dropFilters.proto" aria-label="Drop protocol filter">
+              <option value="all">{{ t("allProtocols") }}</option>
+              <option value="tcp">tcp</option>
+              <option value="udp">udp</option>
+              <option value="icmp">icmp</option>
+              <option value="any">any</option>
+            </Select>
+          </label>
+          <label class="inline-select">
+            <span>{{ t("port") }}</span>
+            <Input v-model="dropFilters.port" class="compact-input port-filter-input" aria-label="Drop port filter" placeholder="443" />
+          </label>
+          <span>{{ t("dropEventsLimit") }}</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>{{ t("seen") }}</th>
+              <th>{{ t("node") }}</th>
+              <th>{{ t("reason") }}</th>
+              <th>{{ t("sourceIp") }}</th>
+              <th>{{ t("protocol") }}</th>
+              <th>{{ t("port") }}</th>
+              <th>{{ t("country") }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-if="filteredDropEvents.length === 0">
+              <td colspan="7" class="empty">{{ t("emptyDropEvents") }}</td>
+            </tr>
+            <tr v-for="event in filteredDropEvents" :key="event.local_id">
+              <td>{{ event.time }}</td>
+              <td class="clip">{{ event.node_id }}</td>
+              <td><Badge :tone="dropReasonTone(event.reason)">{{ dropReasonLabel(event.reason) }}</Badge></td>
+              <td>{{ event.src }}</td>
+              <td>{{ event.proto }}</td>
+              <td>{{ event.dport || '*' }}</td>
+              <td>{{ event.country || '-' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section v-if="tab === 'apiDocs'" class="panel docs-panel">
+        <div class="panel-head">
+          <div>
+            <h2>{{ t("apiDocs") }}</h2>
+            <p>{{ t("apiDocsHint") }}</p>
+          </div>
+        </div>
+        <div class="docs-body">
+          <section class="doc-block">
+            <h3>{{ t("apiAuth") }}</h3>
+            <p>{{ t("apiAuthText") }}</p>
+            <pre><code>Authorization: Bearer &lt;token&gt;
+X-API-Token: &lt;token&gt;</code></pre>
+          </section>
+          <section class="doc-block">
+            <h3>{{ t("apiPagination") }}</h3>
+            <p>{{ t("apiPaginationText") }}</p>
+            <pre><code>{{ pageResponseExample }}</code></pre>
+          </section>
+          <section v-for="section in apiDocSections" :key="section.title" class="doc-block">
+            <h3>{{ section.title }}</h3>
+            <p>{{ section.description }}</p>
+            <div class="endpoint-list">
+              <article v-for="endpoint in section.endpoints" :key="`${endpoint.method}-${endpoint.path}`" class="endpoint-row">
+                <div class="endpoint-main">
+                  <Badge :tone="methodTone(endpoint.method)">{{ endpoint.method }}</Badge>
+                  <code>{{ endpoint.path }}</code>
+                  <span>{{ endpoint.summary }}</span>
+                </div>
+                <pre v-if="endpoint.body"><code>{{ endpoint.body }}</code></pre>
+                <pre v-if="endpoint.curl"><code>{{ endpoint.curl }}</code></pre>
+              </article>
+            </div>
+          </section>
+        </div>
+      </section>
+
       <div v-if="loading" class="loading-bar"><span></span></div>
       <p v-if="error" class="error">{{ error }}</p>
       <p v-else-if="notice" class="notice">{{ notice }}</p>
@@ -421,7 +688,7 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { ChevronLeft, ChevronRight, DatabaseZap, Globe2, KeyRound, ListFilter, Plus, RefreshCcw, Server, ShieldCheck, Trash2 } from "lucide-vue-next";
+import { Activity, Ban, BookOpen, ChevronLeft, ChevronRight, DatabaseZap, Globe2, KeyRound, ListFilter, Plus, RefreshCcw, Server, ShieldCheck, Square, Trash2 } from "lucide-vue-next";
 import Badge from "./components/ui/Badge.vue";
 import Button from "./components/ui/Button.vue";
 import Input from "./components/ui/Input.vue";
@@ -431,6 +698,8 @@ type Rule = { id: number; priority: number; action: string; cidr: string; protoc
 type GeoCountry = { id: number; country: string; action: string; packets_per_second?: number; burst?: number };
 type ThreatSource = { id: number; name: string; url: string; format: string; min_score?: number };
 type TrustedCidr = { id: number; cidr: string; enabled: boolean; comment?: string };
+type DynamicRateLimit = { id: number; enabled: boolean; priority: number; protocol: string; port?: number | null; packets_per_second: number; burst: number; comment?: string | null };
+type TempBan = { id: number; ip: string; protocol: string; port?: number | null; expires_at: string; comment?: string | null; created_at: string };
 type CountryOption = { code: string; name: string };
 type DynamicDefense = {
   enabled: boolean;
@@ -443,18 +712,24 @@ type DynamicDefense = {
   flood_block_seconds?: number | null;
 };
 type NodeState = { node_id: string; interface_name: string; last_applied_version: number; status: string; last_seen_at: string; error?: string };
-type Snapshot = { version: number; rules: unknown[]; geo_countries: unknown[]; dynamic_defense: DynamicDefense; trusted_cidrs: unknown[]; threat_sources: unknown[] };
+type DropEvent = { local_id: number; node_id: string; interface_name: string; time: string; event_time_ns: number; cpu: number; reason: string; src: string; family: number; proto: string; dport: number; country?: string; action: string };
+type Snapshot = { version: number; rules: unknown[]; geo_countries: unknown[]; temp_bans: unknown[]; dynamic_defense: DynamicDefense; dynamic_rate_limits: unknown[]; trusted_cidrs: unknown[]; threat_sources: unknown[] };
 type Page<T> = { items: T[]; total: number; page: number; page_size: number; total_pages: number };
 type PageState = { page: number; total_pages: number; total: number };
+type ApiDocEndpoint = { method: string; path: string; summary: string; body?: string; curl?: string };
+type ApiDocSection = { title: string; description: string; endpoints: ApiDocEndpoint[] };
 type Lang = "zh" | "en";
 
 const tabs = [
   { id: "rules", label: "rules", icon: ListFilter },
   { id: "geo", label: "countries", icon: Globe2 },
+  { id: "tempBans", label: "tempBans", icon: Ban },
   { id: "threats", label: "threats", icon: ShieldCheck },
   { id: "defense", label: "dynamicDefense", icon: ShieldCheck },
   { id: "trusted", label: "trustedCidrs", icon: KeyRound },
-  { id: "nodes", label: "nodes", icon: Server }
+  { id: "nodes", label: "nodes", icon: Server },
+  { id: "drops", label: "dropEvents", icon: Activity },
+  { id: "apiDocs", label: "apiDocs", icon: BookOpen }
 ] as const;
 
 const tab = ref<(typeof tabs)[number]["id"]>("rules");
@@ -473,18 +748,30 @@ const rules = ref<Rule[]>([]);
 const geoCountries = ref<GeoCountry[]>([]);
 const threatSources = ref<ThreatSource[]>([]);
 const trustedCidrs = ref<TrustedCidr[]>([]);
+const dynamicRateLimits = ref<DynamicRateLimit[]>([]);
+const tempBans = ref<TempBan[]>([]);
 const countries = ref<CountryOption[]>([]);
 const nodes = ref<NodeState[]>([]);
+const dropEvents = ref<DropEvent[]>([]);
+const dropStreaming = ref(false);
+const dropNodeFilter = ref("all");
+const dropFilters = reactive({ src: "", proto: "all", port: "" });
+let dropAbort: AbortController | null = null;
+let dropEventSeq = 0;
 const rulePage = reactive<PageState>({ page: 1, total_pages: 0, total: 0 });
 const geoPage = reactive<PageState>({ page: 1, total_pages: 0, total: 0 });
 const threatPage = reactive<PageState>({ page: 1, total_pages: 0, total: 0 });
 const trustedPage = reactive<PageState>({ page: 1, total_pages: 0, total: 0 });
+const dynamicRatePage = reactive<PageState>({ page: 1, total_pages: 0, total: 0 });
+const tempBanPage = reactive<PageState>({ page: 1, total_pages: 0, total: 0 });
 const nodePage = reactive<PageState>({ page: 1, total_pages: 0, total: 0 });
 
 const ruleForm = reactive({ priority: 10, action: "deny", cidr: "203.0.113.0/24", protocol: "any", port: "" });
 const geoForm = reactive({ country: "CN", action: "allow" });
 const threatForm = reactive({ name: "ipsum", url: "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt", format: "ipsum", min_score: 3 });
 const trustedForm = reactive({ cidr: "10.0.0.0/8", comment: "" });
+const dynamicRateForm = reactive({ priority: 10, protocol: "tcp", port: "443", packets_per_second: 1000, burst: 2000, comment: "" });
+const tempBanForm = reactive({ ip: "203.0.113.10", protocol: "any", port: "", duration_seconds: 300, comment: "" });
 const dynamicDefense = reactive<DynamicDefense>({
   enabled: true,
   ip_rate_limit_enabled: true,
@@ -509,6 +796,14 @@ const messages = {
     add: "添加",
     allow: "允许",
     apiToken: "API 令牌",
+    apiAuth: "鉴权",
+    apiAuthText: "除 /health、/countries 和前端静态资源外，配置、节点和 Drop 订阅接口都需要 API 令牌。两种请求头都支持。",
+    apiDocs: "API 文档",
+    apiDocsHint: "查看控制面 HTTP API 的请求方式、参数和示例",
+    apiPagination: "分页",
+    apiPaginationText: "列表接口支持 page 和 page_size，默认 page_size 为 100，最大 500。",
+    allNodes: "全部节点",
+    allProtocols: "全部协议",
     authInvalid: "API 令牌缺失或无效",
     blockSeconds: "封禁秒数",
     burst: "突发",
@@ -517,8 +812,16 @@ const messages = {
     countries: "国家",
     countriesHint: "按国家代码配置允许或拒绝",
     country: "国家",
+    customRateLimits: "自定义限流",
+    customRateLimitsHint: "按协议或目的端口配置限流；优先级高于全局 IP 限流和 Flood",
     delete: "删除",
     disabledShort: "关",
+    clear: "清空",
+    dropEvents: "实时 Drop",
+    dropEventsHint: "通过 xDS 从 agent 订阅实时丢包事件",
+    dropEventsLimit: "仅保留最近 300 条",
+    dropScope: "订阅范围",
+    durationSeconds: "时长秒数",
     dynamicDefense: "动态防御",
     dynamicDefenseHint: "配置全局每源 IP 限流和 flood 临时封禁",
     deny: "拒绝",
@@ -527,9 +830,13 @@ const messages = {
     emptyRules: "暂无普通防火墙规则",
     emptyThreats: "暂无威胁源",
     emptyTrustedCidrs: "暂无白名单",
+    emptyDropEvents: "暂无 Drop 事件",
+    emptyCustomRateLimits: "暂无自定义限流",
+    emptyTempBans: "暂无临时封禁",
     enabled: "启用",
     enabledShort: "开",
     error: "错误",
+    expiresAt: "到期时间",
     floodBurst: "Flood 突发",
     floodPps: "Flood PPS",
     format: "格式",
@@ -547,7 +854,11 @@ const messages = {
     priority: "优先级",
     priorityCountries: "国家规则",
     priorityCountriesDetail: "再按国家代码执行允许或拒绝",
-    priorityDefense: "动态防御",
+    priorityTempBans: "临时封禁",
+    priorityTempBansDetail: "白名单之后立即拒绝命中的临时封禁",
+    priorityDefenseCustom: "自定义限流",
+    priorityDefenseCustomDetail: "先按协议或目的端口执行动态防御限流",
+    priorityDefense: "全局动态防御",
     priorityDefenseDetail: "最后执行全局 ip_rate_limit 和 flood",
     priorityOrder: "执行优先级",
     priorityRules: "普通规则 / 威胁情报",
@@ -568,7 +879,15 @@ const messages = {
     save: "保存",
     saved: "已保存",
     signIn: "登录",
+    sourceIp: "源 IP",
+    start: "开始",
     status: "状态",
+    stop: "停止",
+    stopped: "已停止",
+    streaming: "订阅中",
+    reason: "原因",
+    tempBans: "临时封禁",
+    tempBansHint: "临时封禁某个源 IP，可选协议和目的端口，默认 5 分钟",
     threats: "威胁",
     threatsHint: "配置威胁情报源，下发为拒绝规则",
     threatScore: "威胁评分",
@@ -587,6 +906,14 @@ const messages = {
     add: "Add",
     allow: "allow",
     apiToken: "API token",
+    apiAuth: "Authentication",
+    apiAuthText: "Configuration, nodes, and Drop stream APIs require an API token except /health, /countries, and frontend assets. Both headers are accepted.",
+    apiDocs: "API Docs",
+    apiDocsHint: "HTTP control-plane API methods, parameters, and examples",
+    apiPagination: "Pagination",
+    apiPaginationText: "List APIs support page and page_size. The default page_size is 100 and the maximum is 500.",
+    allNodes: "All nodes",
+    allProtocols: "All protocols",
     authInvalid: "missing or invalid API token",
     blockSeconds: "Block seconds",
     burst: "Burst",
@@ -595,8 +922,16 @@ const messages = {
     countries: "Countries",
     countriesHint: "Allow or deny by country code",
     country: "Country",
+    customRateLimits: "Custom Rate Limits",
+    customRateLimitsHint: "Rate-limit by protocol or destination port before global IP limit and flood",
     delete: "Delete",
     disabledShort: "off",
+    clear: "Clear",
+    dropEvents: "Live Drops",
+    dropEventsHint: "Subscribe to realtime drop events from agents through xDS",
+    dropEventsLimit: "Keeping the latest 300 rows only",
+    dropScope: "Scope",
+    durationSeconds: "Duration seconds",
     dynamicDefense: "Dynamic Defense",
     dynamicDefenseHint: "Configure global per-source-IP rate limit and flood temporary block",
     deny: "deny",
@@ -605,9 +940,13 @@ const messages = {
     emptyRules: "No firewall rules",
     emptyThreats: "No threat sources",
     emptyTrustedCidrs: "No whitelist entries",
+    emptyDropEvents: "No drop events",
+    emptyCustomRateLimits: "No custom rate limits",
+    emptyTempBans: "No temporary bans",
     enabled: "Enabled",
     enabledShort: "on",
     error: "Error",
+    expiresAt: "Expires at",
     floodBurst: "Flood burst",
     floodPps: "Flood PPS",
     format: "Format",
@@ -625,7 +964,11 @@ const messages = {
     priority: "Priority",
     priorityCountries: "Country rules",
     priorityCountriesDetail: "Then apply country-code allow or deny decisions",
-    priorityDefense: "Dynamic Defense",
+    priorityTempBans: "Temporary bans",
+    priorityTempBansDetail: "Drop matching temporary bans immediately after whitelist",
+    priorityDefenseCustom: "Custom rate limits",
+    priorityDefenseCustomDetail: "Apply protocol or destination-port dynamic rate limits first",
+    priorityDefense: "Global Dynamic Defense",
     priorityDefenseDetail: "Finally apply global ip_rate_limit and flood",
     priorityOrder: "Enforcement Priority",
     priorityRules: "Firewall Rules / Threat Intel",
@@ -646,7 +989,15 @@ const messages = {
     save: "Save",
     saved: "Saved",
     signIn: "Sign in",
+    sourceIp: "Source IP",
+    start: "Start",
     status: "Status",
+    stop: "Stop",
+    stopped: "stopped",
+    streaming: "streaming",
+    reason: "Reason",
+    tempBans: "Temporary Bans",
+    tempBansHint: "Temporarily block a source IP with optional protocol and destination port; default is 5 minutes",
     threats: "Threats",
     threatsHint: "Configure threat intelligence feeds as deny rules",
     threatScore: "Threat score",
@@ -701,15 +1052,404 @@ const validationMessages = {
   }
 } as const;
 
+const apiDocsZh: ApiDocSection[] = [
+  {
+    title: "系统",
+    description: "健康检查、国家列表和完整策略快照。",
+    endpoints: [
+      { method: "GET", path: "/health", summary: "健康检查，公开接口。" },
+      { method: "GET", path: "/countries", summary: "返回国家下拉列表，公开接口。" },
+      { method: "GET", path: "/policy", summary: "返回当前单一策略快照。" },
+      { method: "POST", path: "/policy/bump-version", summary: "手动递增策略版本，触发 xDS 推送。" },
+      { method: "POST", path: "/policy/seed-example", summary: "初始化示例规则，保留白名单和动态防御配置。" }
+    ]
+  },
+  {
+    title: "普通规则",
+    description: "CIDR、协议、端口的允许或拒绝规则。priority 数字越小优先级越高。",
+    endpoints: [
+      { method: "GET", path: "/rules?page=1&page_size=100", summary: "分页列出普通防火墙规则。" },
+      {
+        method: "POST",
+        path: "/rules",
+        summary: "新增普通规则。",
+        body: `{
+  "priority": 10,
+  "action": "deny",
+  "cidr": "203.0.113.0/24",
+  "protocol": "tcp",
+  "port": 443,
+  "comment": "block example"
+}`,
+        curl: `curl -X POST "$BASE/rules" \\
+  -H "X-API-Token: $TOKEN" \\
+  -H "content-type: application/json" \\
+  -d '{"priority":10,"action":"deny","cidr":"203.0.113.0/24","protocol":"tcp","port":443}'`
+      },
+      { method: "DELETE", path: "/rules/{id}", summary: "删除普通规则。" }
+    ]
+  },
+  {
+    title: "国家规则",
+    description: "按国家代码允许或拒绝。国家 CIDR 由控制面编译策略时加载。",
+    endpoints: [
+      { method: "GET", path: "/geo-countries?page=1&page_size=100", summary: "分页列出国家规则。" },
+      {
+        method: "POST",
+        path: "/geo-countries",
+        summary: "新增国家允许或拒绝规则。",
+        body: `{
+  "country": "CN",
+  "action": "allow"
+}`
+      },
+      { method: "DELETE", path: "/geo-countries/{id}", summary: "删除国家规则。" }
+    ]
+  },
+  {
+    title: "临时封禁",
+    description: "临时封禁单个源 IP，可选协议和目的端口。duration_seconds 默认 300。",
+    endpoints: [
+      { method: "GET", path: "/temp-bans?page=1&page_size=100", summary: "分页列出未过期临时封禁。" },
+      {
+        method: "POST",
+        path: "/temp-bans",
+        summary: "新增临时封禁。",
+        body: `{
+  "ip": "203.0.113.10",
+  "protocol": "tcp",
+  "port": 443,
+  "duration_seconds": 300,
+  "comment": "manual block"
+}`,
+        curl: `curl -X POST "$BASE/temp-bans" \\
+  -H "X-API-Token: $TOKEN" \\
+  -H "content-type: application/json" \\
+  -d '{"ip":"203.0.113.10","duration_seconds":300}'`
+      },
+      { method: "DELETE", path: "/temp-bans/{id}", summary: "删除临时封禁，立即触发策略版本更新。" }
+    ]
+  },
+  {
+    title: "威胁情报",
+    description: "威胁源会被编译为拒绝前缀规则。内置 ipsum 和 spamhaus-drop。",
+    endpoints: [
+      { method: "GET", path: "/threat-sources?page=1&page_size=100", summary: "分页列出威胁源。" },
+      {
+        method: "POST",
+        path: "/threat-sources",
+        summary: "新增威胁情报源。",
+        body: `{
+  "name": "ipsum",
+  "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt",
+  "format": "ipsum",
+  "min_score": 3
+}`
+      },
+      { method: "DELETE", path: "/threat-sources/{id}", summary: "删除威胁源。" }
+    ]
+  },
+  {
+    title: "动态防御",
+    description: "全局每源 IP 限流和 flood 临时封禁配置。",
+    endpoints: [
+      { method: "GET", path: "/dynamic-defense", summary: "读取全局动态防御配置。" },
+      {
+        method: "PUT",
+        path: "/dynamic-defense",
+        summary: "保存全局动态防御配置。",
+        body: `{
+  "enabled": true,
+  "ip_rate_limit_enabled": true,
+  "ip_packets_per_second": 5000,
+  "ip_burst": 10000,
+  "flood_enabled": true,
+  "flood_packets_per_second": 20000,
+  "flood_burst": 40000,
+  "flood_block_seconds": 60
+}`
+      }
+    ]
+  },
+  {
+    title: "自定义限流",
+    description: "按协议或目的端口配置动态防御限流，优先级高于全局 ip_rate_limit 和 flood。",
+    endpoints: [
+      { method: "GET", path: "/dynamic-rate-limits?page=1&page_size=100", summary: "分页列出自定义限流。" },
+      {
+        method: "POST",
+        path: "/dynamic-rate-limits",
+        summary: "新增协议或目的端口限流。",
+        body: `{
+  "priority": 10,
+  "protocol": "any",
+  "port": 443,
+  "packets_per_second": 1000,
+  "burst": 2000,
+  "comment": "protect https"
+}`
+      },
+      { method: "DELETE", path: "/dynamic-rate-limits/{id}", summary: "删除自定义限流。" }
+    ]
+  },
+  {
+    title: "白名单",
+    description: "最高优先级源 CIDR 白名单。命中后直接允许。",
+    endpoints: [
+      { method: "GET", path: "/trusted-cidrs?page=1&page_size=100", summary: "分页列出数据库管理的白名单。" },
+      {
+        method: "POST",
+        path: "/trusted-cidrs",
+        summary: "新增或更新白名单 CIDR。",
+        body: `{
+  "cidr": "10.0.0.0/8",
+  "enabled": true,
+  "comment": "private network"
+}`
+      },
+      { method: "DELETE", path: "/trusted-cidrs/{id}", summary: "删除白名单。" }
+    ]
+  },
+  {
+    title: "节点",
+    description: "查看 agent 心跳、最后应用版本和状态。",
+    endpoints: [
+      { method: "GET", path: "/nodes?page=1&page_size=100", summary: "分页列出节点。" },
+      { method: "GET", path: "/nodes/{node_id}", summary: "查看单个节点状态。" }
+    ]
+  },
+  {
+    title: "实时 Drop",
+    description: "NDJSON 流。无订阅时 agent 不读取 perf buffer，也不会开启 BPF drop event 输出。",
+    endpoints: [
+      {
+        method: "GET",
+        path: "/drop-events/stream",
+        summary: "订阅所有节点实时 Drop。",
+        curl: `curl -N "$BASE/drop-events/stream" -H "X-API-Token: $TOKEN"`
+      },
+      {
+        method: "GET",
+        path: "/drop-events/stream?node_id=node-1",
+        summary: "只订阅指定节点实时 Drop。",
+        curl: `curl -N "$BASE/drop-events/stream?node_id=node-1" -H "X-API-Token: $TOKEN"`
+      }
+    ]
+  }
+];
+
+const apiDocsEn: ApiDocSection[] = [
+  {
+    title: "System",
+    description: "Health, country options, and full policy snapshot.",
+    endpoints: [
+      { method: "GET", path: "/health", summary: "Health check. Public." },
+      { method: "GET", path: "/countries", summary: "Country dropdown options. Public." },
+      { method: "GET", path: "/policy", summary: "Return the current single policy snapshot." },
+      { method: "POST", path: "/policy/bump-version", summary: "Increment the policy version and trigger xDS push." },
+      { method: "POST", path: "/policy/seed-example", summary: "Seed example rules while preserving whitelist and dynamic defense settings." }
+    ]
+  },
+  {
+    title: "Firewall Rules",
+    description: "CIDR/protocol/port allow or deny rules. Lower priority numbers win.",
+    endpoints: [
+      { method: "GET", path: "/rules?page=1&page_size=100", summary: "List firewall rules." },
+      {
+        method: "POST",
+        path: "/rules",
+        summary: "Create a firewall rule.",
+        body: `{
+  "priority": 10,
+  "action": "deny",
+  "cidr": "203.0.113.0/24",
+  "protocol": "tcp",
+  "port": 443,
+  "comment": "block example"
+}`,
+        curl: `curl -X POST "$BASE/rules" \\
+  -H "X-API-Token: $TOKEN" \\
+  -H "content-type: application/json" \\
+  -d '{"priority":10,"action":"deny","cidr":"203.0.113.0/24","protocol":"tcp","port":443}'`
+      },
+      { method: "DELETE", path: "/rules/{id}", summary: "Delete a firewall rule." }
+    ]
+  },
+  {
+    title: "Country Rules",
+    description: "Allow or deny by country code. Country CIDRs are loaded when compiling policy.",
+    endpoints: [
+      { method: "GET", path: "/geo-countries?page=1&page_size=100", summary: "List country rules." },
+      {
+        method: "POST",
+        path: "/geo-countries",
+        summary: "Create a country allow or deny rule.",
+        body: `{
+  "country": "CN",
+  "action": "allow"
+}`
+      },
+      { method: "DELETE", path: "/geo-countries/{id}", summary: "Delete a country rule." }
+    ]
+  },
+  {
+    title: "Temporary Bans",
+    description: "Temporarily block one source IP with optional protocol and destination port. duration_seconds defaults to 300.",
+    endpoints: [
+      { method: "GET", path: "/temp-bans?page=1&page_size=100", summary: "List unexpired temporary bans." },
+      {
+        method: "POST",
+        path: "/temp-bans",
+        summary: "Create a temporary ban.",
+        body: `{
+  "ip": "203.0.113.10",
+  "protocol": "tcp",
+  "port": 443,
+  "duration_seconds": 300,
+  "comment": "manual block"
+}`,
+        curl: `curl -X POST "$BASE/temp-bans" \\
+  -H "X-API-Token: $TOKEN" \\
+  -H "content-type: application/json" \\
+  -d '{"ip":"203.0.113.10","duration_seconds":300}'`
+      },
+      { method: "DELETE", path: "/temp-bans/{id}", summary: "Delete a temporary ban and trigger a new policy version." }
+    ]
+  },
+  {
+    title: "Threat Intelligence",
+    description: "Threat feeds compile into deny prefix rules. Built-ins include ipsum and spamhaus-drop.",
+    endpoints: [
+      { method: "GET", path: "/threat-sources?page=1&page_size=100", summary: "List threat sources." },
+      {
+        method: "POST",
+        path: "/threat-sources",
+        summary: "Create a threat feed.",
+        body: `{
+  "name": "ipsum",
+  "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt",
+  "format": "ipsum",
+  "min_score": 3
+}`
+      },
+      { method: "DELETE", path: "/threat-sources/{id}", summary: "Delete a threat source." }
+    ]
+  },
+  {
+    title: "Dynamic Defense",
+    description: "Global per-source-IP rate limit and flood temporary block settings.",
+    endpoints: [
+      { method: "GET", path: "/dynamic-defense", summary: "Read global dynamic defense settings." },
+      {
+        method: "PUT",
+        path: "/dynamic-defense",
+        summary: "Save global dynamic defense settings.",
+        body: `{
+  "enabled": true,
+  "ip_rate_limit_enabled": true,
+  "ip_packets_per_second": 5000,
+  "ip_burst": 10000,
+  "flood_enabled": true,
+  "flood_packets_per_second": 20000,
+  "flood_burst": 40000,
+  "flood_block_seconds": 60
+}`
+      }
+    ]
+  },
+  {
+    title: "Custom Rate Limits",
+    description: "Protocol or destination-port dynamic defense limits. They run before global ip_rate_limit and flood.",
+    endpoints: [
+      { method: "GET", path: "/dynamic-rate-limits?page=1&page_size=100", summary: "List custom rate limits." },
+      {
+        method: "POST",
+        path: "/dynamic-rate-limits",
+        summary: "Create a protocol or destination-port limit.",
+        body: `{
+  "priority": 10,
+  "protocol": "any",
+  "port": 443,
+  "packets_per_second": 1000,
+  "burst": 2000,
+  "comment": "protect https"
+}`
+      },
+      { method: "DELETE", path: "/dynamic-rate-limits/{id}", summary: "Delete a custom rate limit." }
+    ]
+  },
+  {
+    title: "Whitelist",
+    description: "Highest-priority source CIDR whitelist. Matching sources pass immediately.",
+    endpoints: [
+      { method: "GET", path: "/trusted-cidrs?page=1&page_size=100", summary: "List database-managed whitelist entries." },
+      {
+        method: "POST",
+        path: "/trusted-cidrs",
+        summary: "Create or update a whitelist CIDR.",
+        body: `{
+  "cidr": "10.0.0.0/8",
+  "enabled": true,
+  "comment": "private network"
+}`
+      },
+      { method: "DELETE", path: "/trusted-cidrs/{id}", summary: "Delete a whitelist entry." }
+    ]
+  },
+  {
+    title: "Nodes",
+    description: "Agent heartbeat, last applied version, and status.",
+    endpoints: [
+      { method: "GET", path: "/nodes?page=1&page_size=100", summary: "List nodes." },
+      { method: "GET", path: "/nodes/{node_id}", summary: "Read one node." }
+    ]
+  },
+  {
+    title: "Live Drop Events",
+    description: "NDJSON stream. Agents do not read the perf buffer or enable BPF drop event output when there are no subscribers.",
+    endpoints: [
+      {
+        method: "GET",
+        path: "/drop-events/stream",
+        summary: "Subscribe to all nodes.",
+        curl: `curl -N "$BASE/drop-events/stream" -H "X-API-Token: $TOKEN"`
+      },
+      {
+        method: "GET",
+        path: "/drop-events/stream?node_id=node-1",
+        summary: "Subscribe to one node.",
+        curl: `curl -N "$BASE/drop-events/stream?node_id=node-1" -H "X-API-Token: $TOKEN"`
+      }
+    ]
+  }
+];
+
 type TextKey = keyof typeof messages.zh;
 type ValidationKey = keyof typeof validationMessages.zh;
 
 const priorityOrder: { rank: string; label: TextKey; detail: TextKey }[] = [
   { rank: "1", label: "priorityWhitelist", detail: "priorityWhitelistDetail" },
-  { rank: "2", label: "priorityRules", detail: "priorityRulesDetail" },
-  { rank: "3", label: "priorityCountries", detail: "priorityCountriesDetail" },
-  { rank: "4", label: "priorityDefense", detail: "priorityDefenseDetail" }
+  { rank: "2", label: "priorityTempBans", detail: "priorityTempBansDetail" },
+  { rank: "3", label: "priorityRules", detail: "priorityRulesDetail" },
+  { rank: "4", label: "priorityCountries", detail: "priorityCountriesDetail" },
+  { rank: "5", label: "priorityDefenseCustom", detail: "priorityDefenseCustomDetail" },
+  { rank: "6", label: "priorityDefense", detail: "priorityDefenseDetail" }
 ];
+
+const pageResponseExample = `{
+  "items": [],
+  "total": 0,
+  "page": 1,
+  "page_size": 100,
+  "total_pages": 0
+}`;
+
+const apiDocSections = computed<ApiDocSection[]>(() => {
+  if (language.value === "en") {
+    return apiDocsEn;
+  }
+  return apiDocsZh;
+});
 
 const highestRulePriority = computed(() => {
   if (rules.value.length === 0) {
@@ -721,6 +1461,48 @@ const highestRulePriority = computed(() => {
 function isHighestRule(rule: Rule): boolean {
   return highestRulePriority.value !== null && rule.priority === highestRulePriority.value;
 }
+
+const highestDynamicRateLimitPriority = computed(() => {
+  if (dynamicRateLimits.value.length === 0) {
+    return null;
+  }
+  return Math.min(...dynamicRateLimits.value.map((limit) => limit.priority));
+});
+
+function isHighestDynamicRateLimit(limit: DynamicRateLimit): boolean {
+  return highestDynamicRateLimitPriority.value !== null && limit.priority === highestDynamicRateLimitPriority.value;
+}
+
+function methodTone(method: string): "red" | "amber" | "green" | "neutral" {
+  if (method === "GET") {
+    return "green";
+  }
+  if (method === "DELETE") {
+    return "red";
+  }
+  if (method === "POST" || method === "PUT") {
+    return "amber";
+  }
+  return "neutral";
+}
+
+const filteredDropEvents = computed(() => {
+  const src = dropFilters.src.trim().toLowerCase();
+  const proto = dropFilters.proto;
+  const port = dropFilters.port.trim();
+  return dropEvents.value.filter((event) => {
+    if (src && !event.src.toLowerCase().includes(src)) {
+      return false;
+    }
+    if (proto !== "all" && event.proto.toLowerCase() !== proto) {
+      return false;
+    }
+    if (port && String(event.dport || "*") !== port) {
+      return false;
+    }
+    return true;
+  });
+});
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   error.value = "";
@@ -763,10 +1545,13 @@ function isProtectedApiPath(path: string): boolean {
     clean.startsWith("policy") ||
     clean.startsWith("rules") ||
     clean.startsWith("geo-countries") ||
+    clean.startsWith("temp-bans") ||
     clean.startsWith("threat-sources") ||
     clean.startsWith("dynamic-defense") ||
+    clean.startsWith("dynamic-rate-limits") ||
     clean.startsWith("trusted-cidrs") ||
-    clean.startsWith("nodes")
+    clean.startsWith("nodes") ||
+    clean.startsWith("drop-events")
   );
 }
 
@@ -792,6 +1577,7 @@ function currentApiToken(): string {
 }
 
 function clearApiToken() {
+  stopDropStream();
   apiToken.value = "";
   loginToken.value = "";
   clearStoredApiToken();
@@ -816,6 +1602,10 @@ function v(key: ValidationKey, label = ""): string {
 
 function setTab(value: (typeof tabs)[number]["id"]) {
   tab.value = value;
+  if (value === "apiDocs") {
+    authRequired.value = false;
+    loginError.value = "";
+  }
   if (window.location.hash !== `#${value}`) {
     window.location.hash = value;
   }
@@ -825,6 +1615,10 @@ function syncTabFromHash() {
   const value = window.location.hash.replace(/^#\/?/, "");
   if (tabs.some((item) => item.id === value)) {
     tab.value = value as (typeof tabs)[number]["id"];
+    if (tab.value === "apiDocs") {
+      authRequired.value = false;
+      loginError.value = "";
+    }
   }
 }
 
@@ -857,6 +1651,40 @@ function pageLabel(state: PageState): string {
   return `${t("page")} ${state.page}/${totalPages} · ${t("total")} ${state.total}`;
 }
 
+function dropReasonLabel(reason: string): string {
+  const zh: Record<string, string> = {
+    firewall_rule: "普通规则",
+    threat_intel: "威胁情报",
+    country: "国家",
+    temporary_ban: "临时封禁",
+    "dynamic_defense.ip_rate_limit": "动态防御 IP 限流",
+    "dynamic_defense.flood": "动态防御 Flood",
+    "dynamic_defense.custom_rate_limit": "动态防御自定义限流",
+    parse_error: "解析异常"
+  };
+  const en: Record<string, string> = {
+    firewall_rule: "Firewall rule",
+    threat_intel: "Threat intel",
+    country: "Country",
+    temporary_ban: "Temporary ban",
+    "dynamic_defense.ip_rate_limit": "IP rate limit",
+    "dynamic_defense.flood": "Flood",
+    "dynamic_defense.custom_rate_limit": "Custom rate limit",
+    parse_error: "Parse error"
+  };
+  return (language.value === "zh" ? zh : en)[reason] ?? reason;
+}
+
+function dropReasonTone(reason: string): "red" | "amber" | "green" | "neutral" {
+  if (reason === "threat_intel" || reason === "country" || reason === "temporary_ban") {
+    return "red";
+  }
+  if (reason.startsWith("dynamic_defense")) {
+    return "amber";
+  }
+  return "neutral";
+}
+
 function countryLabel(country: CountryOption): string {
   return `${country.code} · ${country.name}`;
 }
@@ -882,8 +1710,10 @@ async function refreshAll() {
     await loadPolicy();
     await loadRules();
     await loadGeo();
+    await loadTempBans();
     await loadThreats();
     await loadDynamicDefense();
+    await loadDynamicRateLimits();
     await loadTrustedCidrs();
     await loadNodes();
   } catch (err) {
@@ -891,6 +1721,26 @@ async function refreshAll() {
   } finally {
     loading.value = false;
   }
+}
+
+async function refreshPublic() {
+  loading.value = true;
+  try {
+    await loadHealth();
+    await loadCountries();
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err);
+  } finally {
+    loading.value = false;
+  }
+}
+
+async function refreshCurrentView() {
+  if (tab.value === "apiDocs") {
+    await refreshPublic();
+    return;
+  }
+  await refreshAll();
 }
 
 async function runAction(action: () => Promise<void>) {
@@ -926,6 +1776,12 @@ async function loadGeo(page = geoPage.page) {
   updatePage(geoPage, data);
 }
 
+async function loadTempBans(page = tempBanPage.page) {
+  const data = await api<Page<TempBan>>(`temp-bans?${pageQuery(page)}`);
+  tempBans.value = data.items;
+  updatePage(tempBanPage, data);
+}
+
 async function loadThreats(page = threatPage.page) {
   const data = await api<Page<ThreatSource>>(`threat-sources?${pageQuery(page)}`);
   threatSources.value = data.items;
@@ -935,6 +1791,12 @@ async function loadThreats(page = threatPage.page) {
 async function loadDynamicDefense() {
   const data = await api<DynamicDefense>("dynamic-defense");
   Object.assign(dynamicDefense, data);
+}
+
+async function loadDynamicRateLimits(page = dynamicRatePage.page) {
+  const data = await api<Page<DynamicRateLimit>>(`dynamic-rate-limits?${pageQuery(page)}`);
+  dynamicRateLimits.value = data.items;
+  updatePage(dynamicRatePage, data);
 }
 
 async function loadTrustedCidrs(page = trustedPage.page) {
@@ -954,6 +1816,99 @@ async function loadNodes(page = nodePage.page) {
   const data = await api<Page<NodeState>>(`nodes?${pageQuery(page)}`);
   nodes.value = data.items;
   updatePage(nodePage, data);
+}
+
+async function startDropStream() {
+  if (dropStreaming.value) {
+    return;
+  }
+  error.value = "";
+  const headers = new Headers();
+  const token = currentApiToken();
+  if (!token) {
+    authRequired.value = true;
+    loginError.value = t("authInvalid");
+    return;
+  }
+  headers.set(authHeader, `Bearer ${token}`);
+  headers.set(apiTokenHeader, token);
+  dropAbort = new AbortController();
+  dropStreaming.value = true;
+  try {
+    const response = await fetch(apiUrl(dropStreamPath()), {
+      headers,
+      signal: dropAbort.signal
+    });
+    if (response.status === 401) {
+      authRequired.value = true;
+      loginError.value = t("authInvalid");
+      return;
+    }
+    if (!response.ok || !response.body) {
+      throw new Error(response.statusText || "drop stream failed");
+    }
+    await readDropStream(response.body);
+  } catch (err) {
+    if (!(err instanceof DOMException && err.name === "AbortError")) {
+      error.value = err instanceof Error ? err.message : String(err);
+    }
+  } finally {
+    dropStreaming.value = false;
+    dropAbort = null;
+  }
+}
+
+function dropStreamPath(): string {
+  if (dropNodeFilter.value === "all") {
+    return "drop-events/stream";
+  }
+  return `drop-events/stream?node_id=${encodeURIComponent(dropNodeFilter.value)}`;
+}
+
+function stopDropStream() {
+  dropAbort?.abort();
+  dropAbort = null;
+  dropStreaming.value = false;
+}
+
+function clearDropEvents() {
+  dropEvents.value = [];
+}
+
+async function readDropStream(body: ReadableStream<Uint8Array>) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffered += decoder.decode(value, { stream: true });
+    const lines = buffered.split("\n");
+    buffered = lines.pop() ?? "";
+    for (const line of lines) {
+      appendDropEvent(line);
+    }
+  }
+}
+
+function appendDropEvent(line: string) {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+  let event: Omit<DropEvent, "local_id">;
+  try {
+    event = JSON.parse(trimmed) as Omit<DropEvent, "local_id">;
+  } catch (err) {
+    console.warn("ignored invalid drop event line", err);
+    return;
+  }
+  dropEvents.value.unshift({ ...event, local_id: ++dropEventSeq });
+  if (dropEvents.value.length > 300) {
+    dropEvents.value.length = 300;
+  }
 }
 
 async function seedExample() {
@@ -982,6 +1937,16 @@ async function createGeo() {
   showNotice(t("saved"));
 }
 
+async function createTempBan() {
+  const payload = validateTempBanForm();
+  await api("temp-bans", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+  await refreshAll();
+  showNotice(t("saved"));
+}
+
 async function createThreat() {
   const payload = validateThreatForm();
   await api("threat-sources", {
@@ -996,6 +1961,16 @@ async function saveDynamicDefense() {
   const payload = validateDynamicDefense();
   await api("dynamic-defense", {
     method: "PUT",
+    body: JSON.stringify(payload)
+  });
+  await refreshAll();
+  showNotice(t("saved"));
+}
+
+async function createDynamicRateLimit() {
+  const payload = validateDynamicRateLimitForm();
+  await api("dynamic-rate-limits", {
+    method: "POST",
     body: JSON.stringify(payload)
   });
   await refreshAll();
@@ -1037,10 +2012,11 @@ onMounted(() => {
   window.addEventListener("pagehide", clearApiToken);
   window.addEventListener("beforeunload", clearApiToken);
   document.addEventListener("visibilitychange", clearApiTokenOnHidden);
-  void refreshAll();
+  void refreshCurrentView();
 });
 
 onBeforeUnmount(() => {
+  stopDropStream();
   clearApiToken();
   window.removeEventListener("hashchange", syncTabFromHash);
   window.removeEventListener("pagehide", clearApiToken);
@@ -1049,6 +2025,18 @@ onBeforeUnmount(() => {
 });
 
 watch(apiToken, saveApiToken);
+watch(tab, (value) => {
+  if (value !== "drops") {
+    stopDropStream();
+  }
+});
+watch(dropNodeFilter, () => {
+  clearDropEvents();
+  if (dropStreaming.value) {
+    stopDropStream();
+    void startDropStream();
+  }
+});
 
 function clearApiTokenOnHidden() {
   if (document.visibilityState === "hidden") {
@@ -1065,9 +2053,6 @@ function validateRuleForm() {
   if (protocol === "icmp" && port !== null) {
     throwValidation(v("icmpPort"));
   }
-  if (protocol === "any" && port !== null) {
-    throwValidation(v("anyPort"));
-  }
   return {
     priority,
     action,
@@ -1081,6 +2066,21 @@ function validateGeoForm() {
   return {
     country: requireCountry(geoForm.country),
     action: requireOneOf(t("country"), geoForm.action, actions)
+  };
+}
+
+function validateTempBanForm() {
+  const protocol = requireOneOf(t("protocol"), tempBanForm.protocol, protocols);
+  const port = optionalPort(tempBanForm.port);
+  if (protocol === "icmp" && port !== null) {
+    throwValidation(v("icmpPort"));
+  }
+  return {
+    ip: requireIp(t("sourceIp"), tempBanForm.ip),
+    protocol,
+    port,
+    duration_seconds: requirePositiveInteger(t("durationSeconds"), tempBanForm.duration_seconds),
+    comment: String(tempBanForm.comment ?? "").trim() || null
   };
 }
 
@@ -1117,6 +2117,26 @@ function validateDynamicDefense() {
     requirePositive(t("blockSeconds"), payload.flood_block_seconds);
   }
   return payload;
+}
+
+function validateDynamicRateLimitForm() {
+  const protocol = requireOneOf(t("protocol"), dynamicRateForm.protocol, protocols);
+  const port = optionalPort(dynamicRateForm.port);
+  if (protocol === "icmp" && port !== null) {
+    throwValidation(v("icmpPort"));
+  }
+  if (protocol === "any" && port !== null) {
+    throwValidation(v("anyPort"));
+  }
+  return {
+    enabled: true,
+    priority: requireInteger(t("priority"), dynamicRateForm.priority),
+    protocol,
+    port,
+    packets_per_second: requirePositiveInteger("PPS", dynamicRateForm.packets_per_second),
+    burst: requirePositiveInteger(t("burst"), dynamicRateForm.burst),
+    comment: String(dynamicRateForm.comment ?? "").trim() || null
+  };
 }
 
 function validateTrustedCidrForm() {
@@ -1167,6 +2187,14 @@ function requirePositive(label: string, value: number | null) {
   }
 }
 
+function requirePositiveInteger(label: string, value: unknown): number {
+  const number = requireInteger(label, value);
+  if (number <= 0) {
+    throwValidation(v("positive", label));
+  }
+  return number;
+}
+
 function optionalPort(value: unknown): number | null {
   if (value === "" || value === null || value === undefined) {
     return null;
@@ -1184,6 +2212,14 @@ function requireCountry(value: unknown): string {
     throwValidation(v("countryCode"));
   }
   return country;
+}
+
+function requireIp(label: string, value: unknown): string {
+  const ip = requireText(label, value);
+  if (isIpv4(ip) || isIpv6(ip)) {
+    return ip;
+  }
+  throwValidation(v("invalid", label));
 }
 
 function requireHttpUrl(label: string, value: unknown): string {

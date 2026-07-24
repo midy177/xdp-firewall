@@ -86,7 +86,29 @@ docker compose --env-file deploy/docker-compose/compose-env.local \
   -f deploy/docker-compose/compose.sqlite.yml exec agent xdp-firewall monitor
 ```
 
-The monitor line includes interface state, MTU, bpffs mount status, agent-only mode, whether `DATABASE_URL` is present, whether `/var/lib/xdp-firewall/xdp-firewall.db` exists, local agent process count, xDS connectivity, and current xDS policy snapshot counts. Add `--json` for JSON lines.
+The monitor line includes interface state, MTU, bpffs mount status, agent-only mode, whether `DATABASE_URL` is present, whether `/var/lib/xdp-firewall/xdp-firewall.db` exists, local `xdp-firewall` process count, xDS connectivity, and current xDS policy snapshot counts. Add `--json` for JSON lines.
+
+To see drop counters, follow the agent logs:
+
+```bash
+docker compose --env-file deploy/docker-compose/compose-env.local \
+  -f deploy/docker-compose/compose.sqlite.yml logs -f agent | grep "xdp stats"
+```
+
+`rule_drop` means ordinary firewall or threat-intelligence deny prefixes, `geo_drop` means country denies, `temp_ban_drop` means temporary source-IP bans, `custom_rate_drop` means custom dynamic defense protocol/port limits, `rate_drop` means global `ip_rate_limit`, `flood_drop` means global `flood`, and `parse_drop` means malformed packet parse drops.
+
+The embedded frontend includes a realtime Drop page. Press Start to subscribe through the API. It can subscribe to all nodes or a single selected node. The API asks matching agents over xDS to enable Drop monitoring only while at least one matching frontend subscriber is connected; when the last matching subscriber disconnects, agents stop the perf-buffer reader and disable the BPF event-output switch. Events are streamed in memory and are not written to the database.
+
+For Cilium-style realtime drop events:
+
+```bash
+docker compose --env-file deploy/docker-compose/compose-env.local \
+  -f deploy/docker-compose/compose.sqlite.yml exec agent xdp-firewall monitor --drop
+```
+
+Add `--json` to print JSON lines. The running agent must be from an image that pins `/sys/fs/bpf/xdp-firewall/<interface>/drop_events`; recreate the agent after upgrading the image.
+
+Realtime event `reason` values are `firewall_rule`, `threat_intel`, `temporary_ban`, `country`, `dynamic_defense.custom_rate_limit`, `dynamic_defense.ip_rate_limit`, `dynamic_defense.flood`, and `parse_error`.
 
 `XDP_FIREWALL_TRUSTED_CIDRS` accepts multiple CIDRs as a comma-separated value in `compose-env.local`, with no spaces:
 
@@ -94,11 +116,13 @@ The monitor line includes interface state, MTU, bpffs mount status, agent-only m
 XDP_FIREWALL_TRUSTED_CIDRS=10.0.0.0/8,192.168.0.0/16,203.0.113.10/32
 ```
 
-This is equivalent to starting the API with repeated clap flags:
+This is equivalent to starting the API/control plane with repeated clap flags:
 
 ```bash
 xdp-firewall api --trusted-cidr 10.0.0.0/8 --trusted-cidr 192.168.0.0/16 --trusted-cidr 203.0.113.10/32
 ```
+
+`XDP_FIREWALL_TRUSTED_CIDRS` and `--trusted-cidr` are runtime-only xDS additions. They are merged into snapshots sent to agents and are not persisted in the database. Use the API/frontend whitelist page when you need database-managed whitelist entries.
 
 ## Kubernetes
 
@@ -106,6 +130,7 @@ Edit this file before applying:
 
 - `deploy/kubernetes/secret.yaml`: set `database_url` to your PostgreSQL or MySQL connection string, `api_token` to the API bearer token, and `agent_token` to the xDS agent token.
 - `deploy/kubernetes/kustomization.yaml`: set the image name and tag pushed to your registry.
+- `deploy/kubernetes/api-deployment.yaml`: set `XDP_FIREWALL_K8S_DISCOVERY=true` if the control plane should discover Node IPs, Pod CIDRs, and Service CIDRs and inject them into xDS as runtime-only whitelist entries. Keep the API control plane at one replica unless you add sticky routing or shared pub/sub for realtime Drop streams.
 
 Apply:
 
@@ -131,14 +156,17 @@ Notes:
 - Agents subscribe to xDS with `XDP_FIREWALL_XDS_URL` and `XDP_FIREWALL_AGENT_TOKEN`; they do not connect to the database.
 - xDS push cadence is controlled by `api --xds-push-interval-seconds`, default `5`.
 - API token authentication is required for non-loopback API binds unless `XDP_FIREWALL_ALLOW_UNAUTHENTICATED=true` is explicitly set. Change the template token before deploying.
-- xDS agent authentication is required when `XDP_FIREWALL_AGENT_TOKEN` is set. Change the template token before deploying.
+- xDS agent authentication is required for non-loopback xDS binds. Change the template token before deploying.
 - The single firewall policy is initialized with default dynamic defense and built-in `ipsum` and `spamhaus-drop` threat intelligence feeds.
 - Custom threat feed hosts must be added to `XDP_FIREWALL_ALLOWED_THREAT_HOSTS`; built-in feed hosts are allowed by default.
 - The DaemonSet is privileged and uses `hostNetwork` because XDP attach is a host-network operation.
 - The agent auto-selects the default-route interface when `--interface` is omitted.
-- The agent resolves the configured xDS host and adds local in-memory allow rules for those controller IPs before applying each policy snapshot. The current XDP program is ingress-only, so egress from the agent to the controller is not limited by this firewall.
+- If the configured xDS host is an IP literal, the agent adds a local in-memory trusted CIDR for that controller IP before applying each policy snapshot. Hostnames are not resolved for this bypass. The current XDP program is ingress-only, so egress from the agent to the controller is not limited by this firewall.
 - XDP attach mode can be set with `XDP_FIREWALL_XDP_MODE=auto|driver|skb`. Use `skb` on AWS ENA instances with jumbo MTU if native driver XDP reports that the MTU is too large.
-- Trusted source prefixes can be initialized on `api` with `--trusted-cidr` or `XDP_FIREWALL_TRUSTED_CIDRS` and then managed through the API/frontend; agents apply the xDS-pushed whitelist and do not mutate it. Trusted prefixes are the highest-priority whitelist and are allowed before firewall, threat-intelligence, country, and dynamic defense checks.
+- Trusted source prefixes can be managed through the API/frontend for persistence. `--trusted-cidr` and `XDP_FIREWALL_TRUSTED_CIDRS` are runtime-only xDS additions and do not mutate database rows. Trusted prefixes are the highest-priority whitelist and are allowed before firewall, threat-intelligence, country, and dynamic defense checks.
+- Dynamic defense supports global per-source-IP `ip_rate_limit` and `flood`, plus custom protocol/destination-port rate limits managed through the API/frontend. Custom dynamic limits are evaluated after country rules and before the global dynamic defense checks.
+- Temporary bans can be managed through the API/frontend. They block one source IP, optionally scoped by protocol and destination port, default to 300 seconds, and are evaluated after whitelist but before ordinary firewall rules and threat intelligence.
+- Kubernetes discovery RBAC is included in `deploy/kubernetes/rbac.yaml`: the API ServiceAccount can read `nodes`, `services`, and `networking.k8s.io/servicecidrs`. The control plane caches discovery results and refreshes them at the xDS push cadence. ServiceCIDR is preferred; existing Service ClusterIPs are used as a partial fallback when ServiceCIDR is unavailable or forbidden.
 - XDP map sizes have built-in defaults. Do not set map capacity variables unless an agent reports a map capacity error or you have a measured memory target.
 - Nodes must have bpffs mounted at `/sys/fs/bpf`.
 - Use PostgreSQL/MySQL for multi-node Kubernetes deployments. SQLite is only appropriate for a single server.

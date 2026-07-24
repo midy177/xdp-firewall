@@ -1,11 +1,13 @@
 use crate::cli::{ApiArgs, SeedExampleArgs};
 use crate::db::entities::{
-    dynamic_defense, firewall_rule, geo_country_policy, node, threat_source, trusted_cidr,
+    dynamic_defense, dynamic_rate_limit, firewall_rule, geo_country_policy, node, temp_ban,
+    threat_source, trusted_cidr,
 };
-use crate::{db, firewall, geo, security, threat};
+use crate::{db, firewall, geo, security, threat, xds};
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
@@ -14,10 +16,16 @@ use axum::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set,
+    QueryOrder, Set, sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, time::Instant};
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
 
 const API_TOKEN_ENV: &str = "XDP_FIREWALL_API_TOKEN";
@@ -27,6 +35,8 @@ const DEFAULT_PAGE_SIZE: u64 = 100;
 const MAX_PAGE_SIZE: u64 = 500;
 const FRONTEND_CACHE_CONTROL: &str = "no-store, max-age=0";
 const FRONTEND_ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+const DEFAULT_TEMP_BAN_SECONDS: i64 = 300;
+const MAX_TEMP_BAN_SECONDS: i64 = 31_536_000;
 
 mod frontend_assets {
     include!(concat!(env!("OUT_DIR"), "/frontend_assets.rs"));
@@ -36,6 +46,7 @@ mod frontend_assets {
 struct ApiState {
     db: DatabaseConnection,
     api_token: Option<String>,
+    drop_events: xds::DropEventHub,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,6 +64,11 @@ struct Versioned<T> {
 struct PaginationQuery {
     page: Option<u64>,
     page_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DropEventQuery {
+    node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -126,6 +142,26 @@ struct UpdateDynamicDefenseRequest {
     flood_block_seconds: Option<i32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CreateDynamicRateLimitRequest {
+    enabled: Option<bool>,
+    priority: i32,
+    protocol: String,
+    port: Option<i32>,
+    packets_per_second: i32,
+    burst: i32,
+    comment: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTempBanRequest {
+    ip: String,
+    protocol: Option<String>,
+    port: Option<i32>,
+    duration_seconds: Option<i64>,
+    comment: Option<String>,
+}
+
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -137,7 +173,11 @@ struct ApiErrorBody {
     error: String,
 }
 
-pub async fn serve(db: DatabaseConnection, args: ApiArgs) -> Result<()> {
+pub async fn serve(
+    db: DatabaseConnection,
+    args: ApiArgs,
+    drop_events: xds::DropEventHub,
+) -> Result<()> {
     let bind = args
         .bind
         .parse::<SocketAddr>()
@@ -155,7 +195,11 @@ pub async fn serve(db: DatabaseConnection, args: ApiArgs) -> Result<()> {
         );
     }
     let auth_enabled = api_token.is_some();
-    let app = router(ApiState { db, api_token });
+    let app = router(ApiState {
+        db,
+        api_token,
+        drop_events,
+    });
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("failed to bind API listener on {bind}"))?;
@@ -201,12 +245,23 @@ fn router(state: ApiState) -> Router {
             get(get_dynamic_defense).put(update_dynamic_defense),
         )
         .route(
+            "/dynamic-rate-limits",
+            get(list_dynamic_rate_limits).post(create_dynamic_rate_limit),
+        )
+        .route(
+            "/dynamic-rate-limits/{id}",
+            delete(delete_dynamic_rate_limit),
+        )
+        .route("/temp-bans", get(list_temp_bans).post(create_temp_ban))
+        .route("/temp-bans/{id}", delete(delete_temp_ban))
+        .route(
             "/trusted-cidrs",
             get(list_trusted_cidrs).post(create_trusted_cidr),
         )
         .route("/trusted-cidrs/{id}", delete(delete_trusted_cidr))
         .route("/nodes", get(list_nodes))
         .route("/nodes/{node_id}", get(get_node))
+        .route("/drop-events/stream", get(stream_drop_events))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_token,
@@ -312,6 +367,47 @@ async fn health() -> Json<HealthResponse> {
 
 async fn list_countries() -> Json<&'static [geo::Country]> {
     Json(geo::countries())
+}
+
+async fn stream_drop_events(
+    Query(query): Query<DropEventQuery>,
+    State(state): State<ApiState>,
+) -> ApiResult<Response> {
+    let node_id = query
+        .node_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("all"));
+    let mut subscription = state.drop_events.subscribe(node_id);
+    let (tx, rx) = mpsc::channel::<std::result::Result<String, Infallible>>(256);
+    tokio::spawn(async move {
+        loop {
+            if tx.is_closed() {
+                break;
+            }
+            tokio::select! {
+                event = subscription.recv() => {
+                    let Some(event) = event else {
+                        break;
+                    };
+                    let Ok(line) = serde_json::to_string(&event) else {
+                        continue;
+                    };
+                    if tx.send(Ok(format!("{line}\n"))).await.is_err() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+    });
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store, max-age=0"),
+        ],
+        Body::from_stream(ReceiverStream::new(rx)),
+    )
+        .into_response())
 }
 
 async fn removed_multi_policy_api() -> ApiResult<()> {
@@ -578,6 +674,132 @@ async fn update_dynamic_defense(
     Ok(Json(Versioned { version, data }))
 }
 
+async fn list_dynamic_rate_limits(
+    State(state): State<ApiState>,
+    Query(query): Query<PaginationQuery>,
+) -> ApiResult<Json<Page<dynamic_rate_limit::Model>>> {
+    let pagination = query.normalize()?;
+    let paginator = dynamic_rate_limit::Entity::find()
+        .filter(dynamic_rate_limit::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .order_by_asc(dynamic_rate_limit::Column::Priority)
+        .paginate(&state.db, pagination.page_size);
+    let total = paginator.num_items().await?;
+    let items = paginator.fetch_page(pagination.page - 1).await?;
+    Ok(Json(Page::new(items, total, pagination)))
+}
+
+async fn create_dynamic_rate_limit(
+    State(state): State<ApiState>,
+    Json(request): Json<CreateDynamicRateLimitRequest>,
+) -> ApiResult<(StatusCode, Json<Versioned<dynamic_rate_limit::Model>>)> {
+    let protocol = normalize_protocol(&request.protocol)?;
+    let port = validate_dynamic_rate_port(protocol.as_str(), request.port)?;
+    validate_positive_i32("packets_per_second", request.packets_per_second)?;
+    validate_positive_i32("burst", request.burst)?;
+    let row = dynamic_rate_limit::ActiveModel {
+        policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+        enabled: Set(request.enabled.unwrap_or(true)),
+        priority: Set(request.priority),
+        protocol: Set(protocol),
+        port: Set(port),
+        packets_per_second: Set(request.packets_per_second),
+        burst: Set(request.burst),
+        comment: Set(request.comment),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+        ..Default::default()
+    }
+    .insert(&state.db)
+    .await?;
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
+}
+
+async fn delete_dynamic_rate_limit(
+    State(state): State<ApiState>,
+    Path(id): Path<i32>,
+) -> ApiResult<Json<Versioned<serde_json::Value>>> {
+    let deleted = dynamic_rate_limit::Entity::delete_many()
+        .filter(dynamic_rate_limit::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(dynamic_rate_limit::Column::Id.eq(id))
+        .exec(&state.db)
+        .await?;
+    if deleted.rows_affected == 0 {
+        return Err(ApiError::not_found("dynamic rate limit not found"));
+    }
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok(Json(Versioned {
+        version,
+        data: serde_json::json!({ "deleted": id }),
+    }))
+}
+
+async fn list_temp_bans(
+    State(state): State<ApiState>,
+    Query(query): Query<PaginationQuery>,
+) -> ApiResult<Json<Page<temp_ban::Model>>> {
+    let pagination = query.normalize()?;
+    let paginator = temp_ban::Entity::find()
+        .filter(temp_ban::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(temp_ban::Column::ExpiresAt.gt(chrono::Utc::now().naive_utc()))
+        .order_by_asc(temp_ban::Column::ExpiresAt)
+        .paginate(&state.db, pagination.page_size);
+    let total = paginator.num_items().await?;
+    let items = paginator.fetch_page(pagination.page - 1).await?;
+    Ok(Json(Page::new(items, total, pagination)))
+}
+
+async fn create_temp_ban(
+    State(state): State<ApiState>,
+    Json(request): Json<CreateTempBanRequest>,
+) -> ApiResult<(StatusCode, Json<Versioned<temp_ban::Model>>)> {
+    let ip = normalize_ip(&request.ip)?;
+    let protocol = request
+        .protocol
+        .as_deref()
+        .map(normalize_protocol)
+        .transpose()?
+        .unwrap_or_else(|| "any".to_string());
+    let port = validate_dynamic_rate_port(protocol.as_str(), request.port)?;
+    let duration_seconds = validate_temp_ban_duration(request.duration_seconds)?;
+    let now = chrono::Utc::now().naive_utc();
+    let expires_at = now
+        .checked_add_signed(chrono::Duration::seconds(duration_seconds))
+        .context("temporary ban expiration overflowed")?;
+    let row = temp_ban::ActiveModel {
+        policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+        ip: Set(ip),
+        protocol: Set(protocol),
+        port: Set(port),
+        expires_at: Set(expires_at),
+        comment: Set(request.comment),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&state.db)
+    .await?;
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
+}
+
+async fn delete_temp_ban(
+    State(state): State<ApiState>,
+    Path(id): Path<i32>,
+) -> ApiResult<Json<Versioned<serde_json::Value>>> {
+    let deleted = temp_ban::Entity::delete_many()
+        .filter(temp_ban::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(temp_ban::Column::Id.eq(id))
+        .exec(&state.db)
+        .await?;
+    if deleted.rows_affected == 0 {
+        return Err(ApiError::not_found("temporary ban not found"));
+    }
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok(Json(Versioned {
+        version,
+        data: serde_json::json!({ "deleted": id }),
+    }))
+}
+
 async fn list_trusted_cidrs(
     State(state): State<ApiState>,
     Query(query): Query<PaginationQuery>,
@@ -598,30 +820,44 @@ async fn create_trusted_cidr(
 ) -> ApiResult<(StatusCode, Json<Versioned<trusted_cidr::Model>>)> {
     let cidr = normalize_cidr(&request.cidr)?;
     let now = chrono::Utc::now().naive_utc();
-    let existing = trusted_cidr::Entity::find()
+    let enabled = request.enabled.unwrap_or(true);
+    let comment = request.comment;
+    let existed = trusted_cidr::Entity::find()
         .filter(trusted_cidr::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
         .filter(trusted_cidr::Column::Cidr.eq(&cidr))
         .one(&state.db)
-        .await?;
+        .await?
+        .is_some();
 
-    let (status, row) = if let Some(row) = existing {
-        let mut active: trusted_cidr::ActiveModel = row.into();
-        active.enabled = Set(request.enabled.unwrap_or(true));
-        active.comment = Set(request.comment);
-        active.updated_at = Set(now);
-        (StatusCode::OK, active.update(&state.db).await?)
+    trusted_cidr::Entity::insert(trusted_cidr::ActiveModel {
+        policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+        enabled: Set(enabled),
+        cidr: Set(cidr.clone()),
+        comment: Set(comment),
+        updated_at: Set(now),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::columns([trusted_cidr::Column::PolicyName, trusted_cidr::Column::Cidr])
+            .update_columns([
+                trusted_cidr::Column::Enabled,
+                trusted_cidr::Column::Comment,
+                trusted_cidr::Column::UpdatedAt,
+            ])
+            .to_owned(),
+    )
+    .exec_without_returning(&state.db)
+    .await?;
+    let row = trusted_cidr::Entity::find()
+        .filter(trusted_cidr::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(trusted_cidr::Column::Cidr.eq(&cidr))
+        .one(&state.db)
+        .await?
+        .context("trusted CIDR upsert succeeded but row was not found")?;
+    let status = if existed {
+        StatusCode::OK
     } else {
-        let row = trusted_cidr::ActiveModel {
-            policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
-            enabled: Set(request.enabled.unwrap_or(true)),
-            cidr: Set(cidr),
-            comment: Set(request.comment),
-            updated_at: Set(now),
-            ..Default::default()
-        }
-        .insert(&state.db)
-        .await?;
-        (StatusCode::CREATED, row)
+        StatusCode::CREATED
     };
 
     let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
@@ -800,6 +1036,14 @@ fn normalize_cidr(value: &str) -> Result<String> {
     })
 }
 
+fn normalize_ip(value: &str) -> Result<String> {
+    let ip = value
+        .trim()
+        .parse::<std::net::IpAddr>()
+        .with_context(|| format!("invalid IP address '{value}'"))?;
+    Ok(ip.to_string())
+}
+
 fn validate_action(value: &str) -> Result<()> {
     normalize_action(value).map(|_| ())
 }
@@ -838,9 +1082,42 @@ fn validate_port(protocol: Option<&str>, port: Option<i32>) -> Result<Option<i32
     }
 }
 
+fn validate_dynamic_rate_port(protocol: &str, port: Option<i32>) -> Result<Option<i32>> {
+    let Some(port) = port else {
+        return Ok(None);
+    };
+    u16::try_from(port)
+        .ok()
+        .filter(|port| *port > 0)
+        .context("port must be between 1 and 65535")?;
+    match protocol {
+        "any" | "tcp" | "udp" => Ok(Some(port)),
+        "icmp" => bail!("icmp dynamic rate limits cannot set a port"),
+        other => bail!("unsupported protocol '{other}'"),
+    }
+}
+
+fn validate_temp_ban_duration(value: Option<i64>) -> Result<i64> {
+    let duration = value.unwrap_or(DEFAULT_TEMP_BAN_SECONDS);
+    if duration <= 0 {
+        bail!("duration_seconds must be greater than 0");
+    }
+    if duration > MAX_TEMP_BAN_SECONDS {
+        bail!("duration_seconds must be less than or equal to {MAX_TEMP_BAN_SECONDS}");
+    }
+    Ok(duration)
+}
+
 fn validate_optional_non_negative(label: &str, value: Option<i32>) -> Result<()> {
     if value.is_some_and(|value| value < 0) {
         bail!("{label} must be greater than or equal to 0");
+    }
+    Ok(())
+}
+
+fn validate_positive_i32(label: &str, value: i32) -> Result<()> {
+    if value <= 0 {
+        bail!("{label} must be greater than 0");
     }
     Ok(())
 }
@@ -955,6 +1232,64 @@ fn normalize_threat_format(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::to_bytes,
+        http::{Method, Request},
+    };
+    use sea_orm::{ConnectOptions, Database};
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
+    async fn test_router() -> (Router, DatabaseConnection) {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options).await.unwrap();
+        db::migrate(&db).await.unwrap();
+        let app = router(ApiState {
+            db: db.clone(),
+            api_token: None,
+            drop_events: xds::DropEventHub::new(),
+        });
+        (app, db)
+    }
+
+    async fn send_json(app: &Router, method: Method, uri: &str, body: Value) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn send_empty(app: &Router, method: Method, uri: &str) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn response_json(response: Response) -> Value {
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            status.is_success(),
+            "expected success response, got {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        serde_json::from_slice(&body).unwrap()
+    }
 
     #[test]
     fn reads_bearer_token() {
@@ -973,5 +1308,99 @@ mod tests {
         headers.insert(API_TOKEN_HEADER, "secret-token".parse().unwrap());
 
         assert_eq!(request_token(&headers), Some("secret-token"));
+    }
+
+    #[tokio::test]
+    async fn dynamic_defense_update_persists_and_bumps_policy_version() {
+        let (app, _db) = test_router().await;
+        let update = json!({
+            "enabled": true,
+            "ip_rate_limit_enabled": true,
+            "ip_packets_per_second": 1234,
+            "ip_burst": 2345,
+            "flood_enabled": true,
+            "flood_packets_per_second": 3456,
+            "flood_burst": 4567,
+            "flood_block_seconds": 89
+        });
+
+        let updated =
+            response_json(send_json(&app, Method::PUT, "/dynamic-defense", update).await).await;
+        assert_eq!(updated["version"], 1);
+        assert_eq!(updated["data"]["ip_packets_per_second"], 1234);
+        assert_eq!(updated["data"]["flood_block_seconds"], 89);
+
+        let fetched = response_json(send_empty(&app, Method::GET, "/dynamic-defense").await).await;
+        assert_eq!(fetched["enabled"], true);
+        assert_eq!(fetched["ip_rate_limit_enabled"], true);
+        assert_eq!(fetched["ip_packets_per_second"], 1234);
+        assert_eq!(fetched["ip_burst"], 2345);
+        assert_eq!(fetched["flood_packets_per_second"], 3456);
+        assert_eq!(fetched["flood_burst"], 4567);
+        assert_eq!(fetched["flood_block_seconds"], 89);
+    }
+
+    #[tokio::test]
+    async fn dynamic_rate_limit_create_persists_lists_and_loads_policy() {
+        let (app, db) = test_router().await;
+        let first = json!({
+            "enabled": true,
+            "priority": 20,
+            "protocol": "tcp",
+            "port": 443,
+            "packets_per_second": 1000,
+            "burst": 2000,
+            "comment": "https custom limit"
+        });
+        let second = json!({
+            "enabled": true,
+            "priority": 10,
+            "protocol": "udp",
+            "packets_per_second": 3000,
+            "burst": 4000,
+            "comment": "udp custom limit"
+        });
+
+        let created_first =
+            response_json(send_json(&app, Method::POST, "/dynamic-rate-limits", first).await).await;
+        assert_eq!(created_first["version"], 1);
+        assert_eq!(created_first["data"]["protocol"], "tcp");
+        assert_eq!(created_first["data"]["port"], 443);
+
+        let created_second =
+            response_json(send_json(&app, Method::POST, "/dynamic-rate-limits", second).await)
+                .await;
+        assert_eq!(created_second["version"], 2);
+        assert_eq!(created_second["data"]["protocol"], "udp");
+        assert!(created_second["data"]["port"].is_null());
+
+        let page = response_json(
+            send_empty(&app, Method::GET, "/dynamic-rate-limits?page=1&page_size=1").await,
+        )
+        .await;
+        assert_eq!(page["total"], 2);
+        assert_eq!(page["page"], 1);
+        assert_eq!(page["page_size"], 1);
+        assert_eq!(page["total_pages"], 2);
+        assert_eq!(page["items"][0]["priority"], 10);
+        assert_eq!(page["items"][0]["protocol"], "udp");
+
+        let snapshot = firewall::load_policy(&db, firewall::DEFAULT_POLICY_NAME)
+            .await
+            .unwrap();
+        assert_eq!(snapshot.version, 2);
+        assert_eq!(snapshot.dynamic_rate_limits.len(), 2);
+        assert_eq!(snapshot.dynamic_rate_limits[0].priority, 10);
+        assert_eq!(
+            snapshot.dynamic_rate_limits[0].protocol,
+            firewall::L4Protocol::Udp
+        );
+        assert_eq!(snapshot.dynamic_rate_limits[0].port, None);
+        assert_eq!(snapshot.dynamic_rate_limits[1].priority, 20);
+        assert_eq!(
+            snapshot.dynamic_rate_limits[1].protocol,
+            firewall::L4Protocol::Tcp
+        );
+        assert_eq!(snapshot.dynamic_rate_limits[1].port, Some(443));
     }
 }

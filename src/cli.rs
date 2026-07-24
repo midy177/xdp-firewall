@@ -1,8 +1,9 @@
 use clap::{Args, Parser, Subcommand};
 
 use crate::xdp::{
-    DEFAULT_COUNTRY_MAP_ENTRIES, DEFAULT_GEO_MAP_ENTRIES, DEFAULT_RATE_MAP_ENTRIES,
-    DEFAULT_RULE_MAP_ENTRIES, DEFAULT_TRUSTED_MAP_ENTRIES, XdpAttachMode,
+    DEFAULT_COUNTRY_MAP_ENTRIES, DEFAULT_CUSTOM_RATE_LIMIT_MAP_ENTRIES, DEFAULT_GEO_MAP_ENTRIES,
+    DEFAULT_RATE_MAP_ENTRIES, DEFAULT_RULE_MAP_ENTRIES, DEFAULT_TEMP_BAN_MAP_ENTRIES,
+    DEFAULT_TRUSTED_MAP_ENTRIES, XdpAttachMode,
 };
 
 #[derive(Debug, Parser)]
@@ -42,6 +43,8 @@ pub struct DatabaseArgs {
 pub struct ApiArgs {
     #[command(flatten)]
     pub database: DatabaseArgs,
+    #[command(flatten)]
+    pub k8s: K8sDiscoveryArgs,
     #[arg(long, default_value = "0.0.0.0:8080")]
     pub bind: String,
     #[arg(
@@ -61,7 +64,7 @@ pub struct ApiArgs {
     #[arg(
         long,
         env = "XDP_FIREWALL_AGENT_TOKEN",
-        help = "Bearer token required from XDP agents. If omitted, the xDS service is unauthenticated."
+        help = "Bearer token required from XDP agents. Required when xDS binds to a non-loopback address."
     )]
     pub agent_token: Option<String>,
     #[arg(
@@ -69,7 +72,7 @@ pub struct ApiArgs {
         alias = "trusted-cidrs",
         env = "XDP_FIREWALL_TRUSTED_CIDRS",
         value_delimiter = ',',
-        help = "Highest-priority source CIDR whitelist. Can be repeated or comma-separated. Matching sources are allowed before firewall, threat, country, and dynamic defense checks. These prefixes are persisted to the policy database."
+        help = "Runtime-only highest-priority source CIDR whitelist injected into xDS snapshots. Can be repeated or comma-separated. These prefixes are not persisted to the policy database."
     )]
     pub trusted_cidrs: Vec<String>,
 }
@@ -78,6 +81,8 @@ pub struct ApiArgs {
 pub struct XdsArgs {
     #[command(flatten)]
     pub database: DatabaseArgs,
+    #[command(flatten)]
+    pub k8s: K8sDiscoveryArgs,
     #[arg(long, default_value = "0.0.0.0:50051")]
     pub bind: String,
     #[arg(
@@ -90,9 +95,48 @@ pub struct XdsArgs {
     #[arg(
         long,
         env = "XDP_FIREWALL_AGENT_TOKEN",
-        help = "Bearer token required from XDP agents. If omitted, the xDS service is unauthenticated."
+        help = "Bearer token required from XDP agents. Required when xDS binds to a non-loopback address."
     )]
     pub agent_token: Option<String>,
+    #[arg(
+        long = "trusted-cidr",
+        alias = "trusted-cidrs",
+        env = "XDP_FIREWALL_TRUSTED_CIDRS",
+        value_delimiter = ',',
+        help = "Runtime-only highest-priority source CIDR whitelist injected into xDS snapshots. Can be repeated or comma-separated. These prefixes are not persisted to the policy database."
+    )]
+    pub trusted_cidrs: Vec<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct K8sDiscoveryArgs {
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_K8S_DISCOVERY",
+        default_value_t = false,
+        help = "Enable Kubernetes runtime address discovery in the control plane. Discovered node IPs, Pod CIDRs, and Service CIDRs are injected into xDS snapshots as runtime-only whitelist entries and are not persisted."
+    )]
+    pub k8s_discovery: bool,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_K8S_API_SERVER",
+        help = "Kubernetes API server URL. Defaults to https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT_HTTPS or KUBERNETES_SERVICE_PORT}."
+    )]
+    pub k8s_api_server: Option<String>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_K8S_TOKEN_PATH",
+        default_value = "/var/run/secrets/kubernetes.io/serviceaccount/token",
+        help = "Kubernetes service account bearer token path used by control-plane discovery."
+    )]
+    pub k8s_token_path: String,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_K8S_CA_CERT_PATH",
+        default_value = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+        help = "Kubernetes service account CA certificate path used by control-plane discovery."
+    )]
+    pub k8s_ca_cert_path: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -176,6 +220,20 @@ pub struct AgentArgs {
         default_value_t = DEFAULT_RATE_MAP_ENTRIES
     )]
     pub rate_map_entries: u32,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_CUSTOM_RATE_LIMIT_MAP_ENTRIES",
+        hide = true,
+        default_value_t = DEFAULT_CUSTOM_RATE_LIMIT_MAP_ENTRIES
+    )]
+    pub custom_rate_limit_map_entries: u32,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_TEMP_BAN_MAP_ENTRIES",
+        hide = true,
+        default_value_t = DEFAULT_TEMP_BAN_MAP_ENTRIES
+    )]
+    pub temp_ban_map_entries: u32,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -251,6 +309,20 @@ pub struct SyncOnceArgs {
         default_value_t = DEFAULT_RATE_MAP_ENTRIES
     )]
     pub rate_map_entries: u32,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_CUSTOM_RATE_LIMIT_MAP_ENTRIES",
+        hide = true,
+        default_value_t = DEFAULT_CUSTOM_RATE_LIMIT_MAP_ENTRIES
+    )]
+    pub custom_rate_limit_map_entries: u32,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_TEMP_BAN_MAP_ENTRIES",
+        hide = true,
+        default_value_t = DEFAULT_TEMP_BAN_MAP_ENTRIES
+    )]
+    pub temp_ban_map_entries: u32,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -285,6 +357,17 @@ pub struct MonitorArgs {
     pub once: bool,
     #[arg(long, help = "Print monitor samples as JSON lines.")]
     pub json: bool,
+    #[arg(
+        long,
+        help = "Stream realtime XDP drop events from the pinned agent map."
+    )]
+    pub r#drop: bool,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_DROP_EVENTS_PATH",
+        help = "Pinned drop_events map path. Defaults to /sys/fs/bpf/xdp-firewall/<interface>/drop_events."
+    )]
+    pub drop_events_path: Option<String>,
 }
 
 #[derive(Debug, Args, Clone)]

@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: xdp-firewall-api
+  namespace: xdp-firewall
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: xdp-firewall-k8s-discovery
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "services"]
+    verbs: ["get", "list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["servicecidrs"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: xdp-firewall-k8s-discovery
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: xdp-firewall-k8s-discovery
+subjects:
+  - kind: ServiceAccount
+    name: xdp-firewall-api
+    namespace: xdp-firewall

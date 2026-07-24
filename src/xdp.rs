@@ -1,7 +1,8 @@
 use crate::firewall::CompiledPolicy;
 #[cfg(target_os = "linux")]
 use crate::firewall::{
-    L4Protocol, RuleAction, XdpCountryRule, XdpDynamicDefense, XdpGeoPrefix, XdpPrefixRule,
+    L4Protocol, RuleAction, XdpCountryRule, XdpDynamicDefense, XdpDynamicRateLimit, XdpGeoPrefix,
+    XdpPrefixRule, XdpRuleSource, XdpTempBan,
 };
 use anyhow::{Result, bail};
 #[cfg(target_os = "linux")]
@@ -12,6 +13,16 @@ pub const DEFAULT_GEO_MAP_ENTRIES: u32 = 262_144;
 pub const DEFAULT_TRUSTED_MAP_ENTRIES: u32 = 4_096;
 pub const DEFAULT_COUNTRY_MAP_ENTRIES: u32 = 676;
 pub const DEFAULT_RATE_MAP_ENTRIES: u32 = 1_048_576;
+pub const DEFAULT_CUSTOM_RATE_LIMIT_MAP_ENTRIES: u32 = 4_096;
+pub const DEFAULT_TEMP_BAN_MAP_ENTRIES: u32 = 4_096;
+pub const STAT_PASS: u32 = 0;
+pub const STAT_RULE_DROP: u32 = 1;
+pub const STAT_GEO_DROP: u32 = 2;
+pub const STAT_RATE_DROP: u32 = 3;
+pub const STAT_FLOOD_DROP: u32 = 4;
+pub const STAT_CUSTOM_RATE_DROP: u32 = 5;
+pub const STAT_PARSE_DROP: u32 = 6;
+pub const STAT_TEMP_BAN_DROP: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum XdpAttachMode {
@@ -37,6 +48,8 @@ pub struct XdpMapSizes {
     pub trusted_entries: u32,
     pub country_entries: u32,
     pub rate_entries: u32,
+    pub custom_rate_limit_entries: u32,
+    pub temp_ban_entries: u32,
 }
 
 impl Default for XdpMapSizes {
@@ -47,6 +60,8 @@ impl Default for XdpMapSizes {
             trusted_entries: DEFAULT_TRUSTED_MAP_ENTRIES,
             country_entries: DEFAULT_COUNTRY_MAP_ENTRIES,
             rate_entries: DEFAULT_RATE_MAP_ENTRIES,
+            custom_rate_limit_entries: DEFAULT_CUSTOM_RATE_LIMIT_MAP_ENTRIES,
+            temp_ban_entries: DEFAULT_TEMP_BAN_MAP_ENTRIES,
         }
     }
 }
@@ -58,6 +73,8 @@ impl XdpMapSizes {
         ensure_nonzero("trusted_cidrs", self.trusted_entries)?;
         ensure_nonzero("country_rules", self.country_entries)?;
         ensure_nonzero("rate_buckets", self.rate_entries)?;
+        ensure_nonzero("custom_rate_limits", self.custom_rate_limit_entries)?;
+        ensure_nonzero("temp_bans", self.temp_ban_entries)?;
         Ok(self)
     }
 }
@@ -81,10 +98,63 @@ const PROTO_ICMP: u8 = 1;
 const PROTO_TCP: u8 = 6;
 #[cfg(target_os = "linux")]
 const PROTO_UDP: u8 = 17;
+#[cfg(target_os = "linux")]
+const RULE_SOURCE_FIREWALL: u8 = 1;
+#[cfg(target_os = "linux")]
+const RULE_SOURCE_THREAT: u8 = 2;
 
 pub struct XdpManager {
     #[cfg(target_os = "linux")]
     inner: linux::LinuxXdpManager,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct XdpStats {
+    pub pass: u64,
+    pub rule_drop: u64,
+    pub geo_drop: u64,
+    pub rate_drop: u64,
+    pub flood_drop: u64,
+    pub custom_rate_drop: u64,
+    pub parse_drop: u64,
+    pub temp_ban_drop: u64,
+}
+
+impl XdpStats {
+    pub fn total_drop(self) -> u64 {
+        self.rule_drop
+            + self.geo_drop
+            + self.rate_drop
+            + self.flood_drop
+            + self.custom_rate_drop
+            + self.parse_drop
+            + self.temp_ban_drop
+    }
+}
+
+pub fn drop_events_pin_path(interface: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from("/sys/fs/bpf/xdp-firewall")
+        .join(sanitize_pin_component(interface))
+        .join("drop_events")
+}
+
+pub fn drop_config_pin_path(interface: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from("/sys/fs/bpf/xdp-firewall")
+        .join(sanitize_pin_component(interface))
+        .join("drop_config")
+}
+
+fn sanitize_pin_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 impl XdpManager {
@@ -136,6 +206,29 @@ impl XdpManager {
         #[cfg(not(target_os = "linux"))]
         {
             "noop"
+        }
+    }
+
+    pub fn stats(&self) -> Result<XdpStats> {
+        #[cfg(target_os = "linux")]
+        {
+            return self.inner.stats();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(XdpStats::default())
+        }
+    }
+
+    pub fn set_drop_monitor_enabled(&mut self, enabled: bool) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            return self.inner.set_drop_monitor_enabled(enabled);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = enabled;
+            Ok(())
         }
     }
 }
@@ -194,6 +287,22 @@ fn action_code(action: RuleAction) -> u8 {
 }
 
 #[cfg(target_os = "linux")]
+fn rule_source_code(source: XdpRuleSource) -> u8 {
+    match source {
+        XdpRuleSource::FirewallRule => RULE_SOURCE_FIREWALL,
+        XdpRuleSource::ThreatIntel => RULE_SOURCE_THREAT,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rule_source_order(source: XdpRuleSource) -> u8 {
+    match source {
+        XdpRuleSource::ThreatIntel => 0,
+        XdpRuleSource::FirewallRule => 1,
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn proto_code(protocol: L4Protocol) -> u8 {
     match protocol {
         L4Protocol::Any => PROTO_ANY,
@@ -215,13 +324,14 @@ mod linux {
     use aya::{
         Ebpf, EbpfLoader, Pod,
         maps::{
-            Array as AyaArray, HashMap as AyaHashMap, LpmTrie, MapData, lpm_trie::Key as LpmKey,
+            Array as AyaArray, HashMap as AyaHashMap, LpmTrie, Map, MapData, PerCpuArray,
+            PerfEventArray, lpm_trie::Key as LpmKey,
         },
         programs::{Xdp, XdpMode},
     };
     use std::collections::HashSet;
     use std::path::Path;
-    use tracing::info;
+    use tracing::{info, warn};
 
     pub struct LinuxXdpManager {
         interface: String,
@@ -231,10 +341,17 @@ mod linux {
         trusted_cidrs: LpmTrie<MapData, TrustedData, TrustedValue>,
         country_rules: AyaHashMap<MapData, u32, CountryValue>,
         defense_policy: AyaArray<MapData, DefenseValue>,
+        custom_rate_limits: AyaHashMap<MapData, CustomRateKey, CustomRateValue>,
+        temp_bans: AyaHashMap<MapData, TempBanKey, TempBanValue>,
+        drop_config: AyaArray<MapData, DropConfigValue>,
+        stats: PerCpuArray<MapData, u64>,
+        _drop_events: PerfEventArray<MapData>,
         rule_keys: Vec<RuleKey>,
         geo_keys: Vec<GeoKey>,
         trusted_keys: Vec<TrustedKey>,
         country_keys: Vec<u32>,
+        custom_rate_keys: Vec<CustomRateKey>,
+        temp_ban_keys: Vec<TempBanKey>,
         map_sizes: XdpMapSizes,
     }
 
@@ -272,7 +389,9 @@ mod linux {
     #[repr(C)]
     struct RuleValue {
         action: u8,
-        priority: u32,
+        source: u8,
+        pad: [u8; 2],
+        priority: i32,
     }
 
     #[derive(Clone, Copy)]
@@ -301,9 +420,45 @@ mod linux {
         flood_block_ns: u64,
     }
 
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    #[repr(C)]
+    struct CustomRateKey {
+        proto: u8,
+        pad: u8,
+        dport: u16,
+    }
+
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    struct CustomRateValue {
+        packets_per_second: u32,
+        burst: u32,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    #[repr(C)]
+    struct TempBanKey {
+        family: u8,
+        proto: u8,
+        dport: u16,
+        addr: [u8; 16],
+    }
+
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    struct TempBanValue {
+        expires_at_ns: u64,
+    }
+
     #[derive(Clone, Copy)]
     #[repr(C)]
     struct TrustedValue {
+        value: u8,
+    }
+
+    #[derive(Clone, Copy)]
+    #[repr(C)]
+    struct DropConfigValue {
         value: u8,
     }
 
@@ -314,7 +469,12 @@ mod linux {
     unsafe impl Pod for GeoValue {}
     unsafe impl Pod for CountryValue {}
     unsafe impl Pod for DefenseValue {}
+    unsafe impl Pod for CustomRateKey {}
+    unsafe impl Pod for CustomRateValue {}
+    unsafe impl Pod for TempBanKey {}
+    unsafe impl Pod for TempBanValue {}
     unsafe impl Pod for TrustedValue {}
+    unsafe impl Pod for DropConfigValue {}
 
     impl LinuxXdpManager {
         pub fn attach(
@@ -327,13 +487,18 @@ mod linux {
             if !Path::new(object_path).exists() {
                 bail!("XDP object '{}' does not exist", object_path);
             }
+            let drop_event_entries = possible_cpu_map_entries()
+                .context("failed to detect possible CPUs for drop_events map sizing")?;
             let mut loader = EbpfLoader::new();
             loader
                 .map_max_entries("rule_cidrs", map_sizes.rule_entries)
                 .map_max_entries("geo_cidrs", map_sizes.geo_entries)
                 .map_max_entries("trusted_cidrs", map_sizes.trusted_entries)
                 .map_max_entries("country_rules", map_sizes.country_entries)
-                .map_max_entries("rate_buckets", map_sizes.rate_entries);
+                .map_max_entries("rate_buckets", map_sizes.rate_entries)
+                .map_max_entries("custom_rate_limits", map_sizes.custom_rate_limit_entries)
+                .map_max_entries("temp_bans", map_sizes.temp_ban_entries)
+                .map_max_entries("drop_events", drop_event_entries);
             let mut ebpf = loader
                 .load_file(object_path)
                 .with_context(|| format!("failed to load XDP object '{object_path}'"))?;
@@ -369,6 +534,34 @@ mod linux {
                 .context("missing XDP map 'defense_policy'")?
                 .try_into()
                 .context("XDP map 'defense_policy' has unexpected type")?;
+            let custom_rate_limits = ebpf
+                .take_map("custom_rate_limits")
+                .context("missing XDP map 'custom_rate_limits'")?
+                .try_into()
+                .context("XDP map 'custom_rate_limits' has unexpected type")?;
+            let temp_bans = ebpf
+                .take_map("temp_bans")
+                .context("missing XDP map 'temp_bans'")?
+                .try_into()
+                .context("XDP map 'temp_bans' has unexpected type")?;
+            let mut drop_config = ebpf
+                .take_map("drop_config")
+                .context("missing XDP map 'drop_config'")?
+                .try_into()
+                .context("XDP map 'drop_config' has unexpected type")?;
+            set_drop_config(&mut drop_config, false)?;
+            let drop_config = pin_drop_config(interface, drop_config)?;
+            let stats = ebpf
+                .take_map("stats")
+                .context("missing XDP map 'stats'")?
+                .try_into()
+                .context("XDP map 'stats' has unexpected type")?;
+            let drop_events: PerfEventArray<MapData> = ebpf
+                .take_map("drop_events")
+                .context("missing XDP map 'drop_events'")?
+                .try_into()
+                .context("XDP map 'drop_events' has unexpected type")?;
+            pin_drop_events(interface, &drop_events)?;
 
             Ok(Self {
                 interface: interface.to_string(),
@@ -378,10 +571,17 @@ mod linux {
                 trusted_cidrs,
                 country_rules,
                 defense_policy,
+                custom_rate_limits,
+                temp_bans,
+                drop_config,
+                stats,
+                _drop_events: drop_events,
                 rule_keys: Vec::new(),
                 geo_keys: Vec::new(),
                 trusted_keys: Vec::new(),
                 country_keys: Vec::new(),
+                custom_rate_keys: Vec::new(),
+                temp_ban_keys: Vec::new(),
                 map_sizes,
             })
         }
@@ -400,8 +600,46 @@ mod linux {
             let mut new_trusted_ids = HashSet::new();
             let mut new_country_keys = Vec::new();
             let mut new_country_ids = HashSet::new();
+            let mut new_custom_rate_keys = Vec::new();
+            let mut new_custom_rate_ids = HashSet::new();
+            let mut new_temp_ban_keys = Vec::new();
+            let mut new_temp_ban_ids = HashSet::new();
 
             self.put_dynamic_defense(&policy.dynamic_defense)?;
+            let monotonic_now_ns = monotonic_now_ns()?;
+            let wall_now = chrono::Utc::now().naive_utc();
+            for ban in &policy.temp_bans {
+                if ban.expires_at <= wall_now {
+                    continue;
+                }
+                let key = temp_ban_key(ban.addr, ban.protocol, ban.port);
+                let id = temp_ban_key_id(&key);
+                if new_temp_ban_ids.insert(id) {
+                    self.put_temp_ban_key(&key, ban, wall_now, monotonic_now_ns)?;
+                    new_temp_ban_keys.push(key);
+                } else {
+                    warn!(
+                        addr = %ban.addr,
+                        protocol = ?ban.protocol,
+                        port = ban.port,
+                        "skipping duplicate temporary ban key; first matching key remains active"
+                    );
+                }
+            }
+            for limit in &policy.dynamic_rate_limits {
+                let key = custom_rate_key(limit.protocol, limit.port);
+                let id = custom_rate_key_id(&key);
+                if new_custom_rate_ids.insert(id) {
+                    self.put_custom_rate_key(&key, limit)?;
+                    new_custom_rate_keys.push(key);
+                } else {
+                    warn!(
+                        protocol = ?limit.protocol,
+                        port = limit.port,
+                        "skipping duplicate custom dynamic rate-limit key; first matching key remains active"
+                    );
+                }
+            }
             for prefix in &policy.trusted_prefixes {
                 let key = trusted_key(prefix.addr, prefix.prefix);
                 let id = trusted_key_id(&key);
@@ -410,17 +648,31 @@ mod linux {
                     new_trusted_keys.push(key);
                 }
             }
-            for (priority, rule) in policy
-                .rules
+            let mut ordered_rules = policy
+                .threat_prefixes
                 .iter()
-                .chain(policy.threat_prefixes.iter())
-                .enumerate()
-            {
+                .chain(policy.rules.iter())
+                .collect::<Vec<_>>();
+            ordered_rules.sort_by(|left, right| {
+                left.priority.cmp(&right.priority).then_with(|| {
+                    rule_source_order(left.source).cmp(&rule_source_order(right.source))
+                })
+            });
+            for rule in ordered_rules {
                 let key = rule_key(rule.addr, rule.prefix, rule.protocol, rule.port);
                 let id = rule_key_id(&key);
                 if new_rule_ids.insert(id) {
-                    self.put_rule_key(&key, rule, priority as u32)?;
+                    self.put_rule_key(&key, rule)?;
                     new_rule_keys.push(key);
+                } else {
+                    warn!(
+                        addr = %rule.addr,
+                        prefix = rule.prefix,
+                        protocol = ?rule.protocol,
+                        port = rule.port,
+                        source = ?rule.source,
+                        "skipping duplicate XDP rule key; first matching key remains active"
+                    );
                 }
             }
             for prefix in &policy.geo_prefixes {
@@ -443,12 +695,41 @@ mod linux {
                 &new_geo_ids,
                 &new_trusted_ids,
                 &new_country_ids,
+                &new_custom_rate_ids,
+                &new_temp_ban_ids,
             )?;
             self.rule_keys = new_rule_keys;
             self.geo_keys = new_geo_keys;
             self.trusted_keys = new_trusted_keys;
             self.country_keys = new_country_keys;
+            self.custom_rate_keys = new_custom_rate_keys;
+            self.temp_ban_keys = new_temp_ban_keys;
             Ok(())
+        }
+
+        pub fn stats(&self) -> Result<XdpStats> {
+            Ok(XdpStats {
+                pass: self.stat(STAT_PASS)?,
+                rule_drop: self.stat(STAT_RULE_DROP)?,
+                geo_drop: self.stat(STAT_GEO_DROP)?,
+                rate_drop: self.stat(STAT_RATE_DROP)?,
+                flood_drop: self.stat(STAT_FLOOD_DROP)?,
+                custom_rate_drop: self.stat(STAT_CUSTOM_RATE_DROP)?,
+                parse_drop: self.stat(STAT_PARSE_DROP)?,
+                temp_ban_drop: self.stat(STAT_TEMP_BAN_DROP)?,
+            })
+        }
+
+        fn stat(&self, index: u32) -> Result<u64> {
+            let values = self
+                .stats
+                .get(&index, 0)
+                .with_context(|| format!("failed to read XDP stats index {index}"))?;
+            Ok(values.iter().copied().sum())
+        }
+
+        pub fn set_drop_monitor_enabled(&mut self, enabled: bool) -> Result<()> {
+            set_drop_config(&mut self.drop_config, enabled)
         }
 
         fn put_dynamic_defense(&mut self, policy: &XdpDynamicDefense) -> Result<()> {
@@ -499,6 +780,16 @@ mod linux {
                 country_entries,
                 self.map_sizes.country_entries,
             )?;
+            ensure_capacity(
+                "custom_rate_limits",
+                policy.dynamic_rate_limits.len(),
+                self.map_sizes.custom_rate_limit_entries,
+            )?;
+            ensure_capacity(
+                "temp_bans",
+                policy.temp_bans.len(),
+                self.map_sizes.temp_ban_entries,
+            )?;
             Ok(())
         }
 
@@ -508,20 +799,58 @@ mod linux {
             Ok(())
         }
 
-        fn put_rule_key(
-            &mut self,
-            key: &RuleKey,
-            rule: &XdpPrefixRule,
-            priority: u32,
-        ) -> Result<()> {
+        fn put_rule_key(&mut self, key: &RuleKey, rule: &XdpPrefixRule) -> Result<()> {
             self.rule_cidrs.insert(
                 key,
                 RuleValue {
                     action: action_code(rule.action),
-                    priority,
+                    source: rule_source_code(rule.source),
+                    pad: [0; 2],
+                    priority: rule.priority,
                 },
                 0,
             )?;
+            Ok(())
+        }
+
+        fn put_custom_rate_key(
+            &mut self,
+            key: &CustomRateKey,
+            limit: &XdpDynamicRateLimit,
+        ) -> Result<()> {
+            self.custom_rate_limits.insert(
+                key,
+                CustomRateValue {
+                    packets_per_second: limit.packets_per_second,
+                    burst: limit.burst,
+                },
+                0,
+            )?;
+            Ok(())
+        }
+
+        fn put_temp_ban_key(
+            &mut self,
+            key: &TempBanKey,
+            ban: &XdpTempBan,
+            wall_now: chrono::NaiveDateTime,
+            monotonic_now_ns: u64,
+        ) -> Result<()> {
+            let Some(remaining_ns) = ban
+                .expires_at
+                .signed_duration_since(wall_now)
+                .num_nanoseconds()
+            else {
+                return Ok(());
+            };
+            if remaining_ns <= 0 {
+                return Ok(());
+            }
+            let expires_at_ns = monotonic_now_ns
+                .checked_add(remaining_ns as u64)
+                .context("temporary ban monotonic expiration overflowed")?;
+            self.temp_bans
+                .insert(key, TempBanValue { expires_at_ns }, 0)?;
             Ok(())
         }
 
@@ -553,6 +882,8 @@ mod linux {
             new_geo_ids: &HashSet<(u32, u8, [u8; 16])>,
             new_trusted_ids: &HashSet<(u32, u8, [u8; 16])>,
             new_country_ids: &HashSet<u32>,
+            new_custom_rate_ids: &HashSet<(u8, u16)>,
+            new_temp_ban_ids: &HashSet<(u8, u8, u16, [u8; 16])>,
         ) -> Result<()> {
             for key in self.rule_keys.drain(..) {
                 if !new_rule_ids.contains(&rule_key_id(&key)) {
@@ -574,8 +905,129 @@ mod linux {
                     self.country_rules.remove(&key)?;
                 }
             }
+            for key in self.custom_rate_keys.drain(..) {
+                if !new_custom_rate_ids.contains(&custom_rate_key_id(&key)) {
+                    self.custom_rate_limits.remove(&key)?;
+                }
+            }
+            for key in self.temp_ban_keys.drain(..) {
+                if !new_temp_ban_ids.contains(&temp_ban_key_id(&key)) {
+                    self.temp_bans.remove(&key)?;
+                }
+            }
             Ok(())
         }
+    }
+
+    fn set_drop_config(
+        drop_config: &mut AyaArray<MapData, DropConfigValue>,
+        enabled: bool,
+    ) -> Result<()> {
+        drop_config.set(
+            0,
+            DropConfigValue {
+                value: u8::from(enabled),
+            },
+            0,
+        )?;
+        Ok(())
+    }
+
+    fn possible_cpu_map_entries() -> Result<u32> {
+        let possible = std::fs::read_to_string("/sys/devices/system/cpu/possible")
+            .context("failed to read /sys/devices/system/cpu/possible")?;
+        let max_cpu = possible
+            .trim()
+            .split(',')
+            .filter(|value| !value.trim().is_empty())
+            .map(parse_cpu_range_end)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .context("possible CPU set is empty")?;
+        u32::try_from(max_cpu + 1).context("possible CPU id is outside u32 range")
+    }
+
+    fn parse_cpu_range_end(value: &str) -> Result<usize> {
+        let value = value.trim();
+        let end = value
+            .rsplit_once('-')
+            .map_or(value, |(_, end)| end)
+            .parse::<usize>()
+            .with_context(|| format!("invalid CPU range '{value}'"))?;
+        Ok(end)
+    }
+
+    fn pin_drop_events(interface: &str, drop_events: &PerfEventArray<MapData>) -> Result<()> {
+        let path = drop_events_pin_path(interface);
+        let parent = path
+            .parent()
+            .context("drop_events pin path has no parent directory")?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create bpffs pin directory '{}'",
+                parent.display()
+            )
+        })?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to remove stale drop_events pin '{}'",
+                        path.display()
+                    )
+                });
+            }
+        }
+        drop_events
+            .pin(&path)
+            .with_context(|| format!("failed to pin drop_events map at '{}'", path.display()))?;
+        info!(path = %path.display(), "pinned XDP drop event map");
+        Ok(())
+    }
+
+    fn pin_drop_config(
+        interface: &str,
+        drop_config: AyaArray<MapData, DropConfigValue>,
+    ) -> Result<AyaArray<MapData, DropConfigValue>> {
+        let path = drop_config_pin_path(interface);
+        let parent = path
+            .parent()
+            .context("drop_config pin path has no parent directory")?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create bpffs pin directory '{}'",
+                parent.display()
+            )
+        })?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to remove stale drop_config pin '{}'",
+                        path.display()
+                    )
+                });
+            }
+        }
+        drop_config
+            .pin(&path)
+            .with_context(|| format!("failed to pin drop_config map at '{}'", path.display()))?;
+        info!(path = %path.display(), "pinned XDP drop config map");
+        let map_data = MapData::from_pin(&path).with_context(|| {
+            format!(
+                "failed to reopen pinned drop_config map '{}'",
+                path.display()
+            )
+        })?;
+        Map::from_map_data(map_data)
+            .context("pinned drop_config path is not a supported BPF map")?
+            .try_into()
+            .context("pinned drop_config map has unexpected type")
     }
 
     fn attach_program(
@@ -652,6 +1104,23 @@ mod linux {
         )
     }
 
+    fn custom_rate_key(protocol: L4Protocol, port: u16) -> CustomRateKey {
+        CustomRateKey {
+            proto: proto_code(protocol),
+            pad: 0,
+            dport: port.to_be(),
+        }
+    }
+
+    fn temp_ban_key(addr: IpAddr, protocol: L4Protocol, port: u16) -> TempBanKey {
+        TempBanKey {
+            family: if addr.is_ipv4() { 4 } else { 6 },
+            proto: proto_code(protocol),
+            dport: port.to_be(),
+            addr: addr_bytes(addr),
+        }
+    }
+
     fn rule_key_id(key: &RuleKey) -> (u32, u8, u8, u16, [u8; 16]) {
         let data = key.data();
         (
@@ -673,6 +1142,14 @@ mod linux {
         (key.prefix_len(), data.family, data.addr)
     }
 
+    fn custom_rate_key_id(key: &CustomRateKey) -> (u8, u16) {
+        (key.proto, key.dport)
+    }
+
+    fn temp_ban_key_id(key: &TempBanKey) -> (u8, u8, u16, [u8; 16]) {
+        (key.family, key.proto, key.dport, key.addr)
+    }
+
     fn lpm_prefix_len(prefix: u8) -> u32 {
         32 + u32::from(prefix)
     }
@@ -691,5 +1168,20 @@ mod linux {
             bail!("{map} needs {needed} entries but map capacity is {configured}");
         }
         Ok(())
+    }
+
+    fn monotonic_now_ns() -> Result<u64> {
+        let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, ts.as_mut_ptr()) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to read CLOCK_MONOTONIC");
+        }
+        let ts = unsafe { ts.assume_init() };
+        let seconds = u64::try_from(ts.tv_sec).context("CLOCK_MONOTONIC seconds are negative")?;
+        let nanos = u64::try_from(ts.tv_nsec).context("CLOCK_MONOTONIC nanos are negative")?;
+        seconds
+            .checked_mul(1_000_000_000)
+            .and_then(|value| value.checked_add(nanos))
+            .context("CLOCK_MONOTONIC value overflowed")
     }
 }

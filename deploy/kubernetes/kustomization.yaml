@@ -3,6 +3,7 @@ kind: Kustomization
 namespace: xdp-firewall
 resources:
   - namespace.yaml
+  - rbac.yaml
   - secret.yaml
   - api-deployment.yaml
   - api-service.yaml

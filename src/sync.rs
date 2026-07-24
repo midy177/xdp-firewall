@@ -1,10 +1,10 @@
 use crate::cli::{AgentArgs, SyncOnceArgs};
-use crate::{firewall, xdp, xds};
+use crate::{firewall, monitor, xdp, xds};
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use std::net::IpAddr;
 use tokio::time::{Duration, interval};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub async fn sync_once(args: SyncOnceArgs) -> Result<()> {
     let node_id = resolve_node_id(args.node_id.as_deref())?;
@@ -69,6 +69,8 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
         trusted_map_entries = args.trusted_map_entries,
         country_map_entries = args.country_map_entries,
         rate_map_entries = args.rate_map_entries,
+        custom_rate_limit_map_entries = args.custom_rate_limit_map_entries,
+        temp_ban_map_entries = args.temp_ban_map_entries,
         "attaching XDP for agent"
     );
     let mut xdp = xdp::XdpManager::attach(
@@ -96,6 +98,7 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
     client
         .report_heartbeat(&node_id, &interface, 0, "starting", None)
         .await?;
+    let mut drop_monitor: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         let mut stream = match client
@@ -130,17 +133,35 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
                 update = stream.message() => {
                     match update {
                         Ok(Some(update)) => {
-                            let (version, snapshot) = xds::XdsClient::policy_from_update(update)?;
-                            match apply_latest(&mut xdp, snapshot, &args.control_url, version).await {
-                                Ok(applied) => {
-                                    applied_version = applied;
-                                    client.report_heartbeat(&node_id, &interface, applied_version, "ok", None).await?;
+                            let (version, snapshot, drop_monitor_enabled) = xds::XdsClient::policy_from_update(update)?;
+                            reconcile_drop_monitor(
+                                &mut xdp,
+                                &mut drop_monitor,
+                                drop_monitor_enabled,
+                                &args,
+                                &node_id,
+                                &interface,
+                            )?;
+                            if let Some(snapshot) = snapshot {
+                                match apply_latest(&mut xdp, snapshot, &args.control_url, version).await {
+                                    Ok(applied) => {
+                                        applied_version = applied;
+                                        log_xdp_stats(&xdp);
+                                        client.report_heartbeat(&node_id, &interface, applied_version, "ok", None).await?;
+                                    }
+                                    Err(err) => {
+                                        let details = format!("{err:#}");
+                                        error!(error = %details, "failed to apply firewall policy");
+                                        client.report_heartbeat(&node_id, &interface, applied_version.max(0), "error", Some(&details)).await?;
+                                        tokio::time::sleep(reconnect_delay).await;
+                                        break;
+                                    }
                                 }
-                                Err(err) => {
-                                    let details = format!("{err:#}");
-                                    error!(error = %details, "failed to apply firewall policy");
-                                    client.report_heartbeat(&node_id, &interface, applied_version.max(0), "error", Some(&details)).await?;
-                                }
+                            } else {
+                                info!(
+                                    enabled = drop_monitor_enabled,
+                                    "applied xDS drop monitor setting"
+                                );
                             }
                         }
                         Ok(None) => {
@@ -158,6 +179,7 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
                     }
                 }
                 _ = heartbeat_tick.tick() => {
+                    log_xdp_stats(&xdp);
                     client.report_heartbeat(&node_id, &interface, applied_version.max(0), "ok", None).await?;
                 }
                 result = tokio::signal::ctrl_c() => {
@@ -166,6 +188,94 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
                     return Ok(());
                 }
             }
+        }
+    }
+}
+
+fn reconcile_drop_monitor(
+    xdp: &mut xdp::XdpManager,
+    handle: &mut Option<tokio::task::JoinHandle<()>>,
+    enabled: bool,
+    args: &AgentArgs,
+    node_id: &str,
+    interface: &str,
+) -> Result<()> {
+    if enabled && handle.is_none() {
+        if let Err(err) = xdp.set_drop_monitor_enabled(true) {
+            warn!(
+                error = %err,
+                "failed to enable XDP drop monitor; enforcement continues without drop event reporting"
+            );
+            return Ok(());
+        }
+        let events_path = xdp::drop_events_pin_path(interface);
+        let client_config = xds::XdsClientConfig {
+            control_url: args.control_url.clone(),
+            agent_token: args.agent_token.clone(),
+        };
+        let node_id = node_id.to_string();
+        let interface = interface.to_string();
+        *handle = Some(tokio::spawn(async move {
+            loop {
+                match xds::XdsClient::connect(client_config.clone()).await {
+                    Ok(mut client) => {
+                        let events = match monitor::spawn_drop_event_reader(events_path.clone()) {
+                            Ok(events) => events,
+                            Err(err) => {
+                                error!(
+                                    error = %err,
+                                    "failed to open XDP drop event reader; reconnecting"
+                                );
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                continue;
+                            }
+                        };
+                        if let Err(err) = client
+                            .report_drop_events(node_id.clone(), interface.clone(), events)
+                            .await
+                        {
+                            error!(error = %err, "failed to report xDS drop events; reconnecting");
+                        }
+                    }
+                    Err(err) => {
+                        error!(error = %err, "failed to connect xDS for drop events; reconnecting");
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }));
+        info!("enabled xDS drop monitor reporting");
+    } else if !enabled && let Some(task) = handle.take() {
+        task.abort();
+        if let Err(err) = xdp.set_drop_monitor_enabled(false) {
+            warn!(
+                error = %err,
+                "failed to disable XDP drop monitor; enforcement continues"
+            );
+        }
+        info!("disabled xDS drop monitor reporting");
+    }
+    Ok(())
+}
+
+fn log_xdp_stats(xdp: &xdp::XdpManager) {
+    match xdp.stats() {
+        Ok(stats) => {
+            info!(
+                pass = stats.pass,
+                drop_total = stats.total_drop(),
+                rule_drop = stats.rule_drop,
+                geo_drop = stats.geo_drop,
+                rate_drop = stats.rate_drop,
+                flood_drop = stats.flood_drop,
+                custom_rate_drop = stats.custom_rate_drop,
+                temp_ban_drop = stats.temp_ban_drop,
+                parse_drop = stats.parse_drop,
+                "xdp stats"
+            );
+        }
+        Err(err) => {
+            error!(error = %err, "failed to read xdp stats");
         }
     }
 }
@@ -201,6 +311,8 @@ fn agent_map_sizes(args: &AgentArgs) -> xdp::XdpMapSizes {
         trusted_entries: args.trusted_map_entries,
         country_entries: args.country_map_entries,
         rate_entries: args.rate_map_entries,
+        custom_rate_limit_entries: args.custom_rate_limit_map_entries,
+        temp_ban_entries: args.temp_ban_map_entries,
     }
 }
 
@@ -211,6 +323,8 @@ fn sync_once_map_sizes(args: &SyncOnceArgs) -> xdp::XdpMapSizes {
         trusted_entries: args.trusted_map_entries,
         country_entries: args.country_map_entries,
         rate_entries: args.rate_map_entries,
+        custom_rate_limit_entries: args.custom_rate_limit_map_entries,
+        temp_ban_entries: args.temp_ban_map_entries,
     }
 }
 
@@ -245,7 +359,7 @@ async fn apply_latest(
     expected_version: i64,
 ) -> Result<i64> {
     let policy = firewall::DEFAULT_POLICY_NAME;
-    add_control_plane_allow_rules(&mut snapshot, control_url).await?;
+    add_control_plane_trusted_cidrs(&mut snapshot, control_url)?;
     log_policy_snapshot_summary(policy, expected_version, &snapshot);
     let compiled = firewall::compile_policy(&snapshot).await?;
     log_compiled_policy_summary(policy, expected_version, &compiled);
@@ -271,7 +385,9 @@ fn log_policy_snapshot_summary(
         rules = snapshot.rules.len(),
         geo_countries = snapshot.geo_countries.len(),
         trusted_cidrs = snapshot.trusted_cidrs.len(),
+        temp_bans = snapshot.temp_bans.len(),
         threat_sources = snapshot.threat_sources.len(),
+        dynamic_rate_limits = snapshot.dynamic_rate_limits.len(),
         dynamic_defense_enabled = dynamic.enabled,
         ip_rate_limit_enabled = dynamic.ip_rate_limit_enabled,
         ip_packets_per_second = dynamic.ip_packets_per_second,
@@ -297,48 +413,50 @@ fn log_compiled_policy_summary(
         geo_prefixes = compiled.geo_prefixes.len(),
         country_rules = compiled.country_rules.len(),
         trusted_prefixes = compiled.trusted_prefixes.len(),
+        temp_bans = compiled.temp_bans.len(),
         threat_prefixes = compiled.threat_prefixes.len(),
+        dynamic_rate_limits = compiled.dynamic_rate_limits.len(),
         "compiled xDS policy for XDP maps"
     );
 }
 
-async fn add_control_plane_allow_rules(
+fn add_control_plane_trusted_cidrs(
     snapshot: &mut firewall::PolicySnapshot,
     control_url: &str,
 ) -> Result<()> {
-    let prefixes = resolve_control_plane_prefixes(control_url).await?;
+    let prefixes = resolve_control_plane_prefixes(control_url)?;
     for cidr in prefixes {
-        snapshot.rules.push(firewall::FirewallRule {
-            priority: i32::MIN,
-            action: firewall::RuleAction::Allow,
+        if snapshot
+            .trusted_cidrs
+            .iter()
+            .any(|trusted| trusted.cidr == cidr)
+        {
+            continue;
+        }
+        snapshot.trusted_cidrs.push(firewall::TrustedCidrPolicy {
             cidr,
-            protocol: firewall::L4Protocol::Any,
-            port: None,
             comment: Some("local xDS control-plane allow".to_string()),
         });
     }
     Ok(())
 }
 
-async fn resolve_control_plane_prefixes(control_url: &str) -> Result<Vec<IpNet>> {
-    let (host, port) = control_plane_host_port(control_url)?;
-    let addresses = tokio::net::lookup_host((host.as_str(), port))
-        .await
-        .with_context(|| format!("failed to resolve xDS control plane host '{host}'"))?;
-    let mut prefixes = Vec::new();
-    for address in addresses {
-        let ip = address.ip();
+fn resolve_control_plane_prefixes(control_url: &str) -> Result<Vec<IpNet>> {
+    let (host, _) = control_plane_host_port(control_url)?;
+    if let Ok(ip) = host.parse::<IpAddr>() {
         let prefix = match ip {
             IpAddr::V4(_) => 32,
             IpAddr::V6(_) => 128,
         };
-        let cidr = IpNet::new(ip, prefix)
-            .with_context(|| format!("failed to build xDS control-plane CIDR for {ip}"))?;
-        if !prefixes.contains(&cidr) {
-            prefixes.push(cidr);
-        }
+        return Ok(vec![IpNet::new(ip, prefix).with_context(|| {
+            format!("failed to build xDS control-plane CIDR for {ip}")
+        })?]);
     }
-    Ok(prefixes)
+    warn!(
+        host,
+        "xDS control URL host is not an IP literal; skipping automatic local control-plane allow to avoid DNS-based bypass"
+    );
+    Ok(Vec::new())
 }
 
 fn control_plane_host_port(control_url: &str) -> Result<(String, u16)> {

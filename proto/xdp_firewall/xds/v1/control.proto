@@ -6,6 +6,7 @@ service FirewallXds {
   rpc FetchPolicy(FetchPolicyRequest) returns (FetchPolicyResponse);
   rpc StreamPolicy(StreamPolicyRequest) returns (stream PolicyUpdate);
   rpc ReportHeartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ReportDropEvents(stream DropEvent) returns (DropEventResponse);
 }
 
 message FetchPolicyRequest {
@@ -29,6 +30,7 @@ message StreamPolicyRequest {
 message PolicyUpdate {
   int64 version = 1;
   string policy_json = 2;
+  bool drop_monitor_enabled = 3;
 }
 
 message HeartbeatRequest {
@@ -41,4 +43,23 @@ message HeartbeatRequest {
 
 message HeartbeatResponse {
   bool accepted = 1;
+}
+
+message DropEvent {
+  string node_id = 1;
+  string interface_name = 2;
+  string time = 3;
+  uint64 event_time_ns = 4;
+  uint32 cpu = 5;
+  string reason = 6;
+  string src = 7;
+  uint32 family = 8;
+  string proto = 9;
+  uint32 dport = 10;
+  string country = 11;
+  string action = 12;
+}
+
+message DropEventResponse {
+  uint64 accepted = 1;
 }

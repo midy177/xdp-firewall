@@ -16,9 +16,10 @@ XDP_FIREWALL_XDS_PORT=50051
 # For the bundled host-network agent on the same server, 127.0.0.1 is correct.
 XDP_FIREWALL_XDS_URL=http://127.0.0.1:50051
 
-# Multiple trusted CIDRs are comma-separated. Do not use spaces.
-# These CIDRs skip global ip_rate_limit and flood, but still go through firewall,
-# threat intelligence, and country allow/deny rules.
+# Multiple runtime trusted CIDRs are comma-separated. Do not use spaces.
+# These CIDRs are injected into xDS snapshots only and are not persisted.
+# Trusted CIDRs are the highest-priority allow before firewall, threat, country,
+# and dynamic defense checks.
 # Example: XDP_FIREWALL_TRUSTED_CIDRS=10.0.0.0/8,192.168.0.0/16,203.0.113.10/32
 XDP_FIREWALL_TRUSTED_CIDRS=
 
