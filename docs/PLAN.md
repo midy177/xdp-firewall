@@ -2,6 +2,10 @@
 
 ## Active Plan
 
+- [completed] Add the first XDP dispatcher integration phase: document direct vs dispatcher attach strategy, add CLI flags, detect existing XDP programs before direct attach, expose XDP attach state in monitor output, and fail dispatcher mode explicitly until libxdp/pinned-map integration is implemented.
+- [completed] Complete dispatcher integration by adding libbpf map pin metadata to the BPF object, loading through `xdp-loader` when `--xdp-attach-strategy dispatcher` is selected, and reopening the pinned maps from the agent so control-plane policy updates modify the live dispatcher-owned program maps.
+- [completed] Add an explicit dispatcher lifecycle flow for unload/replace: expose a safe CLI command around `xdp-loader status/unload`, document how to remove the dispatcher-managed program and pinned maps, and make replacement intentional so stale dispatcher attachments are not left behind after agent exits or upgrades.
+- [completed] Move the firewall priority explanation and API documentation out of the main navigation/content area into a floating help button so operational pages stay compact while detailed help remains available on demand.
 - [completed] Fix country IP refresh self-review findings: expose partial failures, treat 304 as unchanged, coordinate refreshes across control-plane instances, avoid blocking `/countries`, and run daily refresh from the control plane even when no agent is connected.
 - [completed] Persist country IP CIDR lists in the database and add daily xDS-side IPdeny metadata checks that download only changed countries.
 - [completed] Harden country IP refresh after review: add HTTP timeout, response-size caps, per-country error tolerance, conditional ETag/Last-Modified checks, and one-at-a-time refresh coordination.
@@ -267,7 +271,15 @@
 
 ## Remaining Tasks
 
-- None.
+- [completed] Harden XDP dispatcher lifecycle and bpffs pin handling:
+  - Reject unsafe interface-derived pin components such as empty, `.`, and `..` while still allowing VLAN names like `eth0.10`.
+  - Require an explicit `--interface` for destructive dispatcher `unload` and `replace` flows so scripts cannot accidentally operate on the auto-detected default-route interface.
+  - Make dispatcher attach converge by unloading an existing `xdp-firewall` dispatcher entry before loading a new one.
+  - Add rollback for attach failures after pinned maps or dispatcher programs have been created.
+  - Use real pinned-map capacities for policy validation when old pins are reused.
+  - Make dispatcher replace tolerate a clean interface when bootstrapping a replacement flow.
+- [pending] Add true direct-mode XDP replacement support instead of only bypassing the pre-attach safety check with `--xdp-allow-replace`.
+- [pending] Add dispatcher map identity verification so the control plane can assert that the xdp-loader attached program is reading the same pinned map IDs that the agent updates.
 
 ## Validation Commands
 

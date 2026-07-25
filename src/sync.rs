@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use std::net::IpAddr;
 use tokio::time::{Duration, interval};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub async fn sync_once(args: SyncOnceArgs) -> Result<()> {
     let node_id = resolve_node_id(args.node_id.as_deref())?;
@@ -15,6 +15,9 @@ pub async fn sync_once(args: SyncOnceArgs) -> Result<()> {
         control_url = %args.control_url,
         configured_interface = ?args.interface,
         xdp_mode = %args.xdp_mode.as_str(),
+        xdp_attach_strategy = %args.xdp_attach_strategy.as_str(),
+        xdp_allow_replace = args.xdp_allow_replace,
+        xdp_run_priority = args.xdp_run_priority,
         xdp_object = %args.xdp_object,
         program = %args.program,
         "attaching XDP for sync-once"
@@ -24,7 +27,7 @@ pub async fn sync_once(args: SyncOnceArgs) -> Result<()> {
         &args.xdp_object,
         &args.program,
         sync_once_map_sizes(&args),
-        args.xdp_mode,
+        xdp_attach_options_for_sync_once(&args),
     )?;
     let interface = xdp.interface_name().to_string();
     let mut client = xds::XdsClient::connect(xds::XdsClientConfig {
@@ -61,6 +64,9 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
         control_url = %args.control_url,
         configured_interface = ?args.interface,
         xdp_mode = %args.xdp_mode.as_str(),
+        xdp_attach_strategy = %args.xdp_attach_strategy.as_str(),
+        xdp_allow_replace = args.xdp_allow_replace,
+        xdp_run_priority = args.xdp_run_priority,
         xdp_object = %args.xdp_object,
         program = %args.program,
         heartbeat_seconds = args.heartbeat_seconds,
@@ -78,7 +84,7 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
         &args.xdp_object,
         &args.program,
         agent_map_sizes(&args),
-        args.xdp_mode,
+        xdp_attach_options_for_agent(&args),
     )?;
     let interface = xdp.interface_name().to_string();
     info!(
@@ -208,7 +214,16 @@ fn reconcile_drop_monitor(
             );
             return Ok(());
         }
-        let events_path = xdp::drop_events_pin_path(interface);
+        let events_path = match xdp::drop_events_pin_path(interface) {
+            Ok(path) => path,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to resolve XDP drop event pin path; enforcement continues without drop event reporting"
+                );
+                return Ok(());
+            }
+        };
         let client_config = xds::XdsClientConfig {
             control_url: args.control_url.clone(),
             agent_token: args.agent_token.clone(),
@@ -261,7 +276,7 @@ fn reconcile_drop_monitor(
 fn log_xdp_stats(xdp: &xdp::XdpManager) {
     match xdp.stats() {
         Ok(stats) => {
-            info!(
+            debug!(
                 pass = stats.pass,
                 drop_total = stats.total_drop(),
                 rule_drop = stats.rule_drop,
@@ -316,6 +331,16 @@ fn agent_map_sizes(args: &AgentArgs) -> xdp::XdpMapSizes {
     }
 }
 
+fn xdp_attach_options_for_agent(args: &AgentArgs) -> xdp::XdpAttachOptions {
+    xdp::XdpAttachOptions {
+        mode: args.xdp_mode,
+        strategy: args.xdp_attach_strategy,
+        allow_replace: args.xdp_allow_replace,
+        run_priority: args.xdp_run_priority,
+        loader_path: args.xdp_loader_path.clone(),
+    }
+}
+
 fn sync_once_map_sizes(args: &SyncOnceArgs) -> xdp::XdpMapSizes {
     xdp::XdpMapSizes {
         rule_entries: args.rule_map_entries,
@@ -325,6 +350,16 @@ fn sync_once_map_sizes(args: &SyncOnceArgs) -> xdp::XdpMapSizes {
         rate_entries: args.rate_map_entries,
         custom_rate_limit_entries: args.custom_rate_limit_map_entries,
         temp_ban_entries: args.temp_ban_map_entries,
+    }
+}
+
+fn xdp_attach_options_for_sync_once(args: &SyncOnceArgs) -> xdp::XdpAttachOptions {
+    xdp::XdpAttachOptions {
+        mode: args.xdp_mode,
+        strategy: args.xdp_attach_strategy,
+        allow_replace: args.xdp_allow_replace,
+        run_priority: args.xdp_run_priority,
+        loader_path: args.xdp_loader_path.clone(),
     }
 }
 

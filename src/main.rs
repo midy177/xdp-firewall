@@ -2,8 +2,8 @@ use anyhow::{Result, bail};
 use clap::Parser;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
-use xdp_firewall::cli::{Cli, Command, PolicyCommand, XdsArgs};
-use xdp_firewall::{api, db, firewall, geo, monitor, sync, xds};
+use xdp_firewall::cli::{Cli, Command, PolicyCommand, XdpCommand, XdsArgs};
+use xdp_firewall::{api, db, firewall, geo, monitor, sync, xdp, xds};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -78,6 +78,20 @@ async fn main() -> Result<()> {
             info!("starting monitor command");
             monitor::run(args).await
         }
+        Command::Xdp { command } => match command {
+            XdpCommand::Status(args) => {
+                info!("starting xdp status command");
+                xdp::dispatcher_status(args)
+            }
+            XdpCommand::Unload(args) => {
+                info!("starting xdp unload command");
+                xdp::dispatcher_unload(args)
+            }
+            XdpCommand::Replace(args) => {
+                info!("starting xdp replace command");
+                xdp::dispatcher_replace(args)
+            }
+        },
         Command::Policy { database, command } => match command {
             PolicyCommand::SeedExample(args) => {
                 let db = db::connect(&database.database_url).await?;
@@ -101,7 +115,7 @@ fn reject_control_plane_commands_in_agent_only_mode(command: &Command) -> Result
     if !agent_only
         || matches!(
             command,
-            Command::Agent(_) | Command::SyncOnce(_) | Command::Monitor(_)
+            Command::Agent(_) | Command::SyncOnce(_) | Command::Monitor(_) | Command::Xdp { .. }
         )
     {
         return Ok(());

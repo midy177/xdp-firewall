@@ -10,6 +10,7 @@ RUN apt-get update \
         llvm \
         procps \
         tcpdump \
+        xdp-tools \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /var/lib/xdp-firewall

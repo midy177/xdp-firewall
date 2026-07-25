@@ -22,6 +22,10 @@
 #define RULE_SOURCE_FIREWALL 1
 #define RULE_SOURCE_THREAT 2
 
+#ifndef LIBBPF_PIN_BY_NAME
+#define LIBBPF_PIN_BY_NAME 1
+#endif
+
 enum stat_index {
     STAT_PASS = 0,
     STAT_RULE_DROP = 1,
@@ -148,6 +152,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __uint(max_entries, 262144);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, struct rule_key);
     __type(value, struct rule_value);
 } rule_cidrs SEC(".maps");
@@ -156,6 +161,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __uint(max_entries, 262144);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, struct geo_key);
     __type(value, struct geo_value);
 } geo_cidrs SEC(".maps");
@@ -164,6 +170,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __uint(max_entries, 4096);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, struct trusted_key);
     __type(value, __u8);
 } trusted_cidrs SEC(".maps");
@@ -171,6 +178,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 676);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, __u32);
     __type(value, struct country_value);
 } country_rules SEC(".maps");
@@ -178,6 +186,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, __u32);
     __type(value, struct defense_value);
 } defense_policy SEC(".maps");
@@ -185,6 +194,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 4096);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, struct custom_rate_key);
     __type(value, struct custom_rate_value);
 } custom_rate_limits SEC(".maps");
@@ -192,6 +202,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 4096);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, struct temp_ban_key);
     __type(value, struct temp_ban_value);
 } temp_bans SEC(".maps");
@@ -199,6 +210,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 1048576);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, struct rate_key);
     __type(value, struct rate_bucket);
 } rate_buckets SEC(".maps");
@@ -206,6 +218,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __uint(max_entries, STAT_MAX);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, __u32);
     __type(value, __u64);
 } stats SEC(".maps");
@@ -213,6 +226,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
     __uint(max_entries, 0);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, __u32);
     __type(value, __u32);
 } drop_events SEC(".maps");
@@ -220,6 +234,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, __u32);
     __type(value, __u8);
 } drop_config SEC(".maps");

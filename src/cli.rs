@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::xdp::{
     DEFAULT_COUNTRY_MAP_ENTRIES, DEFAULT_CUSTOM_RATE_LIMIT_MAP_ENTRIES, DEFAULT_GEO_MAP_ENTRIES,
     DEFAULT_RATE_MAP_ENTRIES, DEFAULT_RULE_MAP_ENTRIES, DEFAULT_TEMP_BAN_MAP_ENTRIES,
-    DEFAULT_TRUSTED_MAP_ENTRIES, XdpAttachMode,
+    DEFAULT_TRUSTED_MAP_ENTRIES, XdpAttachMode, XdpAttachStrategy,
 };
 
 #[derive(Debug, Parser)]
@@ -21,6 +21,10 @@ pub enum Command {
     Agent(AgentArgs),
     SyncOnce(SyncOnceArgs),
     Monitor(MonitorArgs),
+    Xdp {
+        #[command(subcommand)]
+        command: XdpCommand,
+    },
     Policy {
         #[command(flatten)]
         database: DatabaseArgs,
@@ -145,6 +149,13 @@ pub enum PolicyCommand {
     Show(ShowPolicyArgs),
 }
 
+#[derive(Debug, Subcommand)]
+pub enum XdpCommand {
+    Status(XdpStatusArgs),
+    Unload(XdpUnloadArgs),
+    Replace(XdpReplaceArgs),
+}
+
 #[derive(Debug, Args, Clone)]
 pub struct AgentArgs {
     #[arg(
@@ -179,6 +190,35 @@ pub struct AgentArgs {
         help = "XDP attach mode: auto tries driver mode first and falls back to skb; driver fails if native XDP is unavailable; skb skips native XDP."
     )]
     pub xdp_mode: XdpAttachMode,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_ATTACH_STRATEGY",
+        value_enum,
+        default_value_t = XdpAttachStrategy::Direct,
+        help = "XDP attach strategy: direct uses Aya's native attach path; dispatcher uses xdp-loader/libxdp multiprogram attach and pinned maps."
+    )]
+    pub xdp_attach_strategy: XdpAttachStrategy,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_ALLOW_REPLACE",
+        default_value_t = false,
+        help = "Allow direct attach to proceed when an XDP program is already present on the interface. Leave false to avoid replacing another XDP user such as Cilium or Katran."
+    )]
+    pub xdp_allow_replace: bool,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_RUN_PRIORITY",
+        default_value_t = 10,
+        help = "Dispatcher run priority. Lower values run earlier in the libxdp dispatcher chain."
+    )]
+    pub xdp_run_priority: i32,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_LOADER_PATH",
+        default_value = "xdp-loader",
+        hide = true
+    )]
+    pub xdp_loader_path: String,
     #[arg(long, default_value = "/usr/local/share/xdp-firewall/xdp_firewall.o")]
     pub xdp_object: String,
     #[arg(long, default_value_t = 30)]
@@ -270,6 +310,35 @@ pub struct SyncOnceArgs {
         help = "XDP attach mode: auto tries driver mode first and falls back to skb; driver fails if native XDP is unavailable; skb skips native XDP."
     )]
     pub xdp_mode: XdpAttachMode,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_ATTACH_STRATEGY",
+        value_enum,
+        default_value_t = XdpAttachStrategy::Direct,
+        help = "XDP attach strategy: direct uses Aya's native attach path; dispatcher uses xdp-loader/libxdp multiprogram attach and pinned maps."
+    )]
+    pub xdp_attach_strategy: XdpAttachStrategy,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_ALLOW_REPLACE",
+        default_value_t = false,
+        help = "Allow direct attach to proceed when an XDP program is already present on the interface."
+    )]
+    pub xdp_allow_replace: bool,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_RUN_PRIORITY",
+        default_value_t = 10,
+        help = "Dispatcher run priority. Lower values run earlier in the libxdp dispatcher chain."
+    )]
+    pub xdp_run_priority: i32,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_LOADER_PATH",
+        default_value = "xdp-loader",
+        hide = true
+    )]
+    pub xdp_loader_path: String,
     #[arg(long, default_value = "/usr/local/share/xdp-firewall/xdp_firewall.o")]
     pub xdp_object: String,
     #[arg(long, default_value = "xdp_firewall")]
@@ -368,6 +437,170 @@ pub struct MonitorArgs {
         help = "Pinned drop_events map path. Defaults to /sys/fs/bpf/xdp-firewall/<interface>/drop_events."
     )]
     pub drop_events_path: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct XdpStatusArgs {
+    #[arg(
+        long,
+        help = "Network interface to inspect. Auto-detects the default-route interface when omitted."
+    )]
+    pub interface: Option<String>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_LOADER_PATH",
+        default_value = "xdp-loader",
+        hide = true
+    )]
+    pub xdp_loader_path: String,
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct XdpUnloadArgs {
+    #[arg(
+        long,
+        help = "Network interface to unload from. Required for destructive dispatcher operations."
+    )]
+    pub interface: Option<String>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_LOADER_PATH",
+        default_value = "xdp-loader",
+        hide = true
+    )]
+    pub xdp_loader_path: String,
+    #[arg(
+        long,
+        conflicts_with = "all",
+        help = "Unload one dispatcher program ID."
+    )]
+    pub id: Option<u32>,
+    #[arg(
+        long,
+        help = "Unload all dispatcher programs and the dispatcher from the interface."
+    )]
+    pub all: bool,
+    #[arg(
+        long,
+        help = "After unloading all dispatcher programs, remove /sys/fs/bpf/xdp-firewall/<interface> pinned maps."
+    )]
+    pub remove_pins: bool,
+    #[arg(
+        long,
+        help = "Run xdp-loader clean for detached dispatcher links after unload."
+    )]
+    pub clean: bool,
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct XdpReplaceArgs {
+    #[arg(
+        long,
+        help = "Network interface to replace on. Required for destructive dispatcher operations."
+    )]
+    pub interface: Option<String>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_LOADER_PATH",
+        default_value = "xdp-loader",
+        hide = true
+    )]
+    pub xdp_loader_path: String,
+    #[arg(
+        long,
+        conflicts_with = "all",
+        help = "Optionally unload one dispatcher program ID before loading the replacement."
+    )]
+    pub id: Option<u32>,
+    #[arg(
+        long,
+        help = "Optionally unload all dispatcher programs and the dispatcher before loading the replacement."
+    )]
+    pub all: bool,
+    #[arg(
+        long,
+        help = "Remove /sys/fs/bpf/xdp-firewall/<interface> pinned maps before loading the replacement. This starts with empty maps."
+    )]
+    pub remove_pins: bool,
+    #[arg(
+        long,
+        help = "Run xdp-loader clean for detached dispatcher links after unloading the old program."
+    )]
+    pub clean: bool,
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_MODE",
+        value_enum,
+        default_value_t = XdpAttachMode::Auto,
+        help = "Replacement dispatcher attach mode: auto tries native first and falls back to skb; driver requires native; skb uses generic XDP."
+    )]
+    pub xdp_mode: XdpAttachMode,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDP_RUN_PRIORITY",
+        default_value_t = 10,
+        help = "Dispatcher run priority for the replacement. Lower values run earlier."
+    )]
+    pub xdp_run_priority: i32,
+    #[arg(long, default_value = "/usr/local/share/xdp-firewall/xdp_firewall.o")]
+    pub xdp_object: String,
+    #[arg(long, default_value = "xdp_firewall")]
+    pub program: String,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_RULE_MAP_ENTRIES",
+        hide = true,
+        default_value_t = DEFAULT_RULE_MAP_ENTRIES
+    )]
+    pub rule_map_entries: u32,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_GEO_MAP_ENTRIES",
+        hide = true,
+        default_value_t = DEFAULT_GEO_MAP_ENTRIES
+    )]
+    pub geo_map_entries: u32,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_TRUSTED_MAP_ENTRIES",
+        hide = true,
+        default_value_t = DEFAULT_TRUSTED_MAP_ENTRIES
+    )]
+    pub trusted_map_entries: u32,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_COUNTRY_MAP_ENTRIES",
+        hide = true,
+        default_value_t = DEFAULT_COUNTRY_MAP_ENTRIES
+    )]
+    pub country_map_entries: u32,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_RATE_MAP_ENTRIES",
+        hide = true,
+        default_value_t = DEFAULT_RATE_MAP_ENTRIES
+    )]
+    pub rate_map_entries: u32,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_CUSTOM_RATE_LIMIT_MAP_ENTRIES",
+        hide = true,
+        default_value_t = DEFAULT_CUSTOM_RATE_LIMIT_MAP_ENTRIES
+    )]
+    pub custom_rate_limit_map_entries: u32,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_TEMP_BAN_MAP_ENTRIES",
+        hide = true,
+        default_value_t = DEFAULT_TEMP_BAN_MAP_ENTRIES
+    )]
+    pub temp_ban_map_entries: u32,
 }
 
 #[derive(Debug, Args, Clone)]

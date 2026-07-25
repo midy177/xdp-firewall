@@ -339,12 +339,8 @@ async fn log_request(request: axum::extract::Request, next: Next) -> Response {
     let elapsed_ms = started.elapsed().as_millis();
     if status.is_server_error() {
         error!(%method, %path, status = status.as_u16(), elapsed_ms, "API request failed");
-    } else if status.is_client_error() {
-        warn!(%method, %path, status = status.as_u16(), elapsed_ms, "API request rejected");
-    } else if path == "/health" {
-        debug!(%method, %path, status = status.as_u16(), elapsed_ms, "API request completed");
     } else {
-        info!(%method, %path, status = status.as_u16(), elapsed_ms, "API request completed");
+        debug!(%method, %path, status = status.as_u16(), elapsed_ms, "API request completed");
     }
     response
 }
@@ -699,13 +695,14 @@ async fn lookup_geo_ip(
     State(state): State<ApiState>,
     Query(query): Query<GeoLookupQuery>,
 ) -> ApiResult<Json<GeoLookupResponse>> {
-    let ip: std::net::IpAddr = query
-        .ip
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid IP '{}'", query.ip.trim()))?;
+    let ip: std::net::IpAddr = query.ip.trim().parse().with_context(|| {
+        format!(
+            "ip must be a valid IPv4 or IPv6 address, got '{}'",
+            query.ip.trim()
+        )
+    })?;
     let country = state.geo_lookup.lookup_country_record(ip);
-    info!(
+    debug!(
         ip = %ip,
         hit = country.is_some(),
         country = country.as_ref().map(|country| country.code.as_str()).unwrap_or("-"),

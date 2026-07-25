@@ -29,4 +29,9 @@ XDP_FIREWALL_XDS_PUSH_INTERVAL_SECONDS=5
 # XDP attach mode: auto, driver, or skb.
 XDP_FIREWALL_XDP_MODE=auto
 
+# XDP attach strategy: direct or dispatcher. Dispatcher uses xdp-loader/libxdp.
+XDP_FIREWALL_XDP_ATTACH_STRATEGY=direct
+XDP_FIREWALL_XDP_ALLOW_REPLACE=false
+XDP_FIREWALL_XDP_RUN_PRIORITY=10
+
 RUST_LOG=xdp_firewall=info

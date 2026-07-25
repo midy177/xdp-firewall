@@ -84,16 +84,6 @@
         </div>
       </div>
 
-      <section class="priority-strip" :aria-label="t('priorityOrder')">
-        <div v-for="item in priorityOrder" :key="item.rank" class="priority-step">
-          <strong>{{ item.rank }}</strong>
-          <div>
-            <span>{{ t(item.label) }}</span>
-            <small>{{ t(item.detail) }}</small>
-          </div>
-        </div>
-      </section>
-
       <section v-if="tab === 'rules'" class="panel">
         <div class="panel-head">
           <div>
@@ -223,9 +213,18 @@
         <div class="form-grid geo-lookup-form">
           <label class="field">
             <span>{{ t("ipAddress") }}</span>
-            <Input v-model="geoLookupForm.ip" aria-label="Geo lookup IP" placeholder="8.8.8.8" @keyup.enter="runAction(lookupGeoIp)" />
+            <Input
+              v-model="geoLookupForm.ip"
+              aria-label="Geo lookup IP"
+              placeholder="8.8.8.8"
+              :aria-invalid="Boolean(fieldErrors.geoLookupIp)"
+              @blur="validateField('geoLookupIp')"
+              @input="validateTouchedField('geoLookupIp')"
+              @keyup.enter="runAction(lookupGeoIp)"
+            />
+            <small class="field-error" :class="{ visible: Boolean(fieldErrors.geoLookupIp) }">{{ fieldErrors.geoLookupIp }}</small>
           </label>
-          <Button class="form-submit" :title="t('query')" :disabled="actionBusy" @click="runAction(lookupGeoIp)">
+          <Button class="form-submit" :title="t('query')" :disabled="actionBusy || hasFieldErrors(geoLookupErrorFields)" @click="runAction(lookupGeoIp)">
             <Globe2 :size="16" />
           </Button>
           <div class="lookup-result">
@@ -710,14 +709,43 @@
         </table>
       </section>
 
-      <section v-if="tab === 'apiDocs'" class="panel docs-panel">
-        <div class="panel-head">
+      <div v-if="loading" class="loading-bar"><span></span></div>
+      <p v-if="error" class="error">{{ error }}</p>
+      <p v-else-if="notice" class="notice">{{ notice }}</p>
+    </main>
+
+    <button class="help-fab" :aria-label="t('help')" :title="t('help')" @click="helpOpen = true">
+      <BookOpen :size="20" />
+    </button>
+
+    <div v-if="helpOpen" class="help-overlay" @click.self="helpOpen = false">
+      <aside class="help-drawer" role="dialog" aria-modal="true" :aria-label="t('help')">
+        <div class="help-head">
           <div>
-            <h2>{{ t("apiDocs") }}</h2>
-            <p>{{ t("apiDocsHint") }}</p>
+            <h2>{{ t("help") }}</h2>
+            <p>{{ t("helpHint") }}</p>
           </div>
+          <Button variant="ghost" :title="t('close')" @click="helpOpen = false">
+            <X :size="15" />
+          </Button>
         </div>
-        <div class="docs-body">
+        <div class="help-body">
+          <section class="doc-block">
+            <h3>{{ t("priorityOrder") }}</h3>
+            <div class="priority-list">
+              <article v-for="item in priorityOrder" :key="item.rank" class="priority-row">
+                <strong>{{ item.rank }}</strong>
+                <div>
+                  <span>{{ t(item.label) }}</span>
+                  <small>{{ t(item.detail) }}</small>
+                </div>
+              </article>
+            </div>
+          </section>
+          <section class="doc-block">
+            <h3>{{ t("apiDocs") }}</h3>
+            <p>{{ t("apiDocsHint") }}</p>
+          </section>
           <section class="doc-block">
             <h3>{{ t("apiAuth") }}</h3>
             <p>{{ t("apiAuthText") }}</p>
@@ -745,12 +773,8 @@ X-API-Token: &lt;token&gt;</code></pre>
             </div>
           </section>
         </div>
-      </section>
-
-      <div v-if="loading" class="loading-bar"><span></span></div>
-      <p v-if="error" class="error">{{ error }}</p>
-      <p v-else-if="notice" class="notice">{{ notice }}</p>
-    </main>
+      </aside>
+    </div>
 
     <div v-if="authRequired" class="login-overlay">
       <section class="login-panel">
@@ -771,7 +795,7 @@ X-API-Token: &lt;token&gt;</code></pre>
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { Activity, Ban, BookOpen, ChevronLeft, ChevronRight, DatabaseZap, Globe2, KeyRound, ListFilter, Plus, RefreshCcw, Server, ShieldCheck, Square, Trash2 } from "lucide-vue-next";
+import { Activity, Ban, BookOpen, ChevronLeft, ChevronRight, DatabaseZap, Globe2, KeyRound, ListFilter, Plus, RefreshCcw, Server, ShieldCheck, Square, Trash2, X } from "lucide-vue-next";
 import Badge from "./components/ui/Badge.vue";
 import Button from "./components/ui/Button.vue";
 import Input from "./components/ui/Input.vue";
@@ -804,8 +828,9 @@ type ApiDocSection = { title: string; description: string; endpoints: ApiDocEndp
 type GeoRefreshResponse = { countries: string[]; checked_country_count: number; changed_country_count: number; prefix_count: number; provider_base_url: string; refresh_status?: string; cached?: boolean; running?: boolean };
 type GeoLookupResponse = { ip: string; country?: string | null; country_name?: string | null };
 type Lang = "zh" | "en";
-type FieldKey = "ruleCidr" | "rulePort" | "tempBanIp" | "tempBanPort" | "dynamicRatePort" | "trustedCidr";
+type FieldKey = "ruleCidr" | "rulePort" | "geoLookupIp" | "tempBanIp" | "tempBanPort" | "dynamicRatePort" | "trustedCidr";
 const ruleErrorFields: FieldKey[] = ["ruleCidr", "rulePort"];
+const geoLookupErrorFields: FieldKey[] = ["geoLookupIp"];
 const tempBanErrorFields: FieldKey[] = ["tempBanIp", "tempBanPort"];
 const dynamicRateErrorFields: FieldKey[] = ["dynamicRatePort"];
 const trustedErrorFields: FieldKey[] = ["trustedCidr"];
@@ -818,11 +843,11 @@ const tabs = [
   { id: "geo", label: "countries", icon: Globe2 },
   { id: "defense", label: "dynamicDefense", icon: ShieldCheck },
   { id: "drops", label: "dropEvents", icon: Activity },
-  { id: "nodes", label: "nodes", icon: Server },
-  { id: "apiDocs", label: "apiDocs", icon: BookOpen }
+  { id: "nodes", label: "nodes", icon: Server }
 ] as const;
 
 const tab = ref<(typeof tabs)[number]["id"]>("rules");
+const helpOpen = ref(false);
 const language = ref<Lang>(localStorage.getItem("xdp-firewall-language") === "en" ? "en" : "zh");
 const health = ref("loading");
 const error = ref("");
@@ -831,7 +856,7 @@ const fieldErrors = reactive<Partial<Record<FieldKey, string>>>({});
 const touchedFields = reactive<Partial<Record<FieldKey, boolean>>>({});
 const loading = ref(false);
 const actionBusy = ref(false);
-const apiToken = ref("");
+const apiToken = ref(sessionStorage.getItem("xdp-firewall-api-token") ?? "");
 const loginToken = ref(apiToken.value);
 const loginError = ref("");
 const authRequired = ref(false);
@@ -901,6 +926,7 @@ const messages = {
     authInvalid: "API 令牌缺失或无效",
     blockSeconds: "封禁秒数",
     burst: "突发",
+    close: "关闭",
     comment: "备注",
     confirmDelete: "确认删除这条配置？",
     countries: "国家",
@@ -937,6 +963,8 @@ const messages = {
     floodPps: "Flood PPS",
     format: "格式",
     firewall: "防火墙配置",
+    help: "帮助",
+    helpHint: "执行优先级和 API 使用说明",
     highest: "最高",
     ipBurst: "IP 突发",
     ipAddress: "IP 地址",
@@ -1016,6 +1044,7 @@ const messages = {
     authInvalid: "missing or invalid API token",
     blockSeconds: "Block seconds",
     burst: "Burst",
+    close: "Close",
     comment: "Comment",
     confirmDelete: "Delete this configuration?",
     countries: "Countries",
@@ -1052,6 +1081,8 @@ const messages = {
     floodPps: "Flood PPS",
     format: "Format",
     firewall: "Firewall Config",
+    help: "Help",
+    helpHint: "Enforcement priority and API usage reference",
     highest: "highest",
     ipBurst: "IP burst",
     ipAddress: "IP address",
@@ -1753,11 +1784,16 @@ function debugAuthHeaders(path: string, headers: Headers) {
 }
 
 function saveApiToken() {
-  clearStoredApiToken();
+  localStorage.removeItem("xdp-firewall-api-token");
+  const token = apiToken.value.trim();
+  if (token) {
+    sessionStorage.setItem("xdp-firewall-api-token", token);
+  } else {
+    sessionStorage.removeItem("xdp-firewall-api-token");
+  }
 }
 
 function currentApiToken(): string {
-  clearStoredApiToken();
   return apiToken.value.trim();
 }
 
@@ -1787,10 +1823,6 @@ function v(key: ValidationKey, label = ""): string {
 
 function setTab(value: (typeof tabs)[number]["id"]) {
   tab.value = value;
-  if (value === "apiDocs") {
-    authRequired.value = false;
-    loginError.value = "";
-  }
   if (window.location.hash !== `#${value}`) {
     window.location.hash = value;
   }
@@ -1798,12 +1830,13 @@ function setTab(value: (typeof tabs)[number]["id"]) {
 
 function syncTabFromHash() {
   const value = window.location.hash.replace(/^#\/?/, "");
+  if (value === "apiDocs") {
+    helpOpen.value = true;
+    tab.value = "rules";
+    return;
+  }
   if (tabs.some((item) => item.id === value)) {
     tab.value = value as (typeof tabs)[number]["id"];
-    if (tab.value === "apiDocs") {
-      authRequired.value = false;
-      loginError.value = "";
-    }
   }
 }
 
@@ -1877,7 +1910,7 @@ function countryLabel(country: CountryOption): string {
 async function submitLogin() {
   loginError.value = "";
   apiToken.value = loginToken.value.trim();
-  clearStoredApiToken();
+  saveApiToken();
   authRequired.value = false;
   try {
     await refreshAll();
@@ -1921,10 +1954,6 @@ async function refreshPublic() {
 }
 
 async function refreshCurrentView() {
-  if (tab.value === "apiDocs") {
-    await refreshPublic();
-    return;
-  }
   await refreshAll();
 }
 
@@ -2132,6 +2161,7 @@ async function refreshGeoCountries() {
 }
 
 async function lookupGeoIp() {
+  validateFields(["geoLookupIp"]);
   const ip = requireIp(t("ipAddress"), geoLookupForm.ip);
   geoLookupResult.value = await api<GeoLookupResponse>(`geo/lookup?ip=${encodeURIComponent(ip)}`);
 }
@@ -2208,22 +2238,15 @@ function showNotice(message: string) {
 }
 
 onMounted(() => {
-  clearStoredApiToken();
+  localStorage.removeItem("xdp-firewall-api-token");
   syncTabFromHash();
   window.addEventListener("hashchange", syncTabFromHash);
-  window.addEventListener("pagehide", clearApiToken);
-  window.addEventListener("beforeunload", clearApiToken);
-  document.addEventListener("visibilitychange", clearApiTokenOnHidden);
   void refreshCurrentView();
 });
 
 onBeforeUnmount(() => {
   stopDropStream();
-  clearApiToken();
   window.removeEventListener("hashchange", syncTabFromHash);
-  window.removeEventListener("pagehide", clearApiToken);
-  window.removeEventListener("beforeunload", clearApiToken);
-  document.removeEventListener("visibilitychange", clearApiTokenOnHidden);
 });
 
 watch(apiToken, saveApiToken);
@@ -2239,12 +2262,6 @@ watch(dropNodeFilter, () => {
     void startDropStream();
   }
 });
-
-function clearApiTokenOnHidden() {
-  if (document.visibilityState === "hidden") {
-    clearApiToken();
-  }
-}
 
 function validateRuleForm() {
   const action = requireOneOf(t("ruleAction"), ruleForm.action, actions);
@@ -2377,6 +2394,9 @@ function validateField(key: FieldKey): boolean {
         break;
       case "rulePort":
         validateRulePortField();
+        break;
+      case "geoLookupIp":
+        requireIp(t("ipAddress"), geoLookupForm.ip);
         break;
       case "tempBanIp":
         requireIp(t("sourceIp"), tempBanForm.ip);

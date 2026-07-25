@@ -47,6 +47,12 @@ spec:
                   fieldPath: spec.nodeName
             - name: XDP_FIREWALL_XDP_MODE
               value: auto
+            - name: XDP_FIREWALL_XDP_ATTACH_STRATEGY
+              value: direct
+            - name: XDP_FIREWALL_XDP_ALLOW_REPLACE
+              value: "false"
+            - name: XDP_FIREWALL_XDP_RUN_PRIORITY
+              value: "10"
             - name: XDP_FIREWALL_AGENT_ONLY
               value: "true"
             - name: RUST_LOG

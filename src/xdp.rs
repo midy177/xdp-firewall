@@ -1,3 +1,4 @@
+use crate::cli::{XdpReplaceArgs, XdpStatusArgs, XdpUnloadArgs};
 use crate::firewall::CompiledPolicy;
 #[cfg(target_os = "linux")]
 use crate::firewall::{
@@ -37,6 +38,42 @@ impl XdpAttachMode {
             Self::Auto => "auto",
             Self::Driver => "driver",
             Self::Skb => "skb",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum XdpAttachStrategy {
+    Direct,
+    Dispatcher,
+}
+
+impl XdpAttachStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Dispatcher => "dispatcher",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct XdpAttachOptions {
+    pub mode: XdpAttachMode,
+    pub strategy: XdpAttachStrategy,
+    pub allow_replace: bool,
+    pub run_priority: i32,
+    pub loader_path: String,
+}
+
+impl Default for XdpAttachOptions {
+    fn default() -> Self {
+        Self {
+            mode: XdpAttachMode::Auto,
+            strategy: XdpAttachStrategy::Direct,
+            allow_replace: false,
+            run_priority: 10,
+            loader_path: "xdp-loader".to_string(),
         }
     }
 }
@@ -132,20 +169,70 @@ impl XdpStats {
     }
 }
 
-pub fn drop_events_pin_path(interface: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from("/sys/fs/bpf/xdp-firewall")
-        .join(sanitize_pin_component(interface))
-        .join("drop_events")
+pub fn drop_events_pin_path(interface: &str) -> Result<std::path::PathBuf> {
+    Ok(map_pin_dir(interface)?.join("drop_events"))
 }
 
-pub fn drop_config_pin_path(interface: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from("/sys/fs/bpf/xdp-firewall")
-        .join(sanitize_pin_component(interface))
-        .join("drop_config")
+pub fn drop_config_pin_path(interface: &str) -> Result<std::path::PathBuf> {
+    Ok(map_pin_dir(interface)?.join("drop_config"))
 }
 
-fn sanitize_pin_component(value: &str) -> String {
-    value
+pub fn map_pin_dir(interface: &str) -> Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from("/sys/fs/bpf/xdp-firewall")
+        .join(sanitize_pin_component(interface)?))
+}
+
+pub fn existing_xdp_summary(interface: &str) -> Result<Option<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        return linux::existing_xdp_summary(interface);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = interface;
+        Ok(None)
+    }
+}
+
+pub fn dispatcher_status(args: XdpStatusArgs) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return linux::dispatcher_status(args);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = args;
+        bail!("xdp status is only supported on Linux")
+    }
+}
+
+pub fn dispatcher_unload(args: XdpUnloadArgs) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return linux::dispatcher_unload(args);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = args;
+        bail!("xdp unload is only supported on Linux")
+    }
+}
+
+pub fn dispatcher_replace(args: XdpReplaceArgs) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return linux::dispatcher_replace(args);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = args;
+        bail!("xdp replace is only supported on Linux")
+    }
+}
+
+fn sanitize_pin_component(value: &str) -> Result<String> {
+    let sanitized = value
+        .trim()
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
@@ -154,7 +241,11 @@ fn sanitize_pin_component(value: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect::<String>();
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        bail!("interface name '{value}' is not safe for bpffs pin path");
+    }
+    Ok(sanitized)
 }
 
 impl XdpManager {
@@ -163,7 +254,7 @@ impl XdpManager {
         object_path: &str,
         program_name: &str,
         map_sizes: XdpMapSizes,
-        attach_mode: XdpAttachMode,
+        attach_options: XdpAttachOptions,
     ) -> Result<Self> {
         #[cfg(target_os = "linux")]
         {
@@ -175,13 +266,19 @@ impl XdpManager {
                     object_path,
                     program_name,
                     map_sizes,
-                    attach_mode,
+                    attach_options,
                 )?,
             });
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (interface, object_path, program_name, map_sizes, attach_mode);
+            let _ = (
+                interface,
+                object_path,
+                program_name,
+                map_sizes,
+                attach_options,
+            );
             Ok(Self {})
         }
     }
@@ -324,14 +421,14 @@ mod linux {
     use aya::{
         Ebpf, EbpfLoader, Pod,
         maps::{
-            Array as AyaArray, HashMap as AyaHashMap, LpmTrie, Map, MapData, PerCpuArray,
+            Array as AyaArray, HashMap as AyaHashMap, IterableMap, LpmTrie, MapData, PerCpuArray,
             PerfEventArray, lpm_trie::Key as LpmKey,
         },
         programs::{Xdp, XdpMode},
     };
     use std::collections::HashSet;
     use std::path::Path;
-    use tracing::{info, warn};
+    use tracing::{debug, info, warn};
 
     pub struct LinuxXdpManager {
         interface: String,
@@ -353,6 +450,19 @@ mod linux {
         custom_rate_keys: Vec<CustomRateKey>,
         temp_ban_keys: Vec<TempBanKey>,
         map_sizes: XdpMapSizes,
+    }
+
+    struct XdpMapBundle {
+        rule_cidrs: LpmTrie<MapData, RuleData, RuleValue>,
+        geo_cidrs: LpmTrie<MapData, GeoData, GeoValue>,
+        trusted_cidrs: LpmTrie<MapData, TrustedData, TrustedValue>,
+        country_rules: AyaHashMap<MapData, u32, CountryValue>,
+        defense_policy: AyaArray<MapData, DefenseValue>,
+        custom_rate_limits: AyaHashMap<MapData, CustomRateKey, CustomRateValue>,
+        temp_bans: AyaHashMap<MapData, TempBanKey, TempBanValue>,
+        drop_config: AyaArray<MapData, DropConfigValue>,
+        stats: PerCpuArray<MapData, u64>,
+        drop_events: PerfEventArray<MapData>,
     }
 
     #[derive(Clone, Copy)]
@@ -476,114 +586,187 @@ mod linux {
     unsafe impl Pod for TrustedValue {}
     unsafe impl Pod for DropConfigValue {}
 
+    pub(super) fn dispatcher_status(args: XdpStatusArgs) -> Result<()> {
+        let interface = resolve_interface_name(args.interface.as_deref())?;
+        if let Some(summary) = existing_xdp_summary(&interface)? {
+            println!("interface={interface} xdp_attached=true summary={summary}");
+        } else {
+            println!("interface={interface} xdp_attached=false");
+        }
+        let output = run_xdp_loader_command(
+            &args.xdp_loader_path,
+            xdp_loader_verbose_args(args.verbose, ["status"]),
+        )
+        .with_context(|| format!("failed to run xdp-loader status for interface '{interface}'"))?;
+        print_command_output(&output);
+        ensure_success("xdp-loader status", &output)
+    }
+
+    pub(super) fn dispatcher_unload(args: XdpUnloadArgs) -> Result<()> {
+        let interface = require_explicit_interface(
+            args.interface.as_deref(),
+            "xdp unload requires --interface because it can detach dispatcher programs and remove bpffs pins",
+        )?;
+        dispatcher_unload_inner(
+            &interface,
+            &args.xdp_loader_path,
+            args.id,
+            args.all,
+            args.remove_pins,
+            args.clean,
+            args.verbose,
+            false,
+        )
+    }
+
+    pub(super) fn dispatcher_replace(args: XdpReplaceArgs) -> Result<()> {
+        let interface = require_explicit_interface(
+            args.interface.as_deref(),
+            "xdp replace requires --interface because it unloads dispatcher programs before loading the replacement",
+        )?;
+        if args.id.is_some() || args.all || args.remove_pins || args.clean {
+            dispatcher_unload_inner(
+                &interface,
+                &args.xdp_loader_path,
+                args.id,
+                args.all,
+                args.remove_pins,
+                args.clean,
+                args.verbose,
+                true,
+            )?;
+        }
+        let map_sizes = XdpMapSizes {
+            rule_entries: args.rule_map_entries,
+            geo_entries: args.geo_map_entries,
+            trusted_entries: args.trusted_map_entries,
+            country_entries: args.country_map_entries,
+            rate_entries: args.rate_map_entries,
+            custom_rate_limit_entries: args.custom_rate_limit_map_entries,
+            temp_ban_entries: args.temp_ban_map_entries,
+        };
+        let _manager = LinuxXdpManager::attach(
+            &interface,
+            &args.xdp_object,
+            &args.program,
+            map_sizes,
+            XdpAttachOptions {
+                mode: args.xdp_mode,
+                strategy: XdpAttachStrategy::Dispatcher,
+                allow_replace: false,
+                run_priority: args.xdp_run_priority,
+                loader_path: args.xdp_loader_path,
+            },
+        )?;
+        println!(
+            "dispatcher replacement loaded interface={} object={} program={} priority={} pins={}",
+            interface,
+            args.xdp_object,
+            args.program,
+            args.xdp_run_priority,
+            map_pin_dir(&interface)?.display()
+        );
+        Ok(())
+    }
+
     impl LinuxXdpManager {
         pub fn attach(
             interface: &str,
             object_path: &str,
             program_name: &str,
             map_sizes: XdpMapSizes,
-            attach_mode: XdpAttachMode,
+            attach_options: XdpAttachOptions,
         ) -> Result<Self> {
             if !Path::new(object_path).exists() {
                 bail!("XDP object '{}' does not exist", object_path);
             }
-            let drop_event_entries = possible_cpu_map_entries()
-                .context("failed to detect possible CPUs for drop_events map sizing")?;
-            let mut loader = EbpfLoader::new();
-            loader
-                .map_max_entries("rule_cidrs", map_sizes.rule_entries)
-                .map_max_entries("geo_cidrs", map_sizes.geo_entries)
-                .map_max_entries("trusted_cidrs", map_sizes.trusted_entries)
-                .map_max_entries("country_rules", map_sizes.country_entries)
-                .map_max_entries("rate_buckets", map_sizes.rate_entries)
-                .map_max_entries("custom_rate_limits", map_sizes.custom_rate_limit_entries)
-                .map_max_entries("temp_bans", map_sizes.temp_ban_entries)
-                .map_max_entries("drop_events", drop_event_entries);
-            let mut ebpf = loader
-                .load_file(object_path)
-                .with_context(|| format!("failed to load XDP object '{object_path}'"))?;
-            let program: &mut Xdp = ebpf
-                .program_mut(program_name)
-                .with_context(|| format!("XDP program '{program_name}' is missing"))?
-                .try_into()
-                .with_context(|| format!("program '{program_name}' is not XDP"))?;
-            program.load().context("failed to load XDP program")?;
-            attach_program(program, interface, attach_mode)?;
-            let rule_cidrs = ebpf
-                .take_map("rule_cidrs")
-                .context("missing XDP map 'rule_cidrs'")?
-                .try_into()
-                .context("XDP map 'rule_cidrs' has unexpected type")?;
-            let geo_cidrs = ebpf
-                .take_map("geo_cidrs")
-                .context("missing XDP map 'geo_cidrs'")?
-                .try_into()
-                .context("XDP map 'geo_cidrs' has unexpected type")?;
-            let country_rules = ebpf
-                .take_map("country_rules")
-                .context("missing XDP map 'country_rules'")?
-                .try_into()
-                .context("XDP map 'country_rules' has unexpected type")?;
-            let trusted_cidrs = ebpf
-                .take_map("trusted_cidrs")
-                .context("missing XDP map 'trusted_cidrs'")?
-                .try_into()
-                .context("XDP map 'trusted_cidrs' has unexpected type")?;
-            let defense_policy = ebpf
-                .take_map("defense_policy")
-                .context("missing XDP map 'defense_policy'")?
-                .try_into()
-                .context("XDP map 'defense_policy' has unexpected type")?;
-            let custom_rate_limits = ebpf
-                .take_map("custom_rate_limits")
-                .context("missing XDP map 'custom_rate_limits'")?
-                .try_into()
-                .context("XDP map 'custom_rate_limits' has unexpected type")?;
-            let temp_bans = ebpf
-                .take_map("temp_bans")
-                .context("missing XDP map 'temp_bans'")?
-                .try_into()
-                .context("XDP map 'temp_bans' has unexpected type")?;
-            let mut drop_config = ebpf
-                .take_map("drop_config")
-                .context("missing XDP map 'drop_config'")?
-                .try_into()
-                .context("XDP map 'drop_config' has unexpected type")?;
-            set_drop_config(&mut drop_config, false)?;
-            let drop_config = pin_drop_config(interface, drop_config)?;
-            let stats = ebpf
-                .take_map("stats")
-                .context("missing XDP map 'stats'")?
-                .try_into()
-                .context("XDP map 'stats' has unexpected type")?;
-            let drop_events: PerfEventArray<MapData> = ebpf
-                .take_map("drop_events")
-                .context("missing XDP map 'drop_events'")?
-                .try_into()
-                .context("XDP map 'drop_events' has unexpected type")?;
-            pin_drop_events(interface, &drop_events)?;
+            let pin_dir = map_pin_dir(interface)?;
+            let pin_dir_existed = pin_dir.exists();
+            let mut dispatcher_loaded = false;
+            let attach_result = (|| -> Result<Self> {
+                prepare_map_pin_dir(&pin_dir)?;
+                let mut ebpf = load_object_with_pinned_maps(object_path, map_sizes, &pin_dir)?;
+                match attach_options.strategy {
+                    XdpAttachStrategy::Direct => {
+                        if attach_options.allow_replace {
+                            warn!(
+                                interface,
+                                "--xdp-allow-replace only bypasses the pre-attach safety check with the current Aya attach path; it does not force-replace an existing XDP program"
+                            );
+                        } else {
+                            ensure_no_existing_xdp(interface)?;
+                        }
+                        let program: &mut Xdp = ebpf
+                            .program_mut(program_name)
+                            .with_context(|| format!("XDP program '{program_name}' is missing"))?
+                            .try_into()
+                            .with_context(|| format!("program '{program_name}' is not XDP"))?;
+                        program.load().context("failed to load XDP program")?;
+                        attach_program(program, interface, attach_options.mode)?;
+                    }
+                    XdpAttachStrategy::Dispatcher => {
+                        unload_dispatcher_programs_by_name(
+                            &attach_options.loader_path,
+                            interface,
+                            program_name,
+                            false,
+                        )?;
+                        run_xdp_loader_load(
+                            interface,
+                            object_path,
+                            program_name,
+                            &attach_options,
+                            &pin_dir,
+                        )?;
+                        dispatcher_loaded = true;
+                    }
+                }
+                let mut maps = take_maps(&mut ebpf)?;
+                let actual_map_sizes = actual_map_sizes(&maps, map_sizes)?;
+                let mut drop_config = maps.drop_config;
+                set_drop_config(&mut drop_config, false)?;
+                maps.drop_config = drop_config;
+                info!(
+                    interface,
+                    strategy = %attach_options.strategy.as_str(),
+                    pin_dir = %pin_dir.display(),
+                    "XDP maps ready"
+                );
 
-            Ok(Self {
-                interface: interface.to_string(),
-                _ebpf: ebpf,
-                rule_cidrs,
-                geo_cidrs,
-                trusted_cidrs,
-                country_rules,
-                defense_policy,
-                custom_rate_limits,
-                temp_bans,
-                drop_config,
-                stats,
-                _drop_events: drop_events,
-                rule_keys: Vec::new(),
-                geo_keys: Vec::new(),
-                trusted_keys: Vec::new(),
-                country_keys: Vec::new(),
-                custom_rate_keys: Vec::new(),
-                temp_ban_keys: Vec::new(),
-                map_sizes,
-            })
+                Ok(Self {
+                    interface: interface.to_string(),
+                    _ebpf: ebpf,
+                    rule_cidrs: maps.rule_cidrs,
+                    geo_cidrs: maps.geo_cidrs,
+                    trusted_cidrs: maps.trusted_cidrs,
+                    country_rules: maps.country_rules,
+                    defense_policy: maps.defense_policy,
+                    custom_rate_limits: maps.custom_rate_limits,
+                    temp_bans: maps.temp_bans,
+                    drop_config: maps.drop_config,
+                    stats: maps.stats,
+                    _drop_events: maps.drop_events,
+                    rule_keys: Vec::new(),
+                    geo_keys: Vec::new(),
+                    trusted_keys: Vec::new(),
+                    country_keys: Vec::new(),
+                    custom_rate_keys: Vec::new(),
+                    temp_ban_keys: Vec::new(),
+                    map_sizes: actual_map_sizes,
+                })
+            })();
+            if let Err(err) = attach_result {
+                rollback_failed_attach(
+                    interface,
+                    program_name,
+                    &attach_options,
+                    &pin_dir,
+                    pin_dir_existed,
+                    dispatcher_loaded,
+                );
+                return Err(err);
+            }
+            attach_result
         }
 
         pub fn interface_name(&self) -> &str {
@@ -958,76 +1141,114 @@ mod linux {
         Ok(end)
     }
 
-    fn pin_drop_events(interface: &str, drop_events: &PerfEventArray<MapData>) -> Result<()> {
-        let path = drop_events_pin_path(interface);
-        let parent = path
-            .parent()
-            .context("drop_events pin path has no parent directory")?;
-        std::fs::create_dir_all(parent).with_context(|| {
+    fn prepare_map_pin_dir(pin_dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(&pin_dir).with_context(|| {
             format!(
-                "failed to create bpffs pin directory '{}'",
-                parent.display()
+                "failed to create bpffs map pin directory '{}'",
+                pin_dir.display()
             )
         })?;
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "failed to remove stale drop_events pin '{}'",
-                        path.display()
-                    )
-                });
-            }
-        }
-        drop_events
-            .pin(&path)
-            .with_context(|| format!("failed to pin drop_events map at '{}'", path.display()))?;
-        info!(path = %path.display(), "pinned XDP drop event map");
         Ok(())
     }
 
-    fn pin_drop_config(
-        interface: &str,
-        drop_config: AyaArray<MapData, DropConfigValue>,
-    ) -> Result<AyaArray<MapData, DropConfigValue>> {
-        let path = drop_config_pin_path(interface);
-        let parent = path
-            .parent()
-            .context("drop_config pin path has no parent directory")?;
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create bpffs pin directory '{}'",
-                parent.display()
-            )
-        })?;
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "failed to remove stale drop_config pin '{}'",
-                        path.display()
-                    )
-                });
-            }
-        }
-        drop_config
-            .pin(&path)
-            .with_context(|| format!("failed to pin drop_config map at '{}'", path.display()))?;
-        info!(path = %path.display(), "pinned XDP drop config map");
-        let map_data = MapData::from_pin(&path).with_context(|| {
-            format!(
-                "failed to reopen pinned drop_config map '{}'",
-                path.display()
-            )
-        })?;
-        Map::from_map_data(map_data)
-            .context("pinned drop_config path is not a supported BPF map")?
-            .try_into()
-            .context("pinned drop_config map has unexpected type")
+    fn actual_map_sizes(maps: &XdpMapBundle, requested: XdpMapSizes) -> Result<XdpMapSizes> {
+        Ok(XdpMapSizes {
+            rule_entries: map_max_entries("rule_cidrs", maps.rule_cidrs.map())?,
+            geo_entries: map_max_entries("geo_cidrs", maps.geo_cidrs.map())?,
+            trusted_entries: map_max_entries("trusted_cidrs", maps.trusted_cidrs.map())?,
+            country_entries: map_max_entries("country_rules", maps.country_rules.map())?,
+            rate_entries: requested.rate_entries,
+            custom_rate_limit_entries: map_max_entries(
+                "custom_rate_limits",
+                maps.custom_rate_limits.map(),
+            )?,
+            temp_ban_entries: map_max_entries("temp_bans", maps.temp_bans.map())?,
+        })
+    }
+
+    fn map_max_entries(name: &str, map: &MapData) -> Result<u32> {
+        let info = map
+            .info()
+            .with_context(|| format!("failed to inspect XDP map '{name}'"))?;
+        Ok(info.max_entries())
+    }
+
+    fn load_object_with_pinned_maps(
+        object_path: &str,
+        map_sizes: XdpMapSizes,
+        pin_dir: &Path,
+    ) -> Result<Ebpf> {
+        let drop_event_entries = possible_cpu_map_entries()
+            .context("failed to detect possible CPUs for drop_events map sizing")?;
+        let mut loader = EbpfLoader::new();
+        loader
+            .default_map_pin_directory(pin_dir)
+            .map_max_entries("rule_cidrs", map_sizes.rule_entries)
+            .map_max_entries("geo_cidrs", map_sizes.geo_entries)
+            .map_max_entries("trusted_cidrs", map_sizes.trusted_entries)
+            .map_max_entries("country_rules", map_sizes.country_entries)
+            .map_max_entries("rate_buckets", map_sizes.rate_entries)
+            .map_max_entries("custom_rate_limits", map_sizes.custom_rate_limit_entries)
+            .map_max_entries("temp_bans", map_sizes.temp_ban_entries)
+            .map_max_entries("drop_events", drop_event_entries);
+        loader
+            .load_file(object_path)
+            .with_context(|| format!("failed to load XDP object '{object_path}'"))
+    }
+
+    fn take_maps(ebpf: &mut Ebpf) -> Result<XdpMapBundle> {
+        Ok(XdpMapBundle {
+            rule_cidrs: ebpf
+                .take_map("rule_cidrs")
+                .context("missing XDP map 'rule_cidrs'")?
+                .try_into()
+                .context("XDP map 'rule_cidrs' has unexpected type")?,
+            geo_cidrs: ebpf
+                .take_map("geo_cidrs")
+                .context("missing XDP map 'geo_cidrs'")?
+                .try_into()
+                .context("XDP map 'geo_cidrs' has unexpected type")?,
+            trusted_cidrs: ebpf
+                .take_map("trusted_cidrs")
+                .context("missing XDP map 'trusted_cidrs'")?
+                .try_into()
+                .context("XDP map 'trusted_cidrs' has unexpected type")?,
+            country_rules: ebpf
+                .take_map("country_rules")
+                .context("missing XDP map 'country_rules'")?
+                .try_into()
+                .context("XDP map 'country_rules' has unexpected type")?,
+            defense_policy: ebpf
+                .take_map("defense_policy")
+                .context("missing XDP map 'defense_policy'")?
+                .try_into()
+                .context("XDP map 'defense_policy' has unexpected type")?,
+            custom_rate_limits: ebpf
+                .take_map("custom_rate_limits")
+                .context("missing XDP map 'custom_rate_limits'")?
+                .try_into()
+                .context("XDP map 'custom_rate_limits' has unexpected type")?,
+            temp_bans: ebpf
+                .take_map("temp_bans")
+                .context("missing XDP map 'temp_bans'")?
+                .try_into()
+                .context("XDP map 'temp_bans' has unexpected type")?,
+            drop_config: ebpf
+                .take_map("drop_config")
+                .context("missing XDP map 'drop_config'")?
+                .try_into()
+                .context("XDP map 'drop_config' has unexpected type")?,
+            stats: ebpf
+                .take_map("stats")
+                .context("missing XDP map 'stats'")?
+                .try_into()
+                .context("XDP map 'stats' has unexpected type")?,
+            drop_events: ebpf
+                .take_map("drop_events")
+                .context("missing XDP map 'drop_events'")?
+                .try_into()
+                .context("XDP map 'drop_events' has unexpected type")?,
+        })
     }
 
     fn attach_program(
@@ -1065,6 +1286,475 @@ mod linux {
             }
         }
         Ok(())
+    }
+
+    fn run_xdp_loader_load(
+        interface: &str,
+        object_path: &str,
+        program_name: &str,
+        options: &XdpAttachOptions,
+        pin_dir: &Path,
+    ) -> Result<()> {
+        match options.mode {
+            XdpAttachMode::Auto => {
+                if let Err(driver_err) = run_xdp_loader_load_mode(
+                    interface,
+                    object_path,
+                    program_name,
+                    options,
+                    pin_dir,
+                    "native",
+                ) {
+                    info!(
+                        interface,
+                        error = %driver_err,
+                        "dispatcher native XDP attach unavailable; using skb mode"
+                    );
+                    run_xdp_loader_load_mode(
+                        interface,
+                        object_path,
+                        program_name,
+                        options,
+                        pin_dir,
+                        "skb",
+                    )
+                    .with_context(|| {
+                        format!(
+                            "dispatcher native XDP attach failed ({driver_err:#}); skb attach failed"
+                        )
+                    })?;
+                    info!(interface, mode = "skb", "XDP dispatcher program attached");
+                } else {
+                    info!(
+                        interface,
+                        mode = "native",
+                        "XDP dispatcher program attached"
+                    );
+                }
+            }
+            XdpAttachMode::Driver => {
+                run_xdp_loader_load_mode(
+                    interface,
+                    object_path,
+                    program_name,
+                    options,
+                    pin_dir,
+                    "native",
+                )?;
+                info!(
+                    interface,
+                    mode = "native",
+                    "XDP dispatcher program attached"
+                );
+            }
+            XdpAttachMode::Skb => {
+                run_xdp_loader_load_mode(
+                    interface,
+                    object_path,
+                    program_name,
+                    options,
+                    pin_dir,
+                    "skb",
+                )?;
+                info!(interface, mode = "skb", "XDP dispatcher program attached");
+            }
+        }
+        Ok(())
+    }
+
+    fn run_xdp_loader_load_mode(
+        interface: &str,
+        object_path: &str,
+        program_name: &str,
+        options: &XdpAttachOptions,
+        pin_dir: &Path,
+        mode: &str,
+    ) -> Result<()> {
+        let pin_dir = pin_dir
+            .to_str()
+            .context("XDP map pin directory is not valid UTF-8")?;
+        let priority = options.run_priority.to_string();
+        let output = std::process::Command::new(&options.loader_path)
+            .args([
+                "load",
+                "--mode",
+                mode,
+                "--pin-path",
+                pin_dir,
+                "--prog-name",
+                program_name,
+                "--prio",
+                &priority,
+                interface,
+                object_path,
+            ])
+            .output()
+            .with_context(|| {
+                format!(
+                    "failed to execute xdp-loader '{}' for dispatcher attach",
+                    options.loader_path
+                )
+            })?;
+        if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "xdp-loader dispatcher attach failed in {mode} mode: status={} stdout='{}' stderr='{}'",
+                output.status,
+                stdout.trim(),
+                stderr.trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn dispatcher_unload_inner(
+        interface: &str,
+        loader_path: &str,
+        program_id: Option<u32>,
+        all: bool,
+        remove_pins: bool,
+        clean: bool,
+        verbose: u8,
+        tolerate_missing: bool,
+    ) -> Result<()> {
+        if !all && program_id.is_none() {
+            bail!("xdp unload/replace requires either --all or --id <program-id>");
+        }
+        if remove_pins && !all {
+            bail!(
+                "--remove-pins requires --all so pinned maps are not removed while another dispatcher program may still use them"
+            );
+        }
+        let mut args = xdp_loader_verbose_args(verbose, ["unload"]);
+        if all {
+            args.push("--all".to_string());
+        } else if let Some(id) = program_id {
+            args.push("--id".to_string());
+            args.push(id.to_string());
+        }
+        args.push(interface.to_string());
+        let output = run_xdp_loader_command(loader_path, args)
+            .with_context(|| format!("failed to run xdp-loader unload for '{interface}'"))?;
+        print_command_output(&output);
+        if let Err(err) = ensure_success("xdp-loader unload", &output) {
+            if tolerate_missing && is_no_dispatcher_output(&output) {
+                debug!(
+                    interface,
+                    error = %err,
+                    "dispatcher unload found no matching program; continuing"
+                );
+            } else {
+                return Err(err);
+            }
+        }
+
+        if clean {
+            let mut clean_args = xdp_loader_verbose_args(verbose, ["clean"]);
+            clean_args.push(interface.to_string());
+            let clean_output = run_xdp_loader_command(loader_path, clean_args)
+                .with_context(|| format!("failed to run xdp-loader clean for '{interface}'"))?;
+            print_command_output(&clean_output);
+            ensure_success("xdp-loader clean", &clean_output)?;
+        }
+
+        if remove_pins {
+            remove_map_pin_dir(&interface)?;
+        }
+        println!("dispatcher unload completed interface={interface}");
+        Ok(())
+    }
+
+    fn remove_map_pin_dir(interface: &str) -> Result<()> {
+        let pin_dir = map_pin_dir(interface)?;
+        match std::fs::remove_dir_all(&pin_dir) {
+            Ok(()) => {
+                println!("removed pinned map directory {}", pin_dir.display());
+                Ok(())
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err).with_context(|| {
+                format!(
+                    "failed to remove pinned map directory '{}'",
+                    pin_dir.display()
+                )
+            }),
+        }
+    }
+
+    fn require_explicit_interface(configured: Option<&str>, message: &str) -> Result<String> {
+        let Some(interface) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+            bail!("{message}");
+        };
+        resolve_interface_name(Some(interface))
+    }
+
+    fn rollback_failed_attach(
+        interface: &str,
+        program_name: &str,
+        attach_options: &XdpAttachOptions,
+        pin_dir: &Path,
+        pin_dir_existed: bool,
+        dispatcher_loaded: bool,
+    ) {
+        if dispatcher_loaded {
+            if let Err(err) = unload_dispatcher_programs_by_name(
+                &attach_options.loader_path,
+                interface,
+                program_name,
+                true,
+            ) {
+                warn!(
+                    interface,
+                    program = program_name,
+                    error = %err,
+                    "failed to roll back dispatcher program after attach failure"
+                );
+            }
+        }
+        if !pin_dir_existed {
+            match std::fs::remove_dir_all(pin_dir) {
+                Ok(()) => {
+                    debug!(pin_dir = %pin_dir.display(), "removed pin directory after attach failure");
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    warn!(
+                        pin_dir = %pin_dir.display(),
+                        error = %err,
+                        "failed to remove pin directory after attach failure"
+                    );
+                }
+            }
+        }
+    }
+
+    fn unload_dispatcher_programs_by_name(
+        loader_path: &str,
+        interface: &str,
+        program_name: &str,
+        tolerate_missing: bool,
+    ) -> Result<()> {
+        let ids = dispatcher_program_ids_by_name(loader_path, interface, program_name)?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        info!(
+            interface,
+            program = program_name,
+            count = ids.len(),
+            "unloading existing dispatcher program before attach"
+        );
+        for id in ids {
+            let output = run_xdp_loader_command(
+                loader_path,
+                vec![
+                    "unload".to_string(),
+                    "--id".to_string(),
+                    id.to_string(),
+                    interface.to_string(),
+                ],
+            )
+            .with_context(|| {
+                format!("failed to run xdp-loader unload --id {id} for '{interface}'")
+            })?;
+            print_command_output(&output);
+            if let Err(err) = ensure_success("xdp-loader unload --id", &output) {
+                if tolerate_missing && is_no_dispatcher_output(&output) {
+                    debug!(
+                        interface,
+                        program = program_name,
+                        id,
+                        error = %err,
+                        "dispatcher program was already gone during cleanup"
+                    );
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn dispatcher_program_ids_by_name(
+        loader_path: &str,
+        interface: &str,
+        program_name: &str,
+    ) -> Result<Vec<u32>> {
+        let output = run_xdp_loader_command(loader_path, vec!["status".to_string()])
+            .with_context(|| "failed to run xdp-loader status before dispatcher attach")?;
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "xdp-loader status failed before dispatcher attach: status={} stdout='{}' stderr='{}'",
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        parse_dispatcher_program_ids(&stdout, interface, program_name)
+    }
+
+    fn parse_dispatcher_program_ids(
+        text: &str,
+        interface: &str,
+        program_name: &str,
+    ) -> Result<Vec<u32>> {
+        let mut ids = Vec::new();
+        let mut matched_without_id = false;
+        let mut current_interface_matches = false;
+        for line in text.lines() {
+            let tokens = line.split_whitespace().collect::<Vec<_>>();
+            if tokens.is_empty() {
+                continue;
+            }
+            if tokens[0] == interface {
+                current_interface_matches = true;
+            } else if !line.chars().next().is_some_and(|ch| ch.is_whitespace()) {
+                current_interface_matches = false;
+            }
+            if !current_interface_matches || !tokens.iter().any(|token| *token == program_name) {
+                continue;
+            }
+            if let Some(id) = parse_status_program_id(&tokens, program_name) {
+                ids.push(id);
+            } else {
+                matched_without_id = true;
+            }
+        }
+        if matched_without_id {
+            bail!(
+                "xdp-loader status showed program '{program_name}' on interface '{interface}' but no program id could be parsed; refusing dispatcher attach to avoid duplicate loads"
+            );
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    fn parse_status_program_id(tokens: &[&str], program_name: &str) -> Option<u32> {
+        for window in tokens.windows(2) {
+            let key = window[0].trim_end_matches(':');
+            if key.eq_ignore_ascii_case("id") {
+                if let Some(id) = parse_u32_token(window[1]) {
+                    return Some(id);
+                }
+            }
+        }
+        let program_index = tokens.iter().position(|token| *token == program_name)?;
+        tokens
+            .iter()
+            .skip(program_index + 1)
+            .find_map(|token| parse_u32_token(token))
+    }
+
+    fn parse_u32_token(value: &str) -> Option<u32> {
+        value
+            .trim_matches(|ch: char| !ch.is_ascii_digit())
+            .parse::<u32>()
+            .ok()
+    }
+
+    fn is_no_dispatcher_output(output: &std::process::Output) -> bool {
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .to_ascii_lowercase();
+        text.contains("no xdp")
+            || text.contains("no program")
+            || text.contains("not found")
+            || text.contains("no such")
+            || text.contains("nothing")
+    }
+
+    fn xdp_loader_verbose_args<const N: usize>(verbose: u8, args: [&str; N]) -> Vec<String> {
+        let mut values = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+        for _ in 0..verbose {
+            values.push("--verbose".to_string());
+        }
+        values
+    }
+
+    fn run_xdp_loader_command(
+        loader_path: &str,
+        args: Vec<String>,
+    ) -> Result<std::process::Output> {
+        std::process::Command::new(loader_path)
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to execute xdp-loader '{loader_path}'"))
+    }
+
+    fn print_command_output(output: &std::process::Output) {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stdout.trim().is_empty() {
+            println!("{}", stdout.trim_end());
+        }
+        if !stderr.trim().is_empty() {
+            eprintln!("{}", stderr.trim_end());
+        }
+    }
+
+    fn ensure_success(command: &str, output: &std::process::Output) -> Result<()> {
+        if output.status.success() {
+            return Ok(());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "{command} failed: status={} stdout='{}' stderr='{}'",
+            output.status,
+            stdout.trim(),
+            stderr.trim()
+        )
+    }
+
+    fn ensure_no_existing_xdp(interface: &str) -> Result<()> {
+        if let Some(existing) = existing_xdp_summary(interface)? {
+            bail!(
+                "interface '{interface}' already has an XDP program attached ({existing}); refusing to replace it in direct mode. Use --xdp-allow-replace to replace intentionally, or use --xdp-attach-strategy dispatcher to join the libxdp multiprogram chain"
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn existing_xdp_summary(interface: &str) -> Result<Option<String>> {
+        let output = std::process::Command::new("ip")
+            .args(["-details", "link", "show", "dev", interface])
+            .output()
+            .with_context(|| format!("failed to inspect interface '{interface}' with ip"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "failed to inspect interface '{interface}': {}",
+                stderr.trim()
+            );
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let text = stdout.trim();
+        let has_xdp = text.contains(" xdp ")
+            || text.contains(" xdpgeneric ")
+            || text.contains(" xdpdrv ")
+            || text.contains(" xdpoffload ")
+            || text.contains("prog/xdp");
+        if !has_xdp {
+            return Ok(None);
+        }
+        let summary = text
+            .lines()
+            .map(str::trim)
+            .find(|line| {
+                line.contains("xdp")
+                    || line.contains("prog/xdp")
+                    || line.contains("id ")
+                    || line.contains("tag ")
+            })
+            .unwrap_or("xdp program present")
+            .to_string();
+        Ok(Some(summary))
     }
 
     fn rule_key(addr: IpAddr, prefix: u8, protocol: L4Protocol, port: u16) -> RuleKey {
@@ -1183,5 +1873,22 @@ mod linux {
             .checked_mul(1_000_000_000)
             .and_then(|value| value.checked_add(nanos))
             .context("CLOCK_MONOTONIC value overflowed")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pin_component_allows_vlan_interface_names() {
+        assert_eq!(sanitize_pin_component("eth0.10").unwrap(), "eth0.10");
+    }
+
+    #[test]
+    fn pin_component_rejects_path_components() {
+        for value in ["", " ", ".", ".."] {
+            assert!(sanitize_pin_component(value).is_err());
+        }
     }
 }

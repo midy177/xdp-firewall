@@ -44,8 +44,9 @@ async fn stream_drop_events(args: MonitorArgs) -> Result<()> {
         .drop_events_path
         .clone()
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| xdp::drop_events_pin_path(&interface));
-    let config_path = xdp::drop_config_pin_path(&interface);
+        .map(Ok)
+        .unwrap_or_else(|| xdp::drop_events_pin_path(&interface))?;
+    let config_path = xdp::drop_config_pin_path(&interface)?;
     drop_monitor::stream(events_path, Some(config_path), args.json).await
 }
 
@@ -95,6 +96,11 @@ impl MonitorSample {
                 self.host.carrier.as_deref().unwrap_or("unknown")
             ),
             format!("bpffs_mounted={}", self.host.bpffs_mounted),
+            format!("xdp_attached={}", self.host.xdp_attached),
+            format!(
+                "xdp_summary={}",
+                quote_value(self.host.xdp_summary.as_deref().unwrap_or("-"))
+            ),
             format!("agent_only={}", self.host.agent_only),
             format!("database_url_present={}", self.host.database_url_present),
             format!("local_db_file_present={}", self.host.local_db_file_present),
@@ -534,6 +540,8 @@ struct HostSnapshot {
     operstate: Option<String>,
     mtu: Option<String>,
     carrier: Option<String>,
+    xdp_attached: bool,
+    xdp_summary: Option<String>,
     bpffs_mounted: bool,
     agent_only: bool,
     database_url_present: bool,
@@ -543,10 +551,16 @@ struct HostSnapshot {
 
 impl HostSnapshot {
     fn load(interface: &str) -> Self {
+        let (xdp_attached, xdp_summary) = match xdp::existing_xdp_summary(interface) {
+            Ok(summary) => (summary.is_some(), summary),
+            Err(err) => (false, Some(format!("unknown ({})", public_error(&err)))),
+        };
         Self {
             operstate: read_trimmed(format!("/sys/class/net/{interface}/operstate")),
             mtu: read_trimmed(format!("/sys/class/net/{interface}/mtu")),
             carrier: read_trimmed(format!("/sys/class/net/{interface}/carrier")),
+            xdp_attached,
+            xdp_summary,
             bpffs_mounted: bpffs_mounted(),
             agent_only: env_flag("XDP_FIREWALL_AGENT_ONLY"),
             database_url_present: std::env::var("DATABASE_URL")
@@ -557,6 +571,15 @@ impl HostSnapshot {
             xdp_firewall_processes: count_xdp_firewall_processes(),
         }
     }
+}
+
+fn quote_value(value: &str) -> String {
+    if value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':' | b'/' | b'=')
+    }) {
+        return value.to_string();
+    }
+    serde_json::to_string(value).unwrap_or_else(|_| "\"<invalid>\"".to_string())
 }
 
 fn env_flag(key: &str) -> bool {

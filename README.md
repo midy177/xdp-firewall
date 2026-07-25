@@ -329,6 +329,37 @@ XDP attach mode is selected with `--xdp-mode` or `XDP_FIREWALL_XDP_MODE`:
 - `driver` requires native XDP and fails startup if it cannot attach.
 - `skb` skips native XDP and attaches generic XDP directly. Use this on AWS ENA instances that keep jumbo MTU enabled and report `current MTU is larger than the maximum allowed MTU`.
 
+XDP attach strategy is selected with `--xdp-attach-strategy` or `XDP_FIREWALL_XDP_ATTACH_STRATEGY`:
+
+- `direct` is the default. The agent loads the Aya-owned XDP object and updates its maps directly. In this mode startup refuses to attach when the interface already has an XDP program, so an existing program is not replaced accidentally.
+- `--xdp-allow-replace` / `XDP_FIREWALL_XDP_ALLOW_REPLACE=true` only bypasses the pre-attach safety check in direct mode. With the current Aya attach path it does not force-replace an existing XDP program; use dispatcher mode for shared interfaces.
+- `dispatcher` uses `xdp-loader`/libxdp multiprogram attach. The agent creates or reuses pinned maps under `/sys/fs/bpf/xdp-firewall/<interface>`, unloads an existing dispatcher entry with the same program name on the same interface, runs `xdp-loader load --pin-path ... --prog-name ... --prio ...`, and then updates those same live maps. Lower `--xdp-run-priority` values run earlier in the dispatcher chain; the default is `10`.
+- Dispatcher mode requires `xdp-loader` from `xdp-tools` in the agent image or host. The provided Dockerfile installs it.
+- Dispatcher attachments are owned by libxdp/xdp-loader, so they are not automatically detached when the agent process exits. Use `xdp-loader status` and `xdp-loader unload` for manual dispatcher cleanup.
+- `xdp-firewall monitor` prints `xdp_attached` and `xdp_summary` to help detect an existing XDP attachment before starting the agent.
+- Interface names used for bpffs pin paths are sanitized and cannot be empty, `.`, or `..`; VLAN-style names such as `eth0.10` remain valid.
+
+Dispatcher lifecycle commands are available through `xdp-firewall xdp`:
+
+```bash
+# Show interface XDP state plus xdp-loader's dispatcher table.
+xdp-firewall xdp status --interface ens5
+
+# Unload every dispatcher program from the interface. Pinned policy maps are kept by default.
+xdp-firewall xdp unload --interface ens5 --all --clean
+
+# Unload all dispatcher programs and remove pinned policy maps.
+xdp-firewall xdp unload --interface ens5 --all --remove-pins --clean
+
+# Replace the dispatcher-managed xdp-firewall program while keeping pinned maps and policy state.
+xdp-firewall xdp replace --interface ens5 --xdp-object /usr/local/share/xdp-firewall/xdp_firewall.o --program xdp_firewall --xdp-run-priority 10
+
+# Replace one program ID from `xdp-firewall xdp status`.
+xdp-firewall xdp replace --interface ens5 --id 55
+```
+
+`unload` always requires an explicit `--interface` plus either `--all` or `--id <program-id>` so removal is intentional. `replace` also requires an explicit `--interface`; `--all` or `--id` are optional and only needed when you want an explicit pre-unload step before the new dispatcher attach. The normal replace path unloads existing entries with the same program name before loading the new one. `--all` removes every dispatcher-managed XDP program on that interface, not just xdp-firewall; prefer `--id` when replacing only one program in a shared chain. `--remove-pins` is accepted only with `--all`, because pinned maps may still be used by another dispatcher program when only one program ID is removed.
+
 ## XDP Map Sizing
 
 The BPF object has conservative built-in defaults, and the agent can override map capacities before loading the object with Aya:
@@ -340,6 +371,8 @@ The BPF object has conservative built-in defaults, and the agent can override ma
 - `--rate-map-entries` / `XDP_FIREWALL_RATE_MAP_ENTRIES`, default `1048576`.
 - `--custom-rate-limit-map-entries` / `XDP_FIREWALL_CUSTOM_RATE_LIMIT_MAP_ENTRIES`, default `4096`.
 - `--temp-ban-map-entries` / `XDP_FIREWALL_TEMP_BAN_MAP_ENTRIES`, default `4096`.
+
+When dispatcher mode reuses existing pinned maps, the kernel keeps the old map capacities. The agent reads the real pinned-map capacities after attach and validates future policy updates against those real values, not just the requested CLI/env values. To increase capacity for an existing dispatcher deployment, run an explicit unload with `--remove-pins` during a controlled maintenance window so the next attach can create fresh maps.
 
 Default capacity and approximate key/value payload:
 
