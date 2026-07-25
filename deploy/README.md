@@ -47,6 +47,8 @@ curl -X POST http://127.0.0.1:8080/policy/seed-example \
 
 The API control-plane service writes configuration to the database and also exposes gRPC xDS on port `50051`. Agents subscribe to that xDS endpoint. The agent service uses host networking, privileged mode, and `/sys/fs/bpf` from the host so XDP can attach to the selected network interface. Agents do not need database credentials.
 
+The SQLite and PostgreSQL Compose templates start `api` first and start `agent` only after the API healthcheck passes. This is implemented with `depends_on: condition: service_healthy`. The standalone `compose.agent.yml` template points at an external control plane, so startup ordering must be handled outside that file.
+
 Run `xdp-firewall policy show` only in the API/control-plane container or in a shell that has the same `DATABASE_URL`. The agent container intentionally does not receive database credentials and sets `XDP_FIREWALL_AGENT_ONLY=true`, so control-plane database commands are rejected inside agent containers. To inspect the live policy through the control plane, use:
 
 ```bash
