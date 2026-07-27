@@ -159,7 +159,7 @@ When enabled, the control plane reads the Kubernetes API with its service accoun
 - `networking.k8s.io/v1 ServiceCIDR` ranges when the API is available.
 - Existing Service `clusterIP/clusterIPs` as a partial fallback when `ServiceCIDR` is not available.
 
-Discovered CIDRs are cached in the control plane and merged into the xDS snapshot before it is sent to agents. The cache refreshes no more often than the xDS push interval, and discovery failures fall back to the last successful discovery plus static runtime CIDRs instead of interrupting policy delivery. They are not persisted and are not shown as API/frontend-managed whitelist rows.
+Discovered CIDRs are cached in the control plane and merged into the xDS snapshot before it is sent to agents. The control plane performs one initial Kubernetes list, then uses Kubernetes watch streams for Nodes plus ServiceCIDR or Services fallback changes; it does not poll Kubernetes on every xDS push tick. Discovery failures fall back to the last successful discovery plus static runtime CIDRs instead of interrupting policy delivery. They are not persisted and are not shown as API/frontend-managed whitelist rows.
 
 ## Enforcement Priority
 

@@ -59,10 +59,11 @@
 - [completed] Inject discovered Kubernetes node IPs, Pod CIDRs, and Service CIDRs as runtime-only trusted CIDRs immediately before xDS policy snapshots are sent to agents.
 - [completed] Keep Kubernetes-discovered trusted CIDRs out of the policy database; they must be recomputed from Kubernetes state and only exist in the xDS-delivered snapshot.
 - [completed] Change `api/xds --trusted-cidr` and `XDP_FIREWALL_TRUSTED_CIDRS` to runtime-only xDS whitelist injection; do not persist CLI/env trusted CIDRs into the database.
-- [completed] Add Kubernetes RBAC for discovery: `nodes` get/list, `services` get/list fallback, and `networking.k8s.io/servicecidrs` get/list when supported.
+- [completed] Add Kubernetes RBAC for discovery: `nodes`, `services`, and `networking.k8s.io/servicecidrs` get/list/watch so the control plane can initialize from list calls and then maintain runtime CIDRs through Kubernetes watch streams.
 - [completed] Add fallback behavior for clusters without `ServiceCIDR`: collect existing Service `clusterIP/clusterIPs` as partial runtime whitelist entries and expose/log that Service CIDR discovery is partial.
 - [completed] Add shared control-plane Kubernetes discovery caching so each agent stream does not list Kubernetes resources independently on every xDS tick.
 - [completed] Keep xDS policy delivery running when Kubernetes discovery fails by reusing cached/static runtime trusted CIDRs and logging the discovery error.
+- [completed] Replace Kubernetes runtime discovery polling with initial list plus Kubernetes watch streams for Nodes and ServiceCIDR/Services fallback changes; xDS ticks now read the cached runtime CIDR set instead of actively fetching Kubernetes resources.
 - [completed] Treat forbidden `ServiceCIDR` reads like unavailable ServiceCIDR and fall back to existing Service `clusterIP/clusterIPs`.
 - [completed] Add realtime Drop filtering by node: frontend/API can subscribe to all nodes or one node, and xDS only enables Drop reporting on matching agents.
 - [completed] Keep the Kubernetes API/control-plane deployment single-replica by default because realtime Drop subscriptions are process-local until a shared pub/sub backend is added.

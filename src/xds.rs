@@ -22,10 +22,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataMap;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const TEMP_BAN_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const GEO_IP_REFRESH_INTERVAL: Duration = Duration::from_secs(86_400);
+const K8S_WATCH_TIMEOUT: Duration = Duration::from_secs(300);
+const K8S_WATCH_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 pub mod proto {
     tonic::include_proto!("xdp_firewall.xds.v1");
@@ -367,26 +369,22 @@ fn normalize_drop_node_filter(node_id: Option<String>) -> Option<String> {
 struct RuntimeTrustedCidrs {
     configured: Vec<IpNet>,
     k8s_discovery: Option<k8s::KubernetesDiscovery>,
-    cache_ttl: Duration,
     cache: Arc<Mutex<K8sDiscoveryCache>>,
 }
 
 #[derive(Default)]
 struct K8sDiscoveryCache {
     cidrs: Vec<IpNet>,
-    fetched_at: Option<Instant>,
+    initialized: bool,
+    service_cidr_partial: bool,
+    last_refresh_failed: bool,
 }
 
 impl RuntimeTrustedCidrs {
-    fn new(
-        configured: Vec<IpNet>,
-        k8s_discovery: Option<k8s::KubernetesDiscovery>,
-        cache_ttl: Duration,
-    ) -> Self {
+    fn new(configured: Vec<IpNet>, k8s_discovery: Option<k8s::KubernetesDiscovery>) -> Self {
         Self {
             configured,
             k8s_discovery,
-            cache_ttl,
             cache: Arc::new(Mutex::new(K8sDiscoveryCache::default())),
         }
     }
@@ -404,11 +402,11 @@ impl RuntimeTrustedCidrs {
             }
         }
 
-        let Some(discovery) = self.k8s_discovery.as_ref() else {
+        if self.k8s_discovery.is_none() {
             return cidrs;
-        };
-        let discovered = self.cached_k8s_cidrs(discovery).await;
-        for cidr in discovered {
+        }
+        let cached = self.cache.lock().await.cidrs.clone();
+        for cidr in cached {
             if seen.insert(cidr) {
                 cidrs.push(cidr);
             }
@@ -416,37 +414,179 @@ impl RuntimeTrustedCidrs {
         cidrs
     }
 
-    async fn cached_k8s_cidrs(&self, discovery: &k8s::KubernetesDiscovery) -> Vec<IpNet> {
-        let mut cache = self.cache.lock().await;
-        if cache
-            .fetched_at
-            .is_some_and(|fetched_at| fetched_at.elapsed() < self.cache_ttl)
-        {
-            return cache.cidrs.clone();
+    async fn initial_refresh(&self) {
+        let Some(discovery) = self.k8s_discovery.as_ref() else {
+            return;
+        };
+        if let Err(err) = refresh_k8s_discovery_cache(&self.cache, discovery, "initial").await {
+            warn!(
+                error = %err,
+                "initial Kubernetes runtime address discovery failed; continuing with static runtime trusted CIDRs"
+            );
         }
+    }
 
-        match discovery.discover().await {
-            Ok(discovered) => {
-                if discovered.service_cidr_partial {
+    fn spawn_watch(&self) {
+        let Some(discovery) = self.k8s_discovery.clone() else {
+            return;
+        };
+        let cache = self.cache.clone();
+        tokio::spawn(async move {
+            run_k8s_discovery_watch(cache, discovery).await;
+        });
+    }
+}
+
+async fn run_k8s_discovery_watch(
+    cache: Arc<Mutex<K8sDiscoveryCache>>,
+    discovery: k8s::KubernetesDiscovery,
+) {
+    loop {
+        let watch_services = {
+            let cache = cache.lock().await;
+            cache.service_cidr_partial
+        };
+        let outcome = wait_for_k8s_watch_change(discovery.clone(), watch_services).await;
+        match outcome {
+            Ok(true) => {
+                if let Err(err) =
+                    refresh_k8s_discovery_cache(&cache, &discovery, "watch-change").await
+                {
+                    mark_k8s_discovery_failed(&cache).await;
                     warn!(
-                        service_entries = discovered.service_cidrs,
-                        "Kubernetes ServiceCIDR API is unavailable; using existing Service ClusterIPs as partial runtime whitelist"
+                        error = %err,
+                        "Kubernetes runtime address discovery failed after watch event; keeping last cached runtime trusted CIDRs"
                     );
                 }
-                cache.cidrs = discovered.cidrs;
-                cache.fetched_at = Some(Instant::now());
-                cache.cidrs.clone()
             }
+            Ok(false) => {}
             Err(err) => {
+                mark_k8s_discovery_failed(&cache).await;
                 warn!(
                     error = %err,
-                    stale_entries = cache.cidrs.len(),
-                    "Kubernetes runtime address discovery failed; continuing xDS policy delivery with cached/static runtime trusted CIDRs"
+                    retry_seconds = K8S_WATCH_RECONNECT_DELAY.as_secs(),
+                    "Kubernetes watch failed; keeping last cached runtime trusted CIDRs before reconnect"
                 );
-                cache.cidrs.clone()
+                tokio::time::sleep(K8S_WATCH_RECONNECT_DELAY).await;
             }
         }
     }
+}
+
+async fn wait_for_k8s_watch_change(
+    discovery: k8s::KubernetesDiscovery,
+    watch_services: bool,
+) -> Result<bool> {
+    let (tx, mut rx) = mpsc::channel(4);
+    let mut handles = Vec::new();
+    for (label, path) in k8s_watch_targets(watch_services) {
+        let tx = tx.clone();
+        let discovery = discovery.clone();
+        handles.push(tokio::spawn(async move {
+            let result = discovery
+                .watch_until_change(path, label, K8S_WATCH_TIMEOUT)
+                .await;
+            let _ = tx.send((label, result)).await;
+        }));
+    }
+    drop(tx);
+    let mut unsupported = 0_usize;
+    while let Some((label, result)) = rx.recv().await {
+        match result {
+            Ok(k8s::KubernetesWatchOutcome::Changed) => {
+                debug!(
+                    label,
+                    "Kubernetes watch observed a runtime CIDR source change"
+                );
+                for handle in handles {
+                    handle.abort();
+                }
+                return Ok(true);
+            }
+            Ok(k8s::KubernetesWatchOutcome::Ended) => {
+                debug!(label, "Kubernetes watch stream ended; reconnecting");
+                for handle in handles {
+                    handle.abort();
+                }
+                return Ok(false);
+            }
+            Ok(k8s::KubernetesWatchOutcome::Unsupported) => {
+                unsupported += 1;
+                debug!(label, "Kubernetes watch target is unsupported");
+                if unsupported == handles.len() {
+                    bail!("all Kubernetes watch targets are unsupported");
+                }
+            }
+            Err(err) => {
+                for handle in handles {
+                    handle.abort();
+                }
+                return Err(err).with_context(|| format!("Kubernetes watch '{label}' failed"));
+            }
+        }
+    }
+    bail!("all Kubernetes watch streams ended without a change notification")
+}
+
+fn k8s_watch_targets(watch_services: bool) -> &'static [(&'static str, &'static str)] {
+    if watch_services {
+        &[("nodes", "/api/v1/nodes"), ("services", "/api/v1/services")]
+    } else {
+        &[
+            ("nodes", "/api/v1/nodes"),
+            ("servicecidrs", "/apis/networking.k8s.io/v1/servicecidrs"),
+        ]
+    }
+}
+
+async fn refresh_k8s_discovery_cache(
+    cache: &Arc<Mutex<K8sDiscoveryCache>>,
+    discovery: &k8s::KubernetesDiscovery,
+    reason: &'static str,
+) -> Result<()> {
+    let discovered = discovery.discover().await?;
+    let mut cache = cache.lock().await;
+    let first = !cache.initialized;
+    let changed = cache.cidrs != discovered.cidrs;
+    let recovered = cache.last_refresh_failed;
+    if discovered.service_cidr_partial {
+        warn!(
+            service_entries = discovered.service_cidrs,
+            "Kubernetes ServiceCIDR API is unavailable; using existing Service ClusterIPs as partial runtime whitelist"
+        );
+    }
+    if first || changed || recovered {
+        info!(
+            reason,
+            node_ips = discovered.node_ips,
+            pod_cidrs = discovered.pod_cidrs,
+            service_cidrs = discovered.service_cidrs,
+            service_cidr_partial = discovered.service_cidr_partial,
+            total = discovered.cidrs.len(),
+            changed,
+            recovered,
+            "refreshed Kubernetes runtime trusted CIDRs"
+        );
+    } else {
+        debug!(
+            reason,
+            node_ips = discovered.node_ips,
+            pod_cidrs = discovered.pod_cidrs,
+            service_cidrs = discovered.service_cidrs,
+            service_cidr_partial = discovered.service_cidr_partial,
+            total = discovered.cidrs.len(),
+            "Kubernetes runtime trusted CIDRs unchanged"
+        );
+    }
+    cache.cidrs = discovered.cidrs;
+    cache.initialized = true;
+    cache.service_cidr_partial = discovered.service_cidr_partial;
+    cache.last_refresh_failed = false;
+    Ok(())
+}
+
+async fn mark_k8s_discovery_failed(cache: &Arc<Mutex<K8sDiscoveryCache>>) {
+    cache.lock().await.last_refresh_failed = true;
 }
 
 pub async fn serve(
@@ -464,14 +604,16 @@ pub async fn serve(
     let push_interval = Duration::from_secs(args.push_interval_seconds.max(1));
     let runtime_trusted_cidrs = normalize_runtime_trusted_cidrs(&args.trusted_cidrs)?;
     let k8s_discovery = k8s::KubernetesDiscovery::from_args(&args.k8s)?;
-    let runtime_trusted_cidrs =
-        RuntimeTrustedCidrs::new(runtime_trusted_cidrs, k8s_discovery, push_interval);
+    let runtime_trusted_cidrs = RuntimeTrustedCidrs::new(runtime_trusted_cidrs, k8s_discovery);
+    runtime_trusted_cidrs.initial_refresh().await;
+    runtime_trusted_cidrs.spawn_watch();
     info!(
         %bind,
         auth_enabled = agent_token.is_some(),
         push_interval_seconds = push_interval.as_secs(),
         runtime_trusted_cidrs = runtime_trusted_cidrs.configured.len(),
         k8s_discovery_enabled = runtime_trusted_cidrs.k8s_discovery.is_some(),
+        k8s_watch_timeout_seconds = K8S_WATCH_TIMEOUT.as_secs(),
         "xDS gRPC server listening"
     );
     let geo_ip_refresh = GeoIpRefresh::new(GEO_IP_REFRESH_INTERVAL, geo_lookup.clone());

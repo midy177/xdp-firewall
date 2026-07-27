@@ -1,10 +1,11 @@
 use crate::cli::K8sDiscoveryArgs;
 use anyhow::{Context, Result, bail};
+use futures_util::StreamExt;
 use ipnet::IpNet;
 use reqwest::{Certificate, StatusCode};
 use serde_json::Value;
 use std::{collections::HashSet, net::IpAddr, path::Path, time::Duration};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct KubernetesDiscovery {
@@ -20,6 +21,13 @@ pub struct KubernetesRuntimeCidrs {
     pub pod_cidrs: usize,
     pub service_cidrs: usize,
     pub service_cidr_partial: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KubernetesWatchOutcome {
+    Changed,
+    Ended,
+    Unsupported,
 }
 
 impl KubernetesDiscovery {
@@ -131,7 +139,7 @@ impl KubernetesDiscovery {
             Err(err) => return Err(err),
         };
 
-        info!(
+        debug!(
             node_ips,
             pod_cidrs,
             service_cidrs,
@@ -146,6 +154,65 @@ impl KubernetesDiscovery {
             service_cidrs,
             service_cidr_partial,
         })
+    }
+
+    pub async fn watch_until_change(
+        &self,
+        path: &str,
+        label: &str,
+        timeout: Duration,
+    ) -> Result<KubernetesWatchOutcome> {
+        let separator = if path.contains('?') { '&' } else { '?' };
+        let url = format!(
+            "{}{}{}watch=true&allowWatchBookmarks=true&timeoutSeconds={}",
+            self.api_server,
+            path,
+            separator,
+            timeout.as_secs().max(1)
+        );
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(timeout + Duration::from_secs(10))
+            .send()
+            .await
+            .with_context(|| format!("failed to open Kubernetes watch '{label}'"))?;
+        if matches!(
+            response.status(),
+            StatusCode::NOT_FOUND | StatusCode::FORBIDDEN
+        ) {
+            debug!(
+                status = %response.status(),
+                label,
+                "Kubernetes watch endpoint is unavailable"
+            );
+            return Ok(KubernetesWatchOutcome::Unsupported);
+        }
+        let response = response
+            .error_for_status()
+            .with_context(|| format!("Kubernetes watch '{label}' returned an error"))?;
+        let mut stream = response.bytes_stream();
+        let mut pending = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.with_context(|| format!("failed to read Kubernetes watch '{label}'"))?;
+            pending.extend_from_slice(&chunk);
+            while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                let line = pending.drain(..=newline).collect::<Vec<_>>();
+                let line = String::from_utf8_lossy(&line);
+                if watch_line_changed(line.trim(), label)? {
+                    return Ok(KubernetesWatchOutcome::Changed);
+                }
+            }
+        }
+        if !pending.is_empty() {
+            let line = String::from_utf8_lossy(&pending);
+            if watch_line_changed(line.trim(), label)? {
+                return Ok(KubernetesWatchOutcome::Changed);
+            }
+        }
+        Ok(KubernetesWatchOutcome::Ended)
     }
 
     async fn get_json(&self, path: &str) -> Result<Value> {
@@ -175,6 +242,23 @@ impl KubernetesDiscovery {
         Ok(Some(response.json().await.with_context(|| {
             format!("Kubernetes API '{path}' returned invalid JSON")
         })?))
+    }
+}
+
+fn watch_line_changed(line: &str, label: &str) -> Result<bool> {
+    if line.is_empty() {
+        return Ok(false);
+    }
+    let event = serde_json::from_str::<Value>(line)
+        .with_context(|| format!("Kubernetes watch '{label}' returned invalid event JSON"))?;
+    let event_type = string_at(&event, &["type"]).unwrap_or_default();
+    match event_type {
+        "ADDED" | "MODIFIED" | "DELETED" | "ERROR" => Ok(true),
+        "BOOKMARK" => Ok(false),
+        _ => {
+            debug!(label, event_type, "ignored Kubernetes watch event");
+            Ok(false)
+        }
     }
 }
 
