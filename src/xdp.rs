@@ -64,6 +64,7 @@ pub struct XdpAttachOptions {
     pub allow_replace: bool,
     pub run_priority: i32,
     pub loader_path: String,
+    pub bpftool_path: String,
 }
 
 impl Default for XdpAttachOptions {
@@ -74,6 +75,7 @@ impl Default for XdpAttachOptions {
             allow_replace: false,
             run_priority: 10,
             loader_path: "xdp-loader".to_string(),
+            bpftool_path: "bpftool".to_string(),
         }
     }
 }
@@ -424,14 +426,16 @@ mod linux {
             Array as AyaArray, HashMap as AyaHashMap, IterableMap, LpmTrie, MapData, PerCpuArray,
             PerfEventArray, lpm_trie::Key as LpmKey,
         },
-        programs::{Xdp, XdpMode},
+        programs::{ProgramFd, ProgramInfo, Xdp, XdpMode},
     };
     use std::collections::HashSet;
-    use std::path::Path;
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+    use std::path::{Path, PathBuf};
     use tracing::{debug, info, warn};
 
     pub struct LinuxXdpManager {
         interface: String,
+        _direct_netlink_link: Option<DirectNetlinkLink>,
         _ebpf: Ebpf,
         rule_cidrs: LpmTrie<MapData, RuleData, RuleValue>,
         geo_cidrs: LpmTrie<MapData, GeoData, GeoValue>,
@@ -450,6 +454,46 @@ mod linux {
         custom_rate_keys: Vec<CustomRateKey>,
         temp_ban_keys: Vec<TempBanKey>,
         map_sizes: XdpMapSizes,
+    }
+
+    struct DirectNetlinkLink {
+        interface: String,
+        if_index: i32,
+        prog_fd: OwnedFd,
+        mode: XdpAttachMode,
+    }
+
+    struct TemporaryBpffsPin {
+        path: PathBuf,
+    }
+
+    impl Drop for TemporaryBpffsPin {
+        fn drop(&mut self) {
+            if let Err(err) = std::fs::remove_file(&self.path)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    path = %self.path.display(),
+                    error = %err,
+                    "failed to remove temporary bpffs pin"
+                );
+            }
+        }
+    }
+
+    impl Drop for DirectNetlinkLink {
+        fn drop(&mut self) {
+            if let Err(err) =
+                netlink_set_xdp_fd(self.if_index, None, Some(self.prog_fd.as_fd()), self.mode)
+            {
+                warn!(
+                    interface = %self.interface,
+                    mode = %self.mode.as_str(),
+                    error = %err,
+                    "failed to detach direct replacement XDP link"
+                );
+            }
+        }
     }
 
     struct XdpMapBundle {
@@ -586,6 +630,20 @@ mod linux {
     unsafe impl Pod for TrustedValue {}
     unsafe impl Pod for DropConfigValue {}
 
+    const DISPATCHER_REFERENCED_MAPS: &[&str] = &[
+        "rule_cidrs",
+        "geo_cidrs",
+        "trusted_cidrs",
+        "country_rules",
+        "defense_policy",
+        "rate_buckets",
+        "custom_rate_limits",
+        "temp_bans",
+        "drop_config",
+        "stats",
+        "drop_events",
+    ];
+
     pub(super) fn dispatcher_status(args: XdpStatusArgs) -> Result<()> {
         let interface = resolve_interface_name(args.interface.as_deref())?;
         if let Some(summary) = existing_xdp_summary(&interface)? {
@@ -656,6 +714,7 @@ mod linux {
                 allow_replace: false,
                 run_priority: args.xdp_run_priority,
                 loader_path: args.xdp_loader_path,
+                bpftool_path: args.bpftool_path,
             },
         )?;
         println!(
@@ -686,14 +745,9 @@ mod linux {
             let attach_result = (|| -> Result<Self> {
                 prepare_map_pin_dir(&pin_dir)?;
                 let mut ebpf = load_object_with_pinned_maps(object_path, map_sizes, &pin_dir)?;
-                match attach_options.strategy {
+                let direct_netlink_link = match attach_options.strategy {
                     XdpAttachStrategy::Direct => {
-                        if attach_options.allow_replace {
-                            warn!(
-                                interface,
-                                "--xdp-allow-replace only bypasses the pre-attach safety check with the current Aya attach path; it does not force-replace an existing XDP program"
-                            );
-                        } else {
+                        if !attach_options.allow_replace {
                             ensure_no_existing_xdp(interface)?;
                         }
                         let program: &mut Xdp = ebpf
@@ -702,7 +756,13 @@ mod linux {
                             .try_into()
                             .with_context(|| format!("program '{program_name}' is not XDP"))?;
                         program.load().context("failed to load XDP program")?;
-                        attach_program(program, interface, attach_options.mode)?;
+                        attach_program(
+                            program,
+                            interface,
+                            attach_options.mode,
+                            attach_options.allow_replace,
+                            &attach_options.bpftool_path,
+                        )?
                     }
                     XdpAttachStrategy::Dispatcher => {
                         unload_dispatcher_programs_by_name(
@@ -719,8 +779,16 @@ mod linux {
                             &pin_dir,
                         )?;
                         dispatcher_loaded = true;
+                        verify_dispatcher_map_identity(
+                            &attach_options.loader_path,
+                            &attach_options.bpftool_path,
+                            interface,
+                            program_name,
+                            &pin_dir,
+                        )?;
+                        None
                     }
-                }
+                };
                 let mut maps = take_maps(&mut ebpf)?;
                 let actual_map_sizes = actual_map_sizes(&maps, map_sizes)?;
                 let mut drop_config = maps.drop_config;
@@ -735,6 +803,7 @@ mod linux {
 
                 Ok(Self {
                     interface: interface.to_string(),
+                    _direct_netlink_link: direct_netlink_link,
                     _ebpf: ebpf,
                     rule_cidrs: maps.rule_cidrs,
                     geo_cidrs: maps.geo_cidrs,
@@ -1255,37 +1324,455 @@ mod linux {
         program: &mut Xdp,
         interface: &str,
         attach_mode: XdpAttachMode,
-    ) -> Result<()> {
+        allow_replace: bool,
+        bpftool_path: &str,
+    ) -> Result<Option<DirectNetlinkLink>> {
         match attach_mode {
             XdpAttachMode::Auto => {
-                if let Err(driver_err) = program.attach(interface, XdpMode::Driver) {
-                    info!(
-                        interface,
-                        error = %driver_err,
-                        "driver XDP attach unavailable; using skb mode"
-                    );
-                    program.attach(interface, XdpMode::Skb).with_context(|| {
-                        format!("driver XDP attach failed ({driver_err:#}); skb attach failed")
-                    })?;
-                    info!(interface, mode = "skb", "XDP program attached");
-                } else {
-                    info!(interface, mode = "driver", "XDP program attached");
+                match attach_program_mode(
+                    program,
+                    interface,
+                    XdpAttachMode::Driver,
+                    allow_replace,
+                    bpftool_path,
+                ) {
+                    Ok(link) => {
+                        info!(interface, mode = "driver", "XDP program attached");
+                        Ok(link)
+                    }
+                    Err(driver_err) => {
+                        info!(
+                            interface,
+                            error = %driver_err,
+                            "driver XDP attach unavailable; using skb mode"
+                        );
+                        let link = attach_program_mode(
+                            program,
+                            interface,
+                            XdpAttachMode::Skb,
+                            allow_replace,
+                            bpftool_path,
+                        )
+                        .with_context(|| {
+                            format!("driver XDP attach failed ({driver_err:#}); skb attach failed")
+                        })?;
+                        info!(interface, mode = "skb", "XDP program attached");
+                        Ok(link)
+                    }
                 }
             }
             XdpAttachMode::Driver => {
-                program
-                    .attach(interface, XdpMode::Driver)
-                    .context("failed to attach XDP program in driver mode")?;
+                let link = attach_program_mode(
+                    program,
+                    interface,
+                    XdpAttachMode::Driver,
+                    allow_replace,
+                    bpftool_path,
+                )
+                .context("failed to attach XDP program in driver mode")?;
                 info!(interface, mode = "driver", "XDP program attached");
+                Ok(link)
             }
             XdpAttachMode::Skb => {
-                program
-                    .attach(interface, XdpMode::Skb)
-                    .context("failed to attach XDP program in skb mode")?;
+                let link = attach_program_mode(
+                    program,
+                    interface,
+                    XdpAttachMode::Skb,
+                    allow_replace,
+                    bpftool_path,
+                )
+                .context("failed to attach XDP program in skb mode")?;
                 info!(interface, mode = "skb", "XDP program attached");
+                Ok(link)
             }
         }
-        Ok(())
+    }
+
+    fn attach_program_mode(
+        program: &mut Xdp,
+        interface: &str,
+        mode: XdpAttachMode,
+        allow_replace: bool,
+        bpftool_path: &str,
+    ) -> Result<Option<DirectNetlinkLink>> {
+        let Some(existing_id) = current_xdp_program_id(interface, mode)? else {
+            program.attach(interface, xdp_mode(mode))?;
+            return Ok(None);
+        };
+        if !allow_replace {
+            bail!(
+                "interface '{interface}' already has an XDP program id {existing_id} in {} mode",
+                mode.as_str()
+            );
+        }
+        let if_index = if_index(interface)?;
+        let old_prog =
+            program_fd_by_id(bpftool_path, interface, existing_id).with_context(|| {
+                format!("failed to get fd for existing XDP program id {existing_id}")
+            })?;
+        let new_prog_fd = program
+            .fd()
+            .context("XDP program fd is not available after load")?
+            .as_fd()
+            .try_clone_to_owned()
+            .context("failed to clone loaded XDP program fd for direct replacement tracking")?;
+        netlink_set_xdp_fd(
+            if_index,
+            Some(new_prog_fd.as_fd()),
+            Some(old_prog.as_fd()),
+            mode,
+        )
+        .with_context(|| {
+            format!(
+                "failed to replace existing XDP program id {existing_id} on interface '{interface}' in {} mode",
+                mode.as_str()
+            )
+        })?;
+        info!(
+            interface,
+            mode = %mode.as_str(),
+            replaced_program_id = existing_id,
+            "replaced existing direct XDP program"
+        );
+        Ok(Some(DirectNetlinkLink {
+            interface: interface.to_string(),
+            if_index,
+            prog_fd: new_prog_fd,
+            mode,
+        }))
+    }
+
+    fn xdp_mode(mode: XdpAttachMode) -> XdpMode {
+        match mode {
+            XdpAttachMode::Auto => XdpMode::Default,
+            XdpAttachMode::Driver => XdpMode::Driver,
+            XdpAttachMode::Skb => XdpMode::Skb,
+        }
+    }
+
+    fn if_index(interface: &str) -> Result<i32> {
+        let c_interface = std::ffi::CString::new(interface)
+            .with_context(|| format!("interface '{interface}' contains an embedded NUL"))?;
+        let index = unsafe { libc::if_nametoindex(c_interface.as_ptr()) };
+        if index == 0 {
+            bail!("interface '{interface}' does not exist");
+        }
+        i32::try_from(index).context("interface index is outside i32 range")
+    }
+
+    fn program_fd_by_id(bpftool_path: &str, interface: &str, program_id: u32) -> Result<ProgramFd> {
+        let safe_interface = sanitize_pin_component(interface)?;
+        let pin_root = Path::new("/sys/fs/bpf/xdp-firewall");
+        std::fs::create_dir_all(pin_root)
+            .with_context(|| format!("failed to create bpffs pin root '{}'", pin_root.display()))?;
+        let pin_path = pin_root.join(format!(
+            ".direct-replace-old-{safe_interface}-{}-{program_id}",
+            std::process::id()
+        ));
+        if pin_path.exists() {
+            std::fs::remove_file(&pin_path).with_context(|| {
+                format!(
+                    "failed to remove stale temporary bpffs pin '{}'",
+                    pin_path.display()
+                )
+            })?;
+        }
+        let output = std::process::Command::new(bpftool_path)
+            .args(["prog", "pin", "id"])
+            .arg(program_id.to_string())
+            .arg(&pin_path)
+            .output()
+            .with_context(|| format!("failed to run '{bpftool_path} prog pin'"))?;
+        if !output.status.success() {
+            bail!(
+                "bpftool failed to pin existing XDP program id {program_id}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let _pin = TemporaryBpffsPin {
+            path: pin_path.clone(),
+        };
+        ProgramInfo::from_pin(&pin_path)
+            .with_context(|| {
+                format!(
+                    "failed to open temporary bpffs pin '{}' for existing XDP program id {program_id}",
+                    pin_path.display()
+                )
+            })?
+            .fd()
+            .context("failed to clone fd from temporary bpffs pin")
+    }
+
+    fn current_xdp_program_id(interface: &str, mode: XdpAttachMode) -> Result<Option<u32>> {
+        let output = std::process::Command::new("ip")
+            .args(["-j", "-details", "link", "show", "dev", interface])
+            .output()
+            .with_context(|| format!("failed to inspect interface '{interface}' with ip"))?;
+        if !output.status.success() {
+            bail!(
+                "failed to inspect interface '{interface}' for XDP program id: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let value = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .context("failed to parse ip JSON while detecting current XDP program id")?;
+        Ok(find_xdp_program_id(&value, mode))
+    }
+
+    fn find_xdp_program_id(value: &serde_json::Value, mode: XdpAttachMode) -> Option<u32> {
+        let mut mode_specific = Vec::new();
+        let mut generic = Vec::new();
+        collect_xdp_program_ids(value, mode, &mut mode_specific, &mut generic);
+        mode_specific
+            .into_iter()
+            .next()
+            .or_else(|| (generic.len() == 1).then_some(generic[0]))
+    }
+
+    fn collect_xdp_program_ids(
+        value: &serde_json::Value,
+        mode: XdpAttachMode,
+        mode_specific: &mut Vec<u32>,
+        generic: &mut Vec<u32>,
+    ) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, value) in object {
+                    if let Some(id) = value.as_u64().and_then(|id| u32::try_from(id).ok()) {
+                        match key.as_str() {
+                            "drv_prog_id" if mode == XdpAttachMode::Driver => {
+                                mode_specific.push(id)
+                            }
+                            "skb_prog_id" if mode == XdpAttachMode::Skb => mode_specific.push(id),
+                            "prog_id" => generic.push(id),
+                            _ => {}
+                        }
+                    }
+                }
+                let mode_hint = object
+                    .get("mode")
+                    .or_else(|| object.get("attached"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+                if let Some(id) = object
+                    .get("prog_id")
+                    .and_then(|value| value.as_u64())
+                    .and_then(|id| u32::try_from(id).ok())
+                {
+                    let matches_mode = match mode {
+                        XdpAttachMode::Driver => {
+                            mode_hint.contains("drv")
+                                || mode_hint.contains("driver")
+                                || mode_hint.contains("native")
+                        }
+                        XdpAttachMode::Skb => {
+                            mode_hint.contains("skb") || mode_hint.contains("generic")
+                        }
+                        XdpAttachMode::Auto => false,
+                    };
+                    if matches_mode {
+                        mode_specific.push(id);
+                    }
+                }
+                for value in object.values() {
+                    collect_xdp_program_ids(value, mode, mode_specific, generic);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect_xdp_program_ids(value, mode, mode_specific, generic);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn netlink_set_xdp_fd(
+        if_index: i32,
+        fd: Option<BorrowedFd<'_>>,
+        expected_fd: Option<BorrowedFd<'_>>,
+        mode: XdpAttachMode,
+    ) -> Result<()> {
+        const NLM_F_REQUEST: u16 = 1;
+        const NLM_F_ACK: u16 = 4;
+        const NLMSG_ERROR: u16 = 2;
+        const RTM_SETLINK: u16 = 19;
+        const IFLA_XDP: u16 = 43;
+        const NLA_F_NESTED: u16 = 1 << 15;
+        const IFLA_XDP_FD: u16 = 1;
+        const IFLA_XDP_FLAGS: u16 = 3;
+        const IFLA_XDP_EXPECTED_FD: u16 = 8;
+        const XDP_FLAGS_UPDATE_IF_NOEXIST: u32 = 1;
+        const XDP_FLAGS_SKB_MODE: u32 = 2;
+        const XDP_FLAGS_DRV_MODE: u32 = 4;
+        const XDP_FLAGS_REPLACE: u32 = 16;
+
+        let mode_flags = match mode {
+            XdpAttachMode::Driver => XDP_FLAGS_DRV_MODE,
+            XdpAttachMode::Skb => XDP_FLAGS_SKB_MODE,
+            XdpAttachMode::Auto => 0,
+        };
+        let mut flags = mode_flags | XDP_FLAGS_UPDATE_IF_NOEXIST;
+        if expected_fd.is_some() {
+            flags |= XDP_FLAGS_REPLACE;
+        }
+
+        let mut xdp_attrs = Vec::new();
+        push_attr_i32(
+            &mut xdp_attrs,
+            IFLA_XDP_FD,
+            fd.map_or(-1, |fd| fd.as_raw_fd()),
+        );
+        push_attr_u32(&mut xdp_attrs, IFLA_XDP_FLAGS, flags);
+        if let Some(expected_fd) = expected_fd {
+            push_attr_i32(
+                &mut xdp_attrs,
+                IFLA_XDP_EXPECTED_FD,
+                expected_fd.as_raw_fd(),
+            );
+        }
+
+        let mut payload = Vec::new();
+        let mut if_info = unsafe { std::mem::zeroed::<libc::ifinfomsg>() };
+        if_info.ifi_family = libc::AF_UNSPEC as u8;
+        if_info.ifi_index = if_index;
+        push_pod(&mut payload, &if_info);
+        push_attr_bytes(&mut payload, IFLA_XDP | NLA_F_NESTED, &xdp_attrs);
+
+        let header_len = std::mem::size_of::<libc::nlmsghdr>();
+        let mut message = Vec::with_capacity(header_len + payload.len());
+        let header = libc::nlmsghdr {
+            nlmsg_len: u32::try_from(header_len + payload.len())
+                .context("netlink XDP message is too large")?,
+            nlmsg_type: RTM_SETLINK,
+            nlmsg_flags: NLM_F_REQUEST | NLM_F_ACK,
+            nlmsg_seq: 1,
+            nlmsg_pid: 0,
+        };
+        push_pod(&mut message, &header);
+        message.extend_from_slice(&payload);
+
+        let socket = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE) };
+        if socket < 0 {
+            return Err(std::io::Error::last_os_error()).context("failed to open netlink socket");
+        }
+        let socket = OwnedFd::from_raw_fd_checked(socket)?;
+        let sent = unsafe {
+            libc::send(
+                socket.as_raw_fd(),
+                message.as_ptr().cast(),
+                message.len(),
+                0,
+            )
+        };
+        if sent < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to send netlink XDP replace request");
+        }
+
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let len = unsafe {
+                libc::recv(
+                    socket.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    0,
+                )
+            };
+            if len < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to receive netlink XDP replace ack");
+            }
+            let len = len as usize;
+            let mut offset = 0;
+            while offset + header_len <= len {
+                let header = read_unaligned::<libc::nlmsghdr>(&buffer[offset..])?;
+                if header.nlmsg_len == 0 {
+                    bail!("received invalid zero-length netlink message");
+                }
+                let message_len = nla_align(header.nlmsg_len as usize);
+                if offset + message_len > len {
+                    bail!("received truncated netlink message");
+                }
+                if header.nlmsg_type == NLMSG_ERROR {
+                    let error_offset = offset + header_len;
+                    let error = read_unaligned::<i32>(&buffer[error_offset..])?;
+                    if error == 0 {
+                        return Ok(());
+                    }
+                    return Err(std::io::Error::from_raw_os_error(-error))
+                        .context("netlink rejected XDP replace request");
+                }
+                offset += message_len;
+            }
+        }
+    }
+
+    trait OwnedFdExt {
+        fn from_raw_fd_checked(fd: i32) -> Result<OwnedFd>;
+    }
+
+    impl OwnedFdExt for OwnedFd {
+        fn from_raw_fd_checked(fd: i32) -> Result<OwnedFd> {
+            use std::os::fd::FromRawFd;
+            if fd < 0 {
+                bail!("invalid raw fd {fd}");
+            }
+            Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RtAttr {
+        rta_len: u16,
+        rta_type: u16,
+    }
+
+    fn push_attr_i32(buffer: &mut Vec<u8>, attr_type: u16, value: i32) {
+        push_attr_bytes(buffer, attr_type, &value.to_ne_bytes());
+    }
+
+    fn push_attr_u32(buffer: &mut Vec<u8>, attr_type: u16, value: u32) {
+        push_attr_bytes(buffer, attr_type, &value.to_ne_bytes());
+    }
+
+    fn push_attr_bytes(buffer: &mut Vec<u8>, attr_type: u16, value: &[u8]) {
+        let attr_len = std::mem::size_of::<RtAttr>() + value.len();
+        let attr = RtAttr {
+            rta_len: attr_len as u16,
+            rta_type: attr_type,
+        };
+        push_pod(buffer, &attr);
+        buffer.extend_from_slice(value);
+        while buffer.len() % 4 != 0 {
+            buffer.push(0);
+        }
+    }
+
+    fn push_pod<T>(buffer: &mut Vec<u8>, value: &T) {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(value).cast::<u8>(),
+                std::mem::size_of::<T>(),
+            )
+        };
+        buffer.extend_from_slice(bytes);
+    }
+
+    fn read_unaligned<T: Copy>(buffer: &[u8]) -> Result<T> {
+        if buffer.len() < std::mem::size_of::<T>() {
+            bail!("buffer too small for netlink value");
+        }
+        Ok(unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<T>()) })
+    }
+
+    fn nla_align(value: usize) -> usize {
+        const NLA_ALIGNTO: usize = 4;
+        (value + NLA_ALIGNTO - 1) & !(NLA_ALIGNTO - 1)
     }
 
     fn run_xdp_loader_load(
@@ -1593,6 +2080,114 @@ mod linux {
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
         parse_dispatcher_program_ids(&stdout, interface, program_name)
+    }
+
+    fn verify_dispatcher_map_identity(
+        loader_path: &str,
+        bpftool_path: &str,
+        interface: &str,
+        program_name: &str,
+        pin_dir: &Path,
+    ) -> Result<()> {
+        let ids = dispatcher_program_ids_by_name(loader_path, interface, program_name)?;
+        let [program_id] = ids.as_slice() else {
+            bail!(
+                "expected exactly one dispatcher program named '{program_name}' on interface '{interface}' after attach, found {}",
+                ids.len()
+            );
+        };
+        let program_map_ids = bpftool_program_map_ids(bpftool_path, *program_id)?;
+        let expected = pinned_map_ids(pin_dir)?;
+        let missing = expected
+            .iter()
+            .filter(|(_, map_id)| !program_map_ids.contains(map_id))
+            .map(|(name, map_id)| format!("{name}:{map_id}"))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "dispatcher program id {program_id} is not using pinned XDP maps from '{}'; missing map ids: {}",
+                pin_dir.display(),
+                missing.join(", ")
+            );
+        }
+        info!(
+            interface,
+            program = program_name,
+            program_id,
+            maps = expected.len(),
+            "verified dispatcher program uses pinned XDP maps"
+        );
+        Ok(())
+    }
+
+    fn pinned_map_ids(pin_dir: &Path) -> Result<Vec<(&'static str, u32)>> {
+        DISPATCHER_REFERENCED_MAPS
+            .iter()
+            .map(|name| {
+                let path = pin_dir.join(name);
+                let map = MapData::from_pin(&path).with_context(|| {
+                    format!("failed to open pinned XDP map '{}'", path.display())
+                })?;
+                let id = map
+                    .info()
+                    .with_context(|| {
+                        format!("failed to inspect pinned XDP map '{}'", path.display())
+                    })?
+                    .id();
+                Ok((*name, id))
+            })
+            .collect()
+    }
+
+    fn bpftool_program_map_ids(bpftool_path: &str, program_id: u32) -> Result<HashSet<u32>> {
+        let program_id_arg = program_id.to_string();
+        let output = std::process::Command::new(bpftool_path)
+            .args(["-j", "prog", "show", "id", &program_id_arg])
+            .output()
+            .with_context(|| {
+                format!(
+                    "failed to execute bpftool '{bpftool_path}' for dispatcher map verification"
+                )
+            })?;
+        if !output.status.success() {
+            bail!(
+                "bpftool prog show id {program_id} failed: status={} stdout='{}' stderr='{}'",
+                output.status,
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let value = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .context("failed to parse bpftool JSON while verifying dispatcher maps")?;
+        let mut ids = HashSet::new();
+        collect_map_ids_from_json(&value, &mut ids);
+        if ids.is_empty() {
+            bail!("bpftool did not report any map_ids for dispatcher program id {program_id}");
+        }
+        Ok(ids)
+    }
+
+    fn collect_map_ids_from_json(value: &serde_json::Value, ids: &mut HashSet<u32>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(map_ids) = object.get("map_ids").and_then(|value| value.as_array()) {
+                    for id in map_ids {
+                        if let Some(id) = id.as_u64().and_then(|id| u32::try_from(id).ok()) {
+                            ids.insert(id);
+                        }
+                    }
+                }
+                for value in object.values() {
+                    collect_map_ids_from_json(value, ids);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect_map_ids_from_json(value, ids);
+                }
+            }
+            _ => {}
+        }
     }
 
     fn parse_dispatcher_program_ids(

@@ -219,6 +219,13 @@ pub struct AgentArgs {
         hide = true
     )]
     pub xdp_loader_path: String,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_BPFTOOL_PATH",
+        default_value = "bpftool",
+        hide = true
+    )]
+    pub bpftool_path: String,
     #[arg(long, default_value = "/usr/local/share/xdp-firewall/xdp_firewall.o")]
     pub xdp_object: String,
     #[arg(long, default_value_t = 30)]
@@ -339,6 +346,13 @@ pub struct SyncOnceArgs {
         hide = true
     )]
     pub xdp_loader_path: String,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_BPFTOOL_PATH",
+        default_value = "bpftool",
+        hide = true
+    )]
+    pub bpftool_path: String,
     #[arg(long, default_value = "/usr/local/share/xdp-firewall/xdp_firewall.o")]
     pub xdp_object: String,
     #[arg(long, default_value = "xdp_firewall")]
@@ -510,6 +524,13 @@ pub struct XdpReplaceArgs {
         hide = true
     )]
     pub xdp_loader_path: String,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_BPFTOOL_PATH",
+        default_value = "bpftool",
+        hide = true
+    )]
+    pub bpftool_path: String,
     #[arg(
         long,
         conflicts_with = "all",

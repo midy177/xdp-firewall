@@ -338,6 +338,7 @@ fn xdp_attach_options_for_agent(args: &AgentArgs) -> xdp::XdpAttachOptions {
         allow_replace: args.xdp_allow_replace,
         run_priority: args.xdp_run_priority,
         loader_path: args.xdp_loader_path.clone(),
+        bpftool_path: args.bpftool_path.clone(),
     }
 }
 
@@ -360,6 +361,7 @@ fn xdp_attach_options_for_sync_once(args: &SyncOnceArgs) -> xdp::XdpAttachOption
         allow_replace: args.xdp_allow_replace,
         run_priority: args.xdp_run_priority,
         loader_path: args.xdp_loader_path.clone(),
+        bpftool_path: args.bpftool_path.clone(),
     }
 }
 

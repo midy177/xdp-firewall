@@ -278,8 +278,8 @@
   - Add rollback for attach failures after pinned maps or dispatcher programs have been created.
   - Use real pinned-map capacities for policy validation when old pins are reused.
   - Make dispatcher replace tolerate a clean interface when bootstrapping a replacement flow.
-- [pending] Add true direct-mode XDP replacement support instead of only bypassing the pre-attach safety check with `--xdp-allow-replace`.
-- [pending] Add dispatcher map identity verification so the control plane can assert that the xdp-loader attached program is reading the same pinned map IDs that the agent updates.
+- [completed] Add true direct-mode XDP replacement support instead of only bypassing the pre-attach safety check with `--xdp-allow-replace`.
+- [completed] Add dispatcher map identity verification so the control plane can assert that the xdp-loader attached program is reading the same pinned map IDs that the agent updates.
 
 ## Validation Commands
 
