@@ -26,6 +26,7 @@ use tracing::{debug, info, warn};
 
 const TEMP_BAN_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const GEO_IP_REFRESH_INTERVAL: Duration = Duration::from_secs(86_400);
+const GEO_IP_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 const K8S_WATCH_TIMEOUT: Duration = Duration::from_secs(300);
 const K8S_WATCH_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
@@ -86,6 +87,7 @@ struct GeoIpRefresh {
 #[derive(Default)]
 struct GeoIpRefreshState {
     last_success: Option<Instant>,
+    last_attempt: Option<Instant>,
     running: bool,
 }
 
@@ -231,7 +233,10 @@ impl TempBanCleanup {
 impl GeoIpRefresh {
     fn new(interval: Duration, geo_lookup: geo::GeoIpLookup) -> Self {
         Self {
-            state: Arc::new(StdMutex::new(GeoIpRefreshState::default())),
+            state: Arc::new(StdMutex::new(GeoIpRefreshState {
+                last_success: Some(Instant::now()),
+                ..Default::default()
+            })),
             interval,
             geo_lookup,
         }
@@ -239,26 +244,42 @@ impl GeoIpRefresh {
 
     async fn maybe_run(&self, db: &DatabaseConnection) -> Result<()> {
         let started_at = Instant::now();
-        let due = {
+        let (running, retry_throttled, within_interval) = {
             let state = self.state.lock().expect("geo IP refresh mutex poisoned");
-            !state.running
-                && !state
+            (
+                state.running,
+                state
+                    .last_attempt
+                    .and_then(|last| started_at.checked_duration_since(last))
+                    .is_some_and(|elapsed| elapsed < GEO_IP_REFRESH_RETRY_INTERVAL),
+                state
                     .last_success
                     .and_then(|last| started_at.checked_duration_since(last))
-                    .is_some_and(|elapsed| elapsed < self.interval)
+                    .is_some_and(|elapsed| elapsed < self.interval),
+            )
         };
-        let missing_lists = if due {
+        if running || retry_throttled {
+            return Ok(());
+        }
+        let missing_lists = if !within_interval {
             false
         } else {
             geo_ip_lists_missing(db).await?
         };
-        if !due && !missing_lists {
+        if within_interval && !missing_lists {
             return Ok(());
         }
 
         {
             let mut state = self.state.lock().expect("geo IP refresh mutex poisoned");
             if state.running {
+                return Ok(());
+            }
+            if state
+                .last_attempt
+                .and_then(|last| started_at.checked_duration_since(last))
+                .is_some_and(|elapsed| elapsed < GEO_IP_REFRESH_RETRY_INTERVAL)
+            {
                 return Ok(());
             }
             let within_interval = state
@@ -269,6 +290,7 @@ impl GeoIpRefresh {
                 return Ok(());
             }
             state.running = true;
+            state.last_attempt = Some(started_at);
         }
         let state = self.state.clone();
         let db = db.clone();
@@ -296,6 +318,12 @@ impl GeoIpRefresh {
             match result {
                 Ok(report) if report.failed_country_count == 0 && !report.running => {
                     guard.last_success = Some(started_at);
+                }
+                Ok(report) if report.running => {
+                    debug!(
+                        status = %report.refresh_status,
+                        "country IP refresh is already running elsewhere; skipping automatic xDS refresh"
+                    );
                 }
                 Ok(report) => {
                     warn!(

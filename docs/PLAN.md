@@ -282,6 +282,7 @@
   - Make dispatcher replace tolerate a clean interface when bootstrapping a replacement flow.
 - [completed] Add true direct-mode XDP replacement support instead of only bypassing the pre-attach safety check with `--xdp-allow-replace`.
 - [completed] Add dispatcher map identity verification so the control plane can assert that the xdp-loader attached program is reading the same pinned map IDs that the agent updates.
+- [completed] Update Kubernetes deployment templates for runtime stability: agent DaemonSet defaults to dispatcher attach without direct-mode allow-replace, and API/agent memory limits are raised to 512Mi for GeoIP lookup and XDP control-plane headroom.
 
 ## Validation Commands
 

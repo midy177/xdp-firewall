@@ -48,9 +48,7 @@ spec:
             - name: XDP_FIREWALL_XDP_MODE
               value: auto
             - name: XDP_FIREWALL_XDP_ATTACH_STRATEGY
-              value: direct
-            - name: XDP_FIREWALL_XDP_ALLOW_REPLACE
-              value: "false"
+              value: dispatcher
             - name: XDP_FIREWALL_XDP_RUN_PRIORITY
               value: "10"
             - name: XDP_FIREWALL_AGENT_ONLY
@@ -65,7 +63,7 @@ spec:
               cpu: 50m
               memory: 64Mi
             limits:
-              memory: 256Mi
+              memory: 512Mi
           volumeMounts:
             - name: bpffs
               mountPath: /sys/fs/bpf
