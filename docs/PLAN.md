@@ -140,6 +140,7 @@
 - Changed `auto` mode so native driver attach failure followed by successful skb attach is logged as `INFO`, not `WARN`.
 - Added Docker, Docker Compose, and Kubernetes deployment templates.
 - Updated deploy templates to use image `1228022817/xdp-firewall:0.1.0`.
+- Optimized the Compose env template for AWS ENA dispatcher deployments by using `XDP_FIREWALL_XDP_MODE=skb`, `XDP_FIREWALL_XDP_ATTACH_STRATEGY=dispatcher`, and documenting that `XDP_FIREWALL_XDP_ALLOW_REPLACE` is only meaningful for direct attach mode.
 - Added Makefile packaging flow similar to zigbuild Docker packaging.
 - Confirmed `make docker-build` runs frontend build before Rust release packaging.
 - Changed frontend Vite output to hash-based asset names.
