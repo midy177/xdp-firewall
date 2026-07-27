@@ -91,10 +91,27 @@ pub async fn fetch_threat_prefixes(sources: &[ThreatSource]) -> Result<Vec<Threa
             .with_context(|| format!("failed to fetch threat source {}", source.name))?
             .error_for_status()
             .with_context(|| format!("threat source {} returned HTTP error", source.name))?;
-        let body = read_limited_body(response, MAX_THREAT_BODY_BYTES)
-            .await
-            .with_context(|| format!("failed to read threat source {}", source.name))?;
-        prefixes.extend(parse_source(source, &body)?);
+        let source_prefixes = match &source.format {
+            ThreatFormat::Cidr | ThreatFormat::Ips => {
+                read_limited_lines(response, MAX_THREAT_BODY_BYTES, |line| {
+                    parse_line_prefix(line)
+                })
+                .await
+            }
+            ThreatFormat::Ipsum => {
+                let min_score = source.min_score.unwrap_or(1);
+                read_limited_lines(response, MAX_THREAT_BODY_BYTES, |line| {
+                    parse_ipsum_line(line, min_score)
+                })
+                .await
+            }
+            ThreatFormat::SpamhausDrop => {
+                let body = read_limited_body(response, MAX_THREAT_BODY_BYTES).await?;
+                parse_spamhaus_drop(&body)
+            }
+        }
+        .with_context(|| format!("failed to read threat source {}", source.name))?;
+        prefixes.extend(source_prefixes);
     }
     Ok(normalize_prefixes(prefixes))
 }
@@ -135,6 +152,54 @@ async fn read_limited_body(mut response: reqwest::Response, max_bytes: usize) ->
     String::from_utf8(body).context("threat source response is not UTF-8")
 }
 
+async fn read_limited_lines<T, F>(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    mut parse_line: F,
+) -> Result<Vec<T>>
+where
+    F: FnMut(&str) -> Result<Option<T>>,
+{
+    if let Some(length) = response.content_length()
+        && length > max_bytes as u64
+    {
+        bail!("threat source response is larger than {max_bytes} bytes");
+    }
+    let mut total = 0_usize;
+    let mut carry = Vec::new();
+    let mut parsed = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        total += chunk.len();
+        if total > max_bytes {
+            bail!("threat source response is larger than {max_bytes} bytes");
+        }
+        carry.extend_from_slice(&chunk);
+        while let Some(newline) = carry.iter().position(|byte| *byte == b'\n') {
+            let mut line = carry.drain(..=newline).collect::<Vec<_>>();
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let line = std::str::from_utf8(&line).context("threat source response is not UTF-8")?;
+            if let Some(value) = parse_line(line)? {
+                parsed.push(value);
+            }
+        }
+    }
+    if !carry.is_empty() {
+        if carry.last() == Some(&b'\r') {
+            carry.pop();
+        }
+        let line = std::str::from_utf8(&carry).context("threat source response is not UTF-8")?;
+        if let Some(value) = parse_line(line)? {
+            parsed.push(value);
+        }
+    }
+    Ok(parsed)
+}
+
 fn allowed_threat_hosts() -> HashSet<String> {
     let mut hosts = BUILTIN_THREAT_SOURCES
         .iter()
@@ -153,43 +218,37 @@ fn allowed_threat_hosts() -> HashSet<String> {
     hosts
 }
 
-fn parse_source(source: &ThreatSource, body: &str) -> Result<Vec<ThreatPrefix>> {
-    match source.format {
-        ThreatFormat::Cidr | ThreatFormat::Ips => parse_line_prefixes(body),
-        ThreatFormat::Ipsum => parse_ipsum(body, source.min_score.unwrap_or(1)),
-        ThreatFormat::SpamhausDrop => parse_spamhaus_drop(body),
-    }
-    .with_context(|| format!("failed to parse threat source {}", source.name))
-}
-
 fn parse_line_prefixes(body: &str) -> Result<Vec<ThreatPrefix>> {
     let mut prefixes = Vec::new();
     for line in body.lines() {
-        let Some(token) = first_prefix_token(line) else {
-            continue;
-        };
-        prefixes.push(parse_prefix(token)?);
+        if let Some(prefix) = parse_line_prefix(line)? {
+            prefixes.push(prefix);
+        }
     }
     Ok(prefixes)
 }
 
-fn parse_ipsum(body: &str, min_score: u32) -> Result<Vec<ThreatPrefix>> {
-    let mut prefixes = Vec::new();
-    for line in body.lines() {
-        let clean = strip_comment(line);
-        let mut parts = clean.split_whitespace();
-        let Some(ip) = parts.next() else {
-            continue;
-        };
-        let score = parts
-            .next()
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(1);
-        if score >= min_score {
-            prefixes.push(parse_prefix(ip)?);
-        }
+fn parse_line_prefix(line: &str) -> Result<Option<ThreatPrefix>> {
+    let Some(token) = first_prefix_token(line) else {
+        return Ok(None);
+    };
+    Ok(Some(parse_prefix(token)?))
+}
+
+fn parse_ipsum_line(line: &str, min_score: u32) -> Result<Option<ThreatPrefix>> {
+    let clean = strip_comment(line);
+    let mut parts = clean.split_whitespace();
+    let Some(ip) = parts.next() else {
+        return Ok(None);
+    };
+    let score = parts
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1);
+    if score >= min_score {
+        return Ok(Some(parse_prefix(ip)?));
     }
-    Ok(prefixes)
+    Ok(None)
 }
 
 fn parse_spamhaus_drop(body: &str) -> Result<Vec<ThreatPrefix>> {
@@ -281,9 +340,9 @@ mod tests {
 
     #[test]
     fn parses_ipsum_with_min_score() {
-        let parsed = parse_ipsum("1.1.1.1 2\n2.2.2.0/24 5\n", 3).unwrap();
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].prefix, 24);
+        assert!(parse_ipsum_line("1.1.1.1 2", 3).unwrap().is_none());
+        let parsed = parse_ipsum_line("2.2.2.0/24 5", 3).unwrap().unwrap();
+        assert_eq!(parsed.prefix, 24);
     }
 
     #[test]

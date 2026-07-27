@@ -2,10 +2,18 @@ use crate::cli::K8sDiscoveryArgs;
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 use ipnet::IpNet;
+use k8s_openapi::{
+    List, ListableResource,
+    api::{
+        core::v1::{Node, Service},
+        networking::v1::ServiceCIDR,
+    },
+    apimachinery::pkg::apis::meta::v1::WatchEvent,
+};
 use reqwest::{Certificate, StatusCode};
-use serde_json::Value;
+use serde::de::DeserializeOwned;
 use std::{collections::HashSet, net::IpAddr, path::Path, time::Duration};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 #[derive(Debug, Clone)]
 pub struct KubernetesDiscovery {
@@ -80,51 +88,60 @@ impl KubernetesDiscovery {
     pub async fn discover(&self) -> Result<KubernetesRuntimeCidrs> {
         let mut cidrs = Vec::new();
         let mut seen = HashSet::new();
-        let nodes = self.get_json("/api/v1/nodes").await?;
+        let nodes = self.get_list::<Node>("/api/v1/nodes", "nodes").await?;
         let mut node_ips = 0;
         let mut pod_cidrs = 0;
-        for node in items(&nodes) {
-            for address in array_at(node, &["status", "addresses"]) {
-                if string_at(address, &["type"])
-                    .is_some_and(|kind| matches!(kind, "InternalIP" | "ExternalIP"))
-                    && let Some(value) = string_at(address, &["address"])
-                    && let Some(cidr) = ip_to_host_cidr(value)?
-                    && insert_unique(&mut cidrs, &mut seen, cidr)
-                {
-                    node_ips += 1;
+        for node in &nodes.items {
+            if let Some(status) = &node.status
+                && let Some(addresses) = &status.addresses
+            {
+                for address in addresses {
+                    if matches!(address.type_.as_str(), "InternalIP" | "ExternalIP")
+                        && let Some(cidr) = ip_to_host_cidr(&address.address)?
+                        && insert_unique(&mut cidrs, &mut seen, cidr)
+                    {
+                        node_ips += 1;
+                    }
                 }
             }
-            let mut node_has_pod_cidr = false;
-            for value in strings_at(node, &["spec", "podCIDRs"]) {
-                let cidr = value
-                    .parse::<IpNet>()
-                    .with_context(|| format!("invalid Kubernetes podCIDR '{value}'"))?;
-                node_has_pod_cidr = true;
-                if insert_unique(&mut cidrs, &mut seen, cidr) {
-                    pod_cidrs += 1;
+            if let Some(spec) = &node.spec {
+                let mut node_has_pod_cidr = false;
+                for value in spec.pod_cidrs.as_deref().unwrap_or_default() {
+                    let cidr = value
+                        .parse::<IpNet>()
+                        .with_context(|| format!("invalid Kubernetes podCIDR '{value}'"))?;
+                    node_has_pod_cidr = true;
+                    if insert_unique(&mut cidrs, &mut seen, cidr) {
+                        pod_cidrs += 1;
+                    }
                 }
-            }
-            if !node_has_pod_cidr && let Some(value) = string_at(node, &["spec", "podCIDR"]) {
-                let cidr = value
-                    .parse::<IpNet>()
-                    .with_context(|| format!("invalid Kubernetes podCIDR '{value}'"))?;
-                if insert_unique(&mut cidrs, &mut seen, cidr) {
-                    pod_cidrs += 1;
+                if !node_has_pod_cidr && let Some(value) = spec.pod_cidr.as_deref() {
+                    let cidr = value
+                        .parse::<IpNet>()
+                        .with_context(|| format!("invalid Kubernetes podCIDR '{value}'"))?;
+                    if insert_unique(&mut cidrs, &mut seen, cidr) {
+                        pod_cidrs += 1;
+                    }
                 }
             }
         }
 
         let (service_cidrs, service_cidr_partial) = match self
-            .get_json_optional("/apis/networking.k8s.io/v1/servicecidrs")
+            .get_list_optional::<ServiceCIDR>(
+                "/apis/networking.k8s.io/v1/servicecidrs",
+                "servicecidrs",
+            )
             .await
         {
             Ok(Some(servicecidrs)) => {
-                let count = add_service_cidrs(&mut cidrs, &mut seen, &servicecidrs)?;
+                let count = add_service_cidrs(&mut cidrs, &mut seen, &servicecidrs.items)?;
                 (count, false)
             }
             Ok(None) => {
-                let services = self.get_json("/api/v1/services").await?;
-                let count = add_service_cluster_ips(&mut cidrs, &mut seen, &services)?;
+                let services = self
+                    .get_list::<Service>("/api/v1/services", "services")
+                    .await?;
+                let count = add_service_cluster_ips(&mut cidrs, &mut seen, &services.items)?;
                 (count, true)
             }
             Err(err) if is_forbidden_error(&err) => {
@@ -132,14 +149,16 @@ impl KubernetesDiscovery {
                     error = %err,
                     "Kubernetes ServiceCIDR API is forbidden; falling back to existing Service ClusterIPs"
                 );
-                let services = self.get_json("/api/v1/services").await?;
-                let count = add_service_cluster_ips(&mut cidrs, &mut seen, &services)?;
+                let services = self
+                    .get_list::<Service>("/api/v1/services", "services")
+                    .await?;
+                let count = add_service_cluster_ips(&mut cidrs, &mut seen, &services.items)?;
                 (count, true)
             }
             Err(err) => return Err(err),
         };
 
-        debug!(
+        trace!(
             node_ips,
             pod_cidrs,
             service_cidrs,
@@ -162,13 +181,43 @@ impl KubernetesDiscovery {
         label: &str,
         timeout: Duration,
     ) -> Result<KubernetesWatchOutcome> {
+        match label {
+            "nodes" => {
+                self.watch_until_typed_change::<Node>(path, label, timeout)
+                    .await
+            }
+            "services" => {
+                self.watch_until_typed_change::<Service>(path, label, timeout)
+                    .await
+            }
+            "servicecidrs" => {
+                self.watch_until_typed_change::<ServiceCIDR>(path, label, timeout)
+                    .await
+            }
+            _ => bail!("unsupported Kubernetes watch target '{label}'"),
+        }
+    }
+
+    async fn watch_until_typed_change<T>(
+        &self,
+        path: &str,
+        label: &str,
+        timeout: Duration,
+    ) -> Result<KubernetesWatchOutcome>
+    where
+        T: DeserializeOwned + ListableResource,
+    {
+        let Some(resource_version) = self.list_resource_version::<T>(path, label).await? else {
+            return Ok(KubernetesWatchOutcome::Unsupported);
+        };
         let separator = if path.contains('?') { '&' } else { '?' };
         let url = format!(
-            "{}{}{}watch=true&allowWatchBookmarks=true&timeoutSeconds={}",
+            "{}{}{}watch=true&allowWatchBookmarks=true&timeoutSeconds={}&resourceVersion={}",
             self.api_server,
             path,
             separator,
-            timeout.as_secs().max(1)
+            timeout.as_secs().max(1),
+            resource_version
         );
         let response = self
             .client
@@ -201,27 +250,33 @@ impl KubernetesDiscovery {
             while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
                 let line = pending.drain(..=newline).collect::<Vec<_>>();
                 let line = String::from_utf8_lossy(&line);
-                if watch_line_changed(line.trim(), label)? {
+                if watch_line_changed::<T>(line.trim(), label)? {
                     return Ok(KubernetesWatchOutcome::Changed);
                 }
             }
         }
         if !pending.is_empty() {
             let line = String::from_utf8_lossy(&pending);
-            if watch_line_changed(line.trim(), label)? {
+            if watch_line_changed::<T>(line.trim(), label)? {
                 return Ok(KubernetesWatchOutcome::Changed);
             }
         }
         Ok(KubernetesWatchOutcome::Ended)
     }
 
-    async fn get_json(&self, path: &str) -> Result<Value> {
-        self.get_json_optional(path)
+    async fn get_list<T>(&self, path: &str, label: &str) -> Result<List<T>>
+    where
+        T: DeserializeOwned + ListableResource,
+    {
+        self.get_list_optional(path, label)
             .await?
             .with_context(|| format!("Kubernetes API path '{path}' was not found"))
     }
 
-    async fn get_json_optional(&self, path: &str) -> Result<Option<Value>> {
+    async fn get_list_optional<T>(&self, path: &str, label: &str) -> Result<Option<List<T>>>
+    where
+        T: DeserializeOwned + ListableResource,
+    {
         let url = format!("{}{}", self.api_server, path);
         let response = self
             .client
@@ -239,25 +294,51 @@ impl KubernetesDiscovery {
         let response = response
             .error_for_status()
             .with_context(|| format!("Kubernetes API '{path}' returned an error"))?;
-        Ok(Some(response.json().await.with_context(|| {
-            format!("Kubernetes API '{path}' returned invalid JSON")
-        })?))
+        Ok(Some(response.json::<List<T>>().await.with_context(
+            || format!("Kubernetes API '{label}' returned invalid Kubernetes list JSON"),
+        )?))
+    }
+
+    async fn list_resource_version<T>(&self, path: &str, label: &str) -> Result<Option<String>>
+    where
+        T: DeserializeOwned + ListableResource,
+    {
+        let Some(list) = self.get_list_optional::<T>(path, label).await? else {
+            debug!(label, "Kubernetes watch base list is unavailable");
+            return Ok(None);
+        };
+        let Some(resource_version) = list.metadata.resource_version else {
+            debug!(
+                label,
+                "Kubernetes watch base list did not include metadata.resourceVersion"
+            );
+            return Ok(None);
+        };
+        Ok(Some(resource_version.to_string()))
     }
 }
 
-fn watch_line_changed(line: &str, label: &str) -> Result<bool> {
+fn watch_line_changed<T>(line: &str, label: &str) -> Result<bool>
+where
+    T: DeserializeOwned,
+{
     if line.is_empty() {
         return Ok(false);
     }
-    let event = serde_json::from_str::<Value>(line)
+    let event = serde_json::from_str::<WatchEvent<T>>(line)
         .with_context(|| format!("Kubernetes watch '{label}' returned invalid event JSON"))?;
-    let event_type = string_at(&event, &["type"]).unwrap_or_default();
-    match event_type {
-        "ADDED" | "MODIFIED" | "DELETED" | "ERROR" => Ok(true),
-        "BOOKMARK" => Ok(false),
-        _ => {
-            debug!(label, event_type, "ignored Kubernetes watch event");
-            Ok(false)
+    match event {
+        WatchEvent::Added(_) | WatchEvent::Modified(_) | WatchEvent::Deleted(_) => Ok(true),
+        WatchEvent::Bookmark { .. } => Ok(false),
+        WatchEvent::ErrorStatus(status) => {
+            let message = status
+                .message
+                .as_deref()
+                .unwrap_or("Kubernetes watch error");
+            bail!("Kubernetes watch '{label}' returned ERROR event: {message}")
+        }
+        WatchEvent::ErrorOther(error) => {
+            bail!("Kubernetes watch '{label}' returned non-Status ERROR event: {error:?}")
         }
     }
 }
@@ -279,24 +360,20 @@ fn default_api_server() -> Option<String> {
 fn add_service_cidrs(
     cidrs: &mut Vec<IpNet>,
     seen: &mut HashSet<IpNet>,
-    servicecidrs: &Value,
+    servicecidrs: &[ServiceCIDR],
 ) -> Result<usize> {
     let mut count = 0;
-    for item in items(servicecidrs) {
-        for value in strings_at(item, &["spec", "cidrs"]) {
-            let cidr = value
-                .parse::<IpNet>()
-                .with_context(|| format!("invalid Kubernetes ServiceCIDR '{value}'"))?;
-            if insert_unique(cidrs, seen, cidr) {
-                count += 1;
-            }
-        }
-        if let Some(value) = string_at(item, &["spec", "cidr"]) {
-            let cidr = value
-                .parse::<IpNet>()
-                .with_context(|| format!("invalid Kubernetes ServiceCIDR '{value}'"))?;
-            if insert_unique(cidrs, seen, cidr) {
-                count += 1;
+    for servicecidr in servicecidrs {
+        if let Some(spec) = &servicecidr.spec
+            && let Some(values) = &spec.cidrs
+        {
+            for value in values {
+                let cidr = value
+                    .parse::<IpNet>()
+                    .with_context(|| format!("invalid Kubernetes ServiceCIDR '{value}'"))?;
+                if insert_unique(cidrs, seen, cidr) {
+                    count += 1;
+                }
             }
         }
     }
@@ -306,22 +383,26 @@ fn add_service_cidrs(
 fn add_service_cluster_ips(
     cidrs: &mut Vec<IpNet>,
     seen: &mut HashSet<IpNet>,
-    services: &Value,
+    services: &[Service],
 ) -> Result<usize> {
     let mut count = 0;
-    for service in items(services) {
-        for value in strings_at(service, &["spec", "clusterIPs"]) {
-            if let Some(cidr) = ip_to_host_cidr(value)?
+    for service in services {
+        if let Some(spec) = &service.spec {
+            if let Some(values) = &spec.cluster_ips {
+                for value in values {
+                    if let Some(cidr) = ip_to_host_cidr(value)?
+                        && insert_unique(cidrs, seen, cidr)
+                    {
+                        count += 1;
+                    }
+                }
+            }
+            if let Some(value) = &spec.cluster_ip
+                && let Some(cidr) = ip_to_host_cidr(value)?
                 && insert_unique(cidrs, seen, cidr)
             {
                 count += 1;
             }
-        }
-        if let Some(value) = string_at(service, &["spec", "clusterIP"])
-            && let Some(cidr) = ip_to_host_cidr(value)?
-            && insert_unique(cidrs, seen, cidr)
-        {
-            count += 1;
         }
     }
     Ok(count)
@@ -350,34 +431,6 @@ fn insert_unique(cidrs: &mut Vec<IpNet>, seen: &mut HashSet<IpNet>, cidr: IpNet)
     }
 }
 
-fn items(value: &Value) -> impl Iterator<Item = &Value> {
-    value
-        .get("items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-}
-
-fn array_at<'a>(value: &'a Value, path: &[&str]) -> impl Iterator<Item = &'a Value> {
-    path.iter()
-        .try_fold(value, |current, key| current.get(*key))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-}
-
-fn strings_at<'a>(value: &'a Value, path: &[&str]) -> impl Iterator<Item = &'a str> {
-    array_at(value, path).filter_map(Value::as_str)
-}
-
-fn string_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
-    path.iter()
-        .try_fold(value, |current, key| current.get(*key))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +446,31 @@ mod tests {
             ip_to_host_cidr("10.0.0.5").unwrap().unwrap().to_string(),
             "10.0.0.5/32"
         );
+    }
+
+    #[test]
+    fn watch_bookmark_is_not_a_change() {
+        assert!(
+            !watch_line_changed::<Node>(
+                r#"{"type":"BOOKMARK","object":{"metadata":{"resourceVersion":"1"}}}"#,
+                "nodes"
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn watch_added_is_a_change_after_resource_version_anchor() {
+        assert!(watch_line_changed::<Node>(r#"{"type":"ADDED","object":{}}"#, "nodes").unwrap());
+    }
+
+    #[test]
+    fn watch_error_is_not_reported_as_policy_change() {
+        let err = watch_line_changed::<Node>(
+            r#"{"type":"ERROR","object":{"message":"too old resource version"}}"#,
+            "nodes",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("too old resource version"));
     }
 }

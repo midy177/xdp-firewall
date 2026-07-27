@@ -1,6 +1,6 @@
 [package]
 name = "xdp-firewall"
-version = "0.1.2"
+version = "0.1.5"
 edition = "2024"
 description = "Distributed XDP firewall with database-backed policy"
 license = "MIT"
@@ -13,18 +13,20 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 ipnet = { version = "2", features = ["serde"] }
 futures-util = "0.3"
-maxminddb = "0.29"
+k8s-openapi = { version = "0.28", features = ["v1_36"] }
+maxminddb = { version = "0.30", features = ["mmap"] }
 mmdb-writer = "0.1"
-prost = "0.13"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-sea-orm = { version = "1", features = ["macros", "runtime-tokio-rustls", "sqlx-postgres", "sqlx-mysql", "sqlx-sqlite", "with-chrono", "with-json"] }
+prost = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+sea-orm = { version = "2", features = ["macros", "runtime-tokio-rustls", "sqlx-postgres", "sqlx-mysql", "sqlx-sqlite", "with-chrono", "with-json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tokio-stream = "0.1"
-toml = "0.8"
-tonic = { version = "0.12", features = ["transport"] }
+toml = "1.1"
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -38,4 +40,5 @@ tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3"
-tonic-build = "0.12"
+tonic-build = "0.14"
+tonic-prost-build = "0.14"

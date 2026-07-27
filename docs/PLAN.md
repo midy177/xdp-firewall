@@ -2,6 +2,7 @@
 
 ## Active Plan
 
+- [completed] Reduce country GeoIP lookup memory pressure under 512Mi Kubernetes limits by building the generated MMDB as an IPv4 tree for the IPdeny aggregated IPv4 feed, documenting the remaining full-MMDB memory tradeoffs, and adding debug memory snapshots after GeoIP DB/MMDB writes.
 - [completed] Add the first XDP dispatcher integration phase: document direct vs dispatcher attach strategy, add CLI flags, detect existing XDP programs before direct attach, expose XDP attach state in monitor output, and fail dispatcher mode explicitly until libxdp/pinned-map integration is implemented.
 - [completed] Complete dispatcher integration by adding libbpf map pin metadata to the BPF object, loading through `xdp-loader` when `--xdp-attach-strategy dispatcher` is selected, and reopening the pinned maps from the agent so control-plane policy updates modify the live dispatcher-owned program maps.
 - [completed] Add an explicit dispatcher lifecycle flow for unload/replace: expose a safe CLI command around `xdp-loader status/unload`, document how to remove the dispatcher-managed program and pinned maps, and make replacement intentional so stale dispatcher attachments are not left behind after agent exits or upgrades.
@@ -283,6 +284,20 @@
 - [completed] Add true direct-mode XDP replacement support instead of only bypassing the pre-attach safety check with `--xdp-allow-replace`.
 - [completed] Add dispatcher map identity verification so the control plane can assert that the xdp-loader attached program is reading the same pinned map IDs that the agent updates.
 - [completed] Update Kubernetes deployment templates for runtime stability: agent DaemonSet defaults to dispatcher attach without direct-mode allow-replace, and API/agent memory limits are raised to 512Mi for GeoIP lookup and XDP control-plane headroom.
+- [completed] Reduce GeoIP refresh memory pressure: xDS request/push paths no longer trigger country refresh inline, MMDB rebuild reads persisted prefix rows in pages, and the active lookup database uses a memory-mapped temporary MMDB file instead of retaining final bytes on the heap.
+- [completed] Further reduce GeoIP memory peaks by streaming persisted country CIDR JSON during MMDB rebuild instead of materializing a per-country `Vec<IpNet>`.
+- [completed] Stream country CIDR downloads and text threat-intelligence feeds line-by-line so refresh/compile paths do not retain full response bodies when the format does not require JSON parsing.
+- [completed] Stabilize Kubernetes runtime discovery watch memory/log behavior:
+  - Start watches from the resourceVersion returned by a preceding list so existing objects are not replayed as fresh `ADDED` changes on every reconnect.
+  - Reduce unchanged watch/discovery diagnostics below debug so memory debugging is not hidden by steady-state Kubernetes watch traffic.
+  - Add a small post-change debounce to prevent rapid reconnect storms during Kubernetes object churn.
+- [completed] Replace hand-written Kubernetes JSON parsing with `k8s-openapi` typed resources for runtime discovery:
+  - Decode Node, Service, ServiceCIDR list responses as `k8s_openapi::List<T>`.
+  - Decode watch lines as `k8s_openapi::apimachinery::pkg::apis::meta::v1::WatchEvent<T>`.
+  - Remove manual `serde_json::Value` path walkers from Kubernetes discovery.
+- [completed] Update Rust and frontend dependencies to current registry releases, refresh lockfiles, and run the standard validation suite after dependency resolution.
+- [pending] Evaluate threat-intelligence prefix caching/persistence so agents do not repeatedly download and parse built-in feeds during policy compilation.
+- [pending] Keep MMDB lookup coverage as all persisted countries for correct IP ownership queries; optimize only the full-MMDB build path and refresh cadence.
 
 ## Validation Commands
 

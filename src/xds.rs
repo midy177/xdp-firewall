@@ -22,13 +22,14 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataMap;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 const TEMP_BAN_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const GEO_IP_REFRESH_INTERVAL: Duration = Duration::from_secs(86_400);
 const GEO_IP_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 const K8S_WATCH_TIMEOUT: Duration = Duration::from_secs(300);
 const K8S_WATCH_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const K8S_WATCH_CHANGE_DEBOUNCE: Duration = Duration::from_secs(1);
 
 pub mod proto {
     tonic::include_proto!("xdp_firewall.xds.v1");
@@ -61,7 +62,6 @@ struct XdsService {
     drop_events: DropEventHub,
     runtime_trusted_cidrs: RuntimeTrustedCidrs,
     temp_ban_cleanup: TempBanCleanup,
-    geo_ip_refresh: GeoIpRefresh,
     geo_lookup: geo::GeoIpLookup,
 }
 
@@ -486,6 +486,7 @@ async fn run_k8s_discovery_watch(
                         "Kubernetes runtime address discovery failed after watch event; keeping last cached runtime trusted CIDRs"
                     );
                 }
+                tokio::time::sleep(K8S_WATCH_CHANGE_DEBOUNCE).await;
             }
             Ok(false) => {}
             Err(err) => {
@@ -532,7 +533,7 @@ async fn wait_for_k8s_watch_change(
                 return Ok(true);
             }
             Ok(k8s::KubernetesWatchOutcome::Ended) => {
-                debug!(label, "Kubernetes watch stream ended; reconnecting");
+                trace!(label, "Kubernetes watch stream ended; reconnecting");
                 for handle in handles {
                     handle.abort();
                 }
@@ -596,7 +597,7 @@ async fn refresh_k8s_discovery_cache(
             "refreshed Kubernetes runtime trusted CIDRs"
         );
     } else {
-        debug!(
+        trace!(
             reason,
             node_ips = discovered.node_ips,
             pod_cidrs = discovered.pod_cidrs,
@@ -654,7 +655,6 @@ pub async fn serve(
             drop_events,
             runtime_trusted_cidrs,
             temp_ban_cleanup: TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL),
-            geo_ip_refresh,
             geo_lookup,
         }))
         .serve(bind)
@@ -828,10 +828,6 @@ impl FirewallXds for XdsService {
             return Err(unauthenticated_status());
         }
         let request = request.into_inner();
-        self.geo_ip_refresh
-            .maybe_run(&self.db)
-            .await
-            .map_err(internal_status)?;
         let version = latest_version(&self.db).await.map_err(internal_status)?;
         if version <= request.current_version && !self.runtime_trusted_cidrs.enabled() {
             return Ok(Response::new(FetchPolicyResponse {
@@ -874,7 +870,6 @@ impl FirewallXds for XdsService {
         let drop_events = self.drop_events.clone();
         let runtime_trusted_cidrs = self.runtime_trusted_cidrs.clone();
         let temp_ban_cleanup = self.temp_ban_cleanup.clone();
-        let geo_ip_refresh = self.geo_ip_refresh.clone();
         let mut drop_monitor_changes = drop_events.subscribe_changes();
         let (tx, rx) = mpsc::channel(8);
 
@@ -903,7 +898,6 @@ impl FirewallXds for XdsService {
                     sent_runtime_fingerprint.as_deref(),
                     &runtime_trusted_cidrs,
                     &temp_ban_cleanup,
-                    &geo_ip_refresh,
                 )
                 .await
                 {
@@ -1173,10 +1167,8 @@ async fn build_policy_update(
     current_runtime_fingerprint: Option<&str>,
     runtime_trusted_cidrs: &RuntimeTrustedCidrs,
     temp_ban_cleanup: &TempBanCleanup,
-    geo_ip_refresh: &GeoIpRefresh,
 ) -> Result<Option<(PolicyUpdate, String)>> {
     temp_ban_cleanup.maybe_run(db).await?;
-    geo_ip_refresh.maybe_run(db).await?;
     let version = latest_version(db).await?;
     let runtime_cidrs = runtime_trusted_cidrs.current().await;
     let runtime_fingerprint = cidr_fingerprint(&runtime_cidrs);

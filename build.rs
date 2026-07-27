@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     unsafe {
         env::set_var("PROTOC", protoc);
     }
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .compile_protos(&["proto/xdp_firewall/xds/v1/control.proto"], &["proto"])?;
 
     println!("cargo:rerun-if-changed=frontend/dist/index.html");

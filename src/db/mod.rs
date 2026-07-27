@@ -159,8 +159,7 @@ async fn create_table(
     mut stmt: sea_orm::sea_query::TableCreateStatement,
 ) -> Result<()> {
     stmt.if_not_exists();
-    let sql = db.get_database_backend().build(&stmt);
-    db.execute(sql).await?;
+    db.execute(&stmt).await?;
     Ok(())
 }
 
@@ -168,8 +167,7 @@ async fn create_index(
     db: &DatabaseConnection,
     stmt: sea_orm::sea_query::IndexCreateStatement,
 ) -> Result<()> {
-    let sql = db.get_database_backend().build(&stmt);
-    db.execute(sql).await?;
+    db.execute(&stmt).await?;
     Ok(())
 }
 
@@ -232,6 +230,7 @@ pub fn placeholder(backend: DbBackend, n: usize) -> String {
     match backend {
         DbBackend::Postgres => format!("${n}"),
         DbBackend::MySql | DbBackend::Sqlite => "?".to_string(),
+        _ => "?".to_string(),
     }
 }
 

@@ -2,17 +2,22 @@ use crate::db::entities::{geo_country_catalog, geo_ip_list_state, geo_ip_prefix}
 use crate::{db, firewall};
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
-use maxminddb::{Reader, path};
-use mmdb_writer::Writer;
+use maxminddb::{Mmap, Reader, path};
+use mmdb_writer::{IpVersion, Value, Writer};
 use reqwest::header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
-    TransactionTrait, sea_query::OnConflict,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, Set, TransactionTrait, sea_query::OnConflict,
 };
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{Error as DeError, SeqAccess, Visitor},
+};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    fmt, fs,
     net::IpAddr,
+    path::PathBuf,
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -25,6 +30,7 @@ const IPDENY_INDEX_MAX_BYTES: usize = 2 * 1024 * 1024;
 const IPDENY_COUNTRY_MAX_BYTES: usize = 16 * 1024 * 1024;
 const REFRESH_LOCK_COUNTRY: &str = "__refresh_lock__";
 const REFRESH_LOCK_STALE_SECONDS: i64 = 30 * 60;
+const GEOIP_REBUILD_PAGE_SIZE: u64 = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GeoPrefix {
     pub addr: IpAddr,
@@ -119,57 +125,109 @@ pub struct GeoIpCountry {
 
 #[derive(Clone, Default)]
 pub struct GeoIpLookup {
-    reader: Arc<RwLock<Option<Reader<Vec<u8>>>>>,
+    reader: Arc<RwLock<Option<GeoIpDatabase>>>,
+}
+
+struct GeoIpDatabase {
+    reader: Reader<Mmap>,
+    path: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct MemorySnapshot {
+    memory_limit: Option<String>,
+    memory_current: Option<String>,
+    vm_rss: Option<String>,
+    vm_hwm: Option<String>,
 }
 
 impl GeoIpLookup {
     pub async fn rebuild_from_db(&self, db: &DatabaseConnection) -> Result<usize> {
-        let rows = geo_ip_prefix::Entity::find().all(db).await?;
         let country_names = geo_country_catalog::Entity::find()
             .all(db)
             .await?
             .into_iter()
             .map(|row| (row.code, row.name))
             .collect::<HashMap<_, _>>();
+        self.clear_reader();
+
         let mut count = 0_usize;
-        let mut writer = Writer::new("XDP-Firewall-Country");
-        for row in rows {
-            let country = normalize_country(&row.country)?;
-            let country_name = country_names
-                .get(&country)
-                .cloned()
-                .unwrap_or_else(|| country.clone());
-            let cidrs = match persisted_cidrs(&row) {
-                Ok(cidrs) => cidrs,
-                Err(err) => {
-                    warn!(
-                        country = %row.country,
-                        error = %err,
-                        "skipping malformed persisted GeoIP CIDR list while rebuilding MMDB"
-                    );
-                    continue;
-                }
-            };
-            for cidr in cidrs {
-                let mut names = BTreeMap::new();
-                names.insert("en".to_string(), country_name.clone());
-                let record = MmdbCountryRecord {
-                    country: MmdbCountry {
-                        iso_code: country.clone(),
-                        names,
-                    },
+        let mut skipped_ipv6 = 0_usize;
+        let mut writer = Writer::builder("XDP-Firewall-Country")
+            .ip_version(IpVersion::V4)
+            .build();
+        let paginator = geo_ip_prefix::Entity::find()
+            .order_by_asc(geo_ip_prefix::Column::Country)
+            .paginate(db, GEOIP_REBUILD_PAGE_SIZE);
+        let pages = paginator.num_pages().await?;
+        for page in 0..pages {
+            let rows = paginator.fetch_page(page).await?;
+            for row in rows {
+                let country = normalize_country(&row.country)?;
+                let country_name = country_names
+                    .get(&country)
+                    .cloned()
+                    .unwrap_or_else(|| country.clone());
+                let value = mmdb_country_value(&country, &country_name);
+                let inserted = match for_each_persisted_cidr(&row, |cidr| {
+                    if matches!(cidr, IpNet::V6(_)) {
+                        skipped_ipv6 += 1;
+                        return Ok(());
+                    }
+                    writer.insert_value(cidr, value.clone())?;
+                    count += 1;
+                    Ok(())
+                }) {
+                    Ok(inserted) => inserted,
+                    Err(err) => {
+                        warn!(
+                            country = %row.country,
+                            error = %err,
+                            "skipping malformed persisted GeoIP CIDR list while rebuilding MMDB"
+                        );
+                        continue;
+                    }
                 };
-                writer.insert(cidr, &record)?;
-                count += 1;
+                debug!(
+                    country = %row.country,
+                    prefixes = inserted,
+                    "added country prefixes to MMDB writer"
+                );
             }
         }
-        let reader = if count == 0 {
-            None
-        } else {
-            Some(Reader::from_source(writer.to_bytes()?)?)
-        };
-        *self.reader.write().expect("geoip lookup lock poisoned") = reader;
+
+        if skipped_ipv6 > 0 {
+            warn!(
+                skipped_ipv6,
+                "skipped IPv6 country prefixes while rebuilding IPv4 IPdeny MMDB"
+            );
+        }
+
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let path = geoip_temp_path();
+        let bytes = writer.to_bytes()?;
+        fs::write(&path, bytes)
+            .with_context(|| format!("failed to write temporary MMDB {}", path.display()))?;
+        log_geo_memory_snapshot("after temporary MMDB write");
+        // SAFETY: the generated file path is unique and is not modified after this mmap is opened.
+        let reader = unsafe { Reader::open_mmap(&path) }
+            .with_context(|| format!("failed to mmap temporary MMDB {}", path.display()))?;
+        *self.reader.write().expect("geoip lookup lock poisoned") =
+            Some(GeoIpDatabase { reader, path });
+        log_geo_memory_snapshot("after temporary MMDB mmap");
         Ok(count)
+    }
+
+    fn clear_reader(&self) {
+        let old = self
+            .reader
+            .write()
+            .expect("geoip lookup lock poisoned")
+            .take();
+        drop(old);
     }
 
     pub fn lookup_country(&self, ip: IpAddr) -> Option<String> {
@@ -178,8 +236,8 @@ impl GeoIpLookup {
 
     pub fn lookup_country_record(&self, ip: IpAddr) -> Option<GeoIpCountry> {
         let guard = self.reader.read().expect("geoip lookup lock poisoned");
-        let reader = guard.as_ref()?;
-        let result = reader.lookup(ip).ok()?;
+        let database = guard.as_ref()?;
+        let result = database.reader.lookup(ip).ok()?;
         let code = result
             .decode_path::<String>(&path!["country", "iso_code"])
             .ok()
@@ -190,6 +248,78 @@ impl GeoIpLookup {
             .flatten();
         Some(GeoIpCountry { code, name })
     }
+}
+
+impl Drop for GeoIpDatabase {
+    fn drop(&mut self) {
+        if let Err(err) = fs::remove_file(&self.path) {
+            debug!(
+                path = %self.path.display(),
+                error = %err,
+                "failed to remove temporary MMDB"
+            );
+        }
+    }
+}
+
+fn geoip_temp_path() -> PathBuf {
+    let now = chrono::Utc::now();
+    std::env::temp_dir().join(format!(
+        "xdp-firewall-geoip-{}-{}.mmdb",
+        std::process::id(),
+        now.timestamp_nanos_opt()
+            .unwrap_or_else(|| now.timestamp_micros() * 1_000)
+    ))
+}
+
+fn mmdb_country_value(code: &str, name: &str) -> Value {
+    Value::map([(
+        "country",
+        Value::map([
+            ("iso_code", Value::from(code)),
+            ("names", Value::map([("en", Value::from(name))])),
+        ]),
+    )])
+}
+
+fn log_geo_memory_snapshot(event: &'static str) {
+    let snapshot = memory_snapshot();
+    debug!(
+        event,
+        memory_limit = snapshot.memory_limit.as_deref().unwrap_or("-"),
+        memory_current = snapshot.memory_current.as_deref().unwrap_or("-"),
+        vm_rss = snapshot.vm_rss.as_deref().unwrap_or("-"),
+        vm_hwm = snapshot.vm_hwm.as_deref().unwrap_or("-"),
+        "GeoIP memory snapshot"
+    );
+}
+
+fn memory_snapshot() -> MemorySnapshot {
+    let mut snapshot = MemorySnapshot {
+        memory_limit: read_trimmed("/sys/fs/cgroup/memory.max")
+            .or_else(|| read_trimmed("/sys/fs/cgroup/memory/memory.limit_in_bytes")),
+        memory_current: read_trimmed("/sys/fs/cgroup/memory.current")
+            .or_else(|| read_trimmed("/sys/fs/cgroup/memory/memory.usage_in_bytes")),
+        ..Default::default()
+    };
+
+    if let Some(status) = read_trimmed("/proc/self/status") {
+        for line in status.lines() {
+            if let Some(value) = line.strip_prefix("VmRSS:") {
+                snapshot.vm_rss = Some(value.trim().to_string());
+            } else if let Some(value) = line.strip_prefix("VmHWM:") {
+                snapshot.vm_hwm = Some(value.trim().to_string());
+            }
+        }
+    }
+    snapshot
+}
+
+fn read_trimmed(path: &str) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 pub fn ipdeny_base_url() -> &'static str {
@@ -493,21 +623,20 @@ async fn refresh_one_country(
         return Ok(None);
     }
 
-    let (fetched_metadata, body) = fetch_country_body(client, country, existing.as_ref()).await?;
-    if body.is_empty() {
+    let fetched = fetch_country_prefixes_streaming(client, country, existing.as_ref()).await?;
+    let Some((fetched_metadata, prefixes)) = fetched else {
         if let Some(existing) = existing {
             touch_geo_ip_list_state(
                 db,
                 existing,
-                fetched_metadata.last_modified,
-                fetched_metadata.etag,
+                metadata.last_modified.clone(),
+                metadata.etag.clone(),
             )
             .await?;
         }
         debug!(country, "country IP list returned not-modified");
         return Ok(None);
-    }
-    let prefixes = parse_ipdeny_body(country, &body)?;
+    };
     if prefixes.is_empty() {
         bail!("country {country} IP list is empty");
     }
@@ -589,11 +718,10 @@ pub async fn fetch_ipdeny_metadata(country: &str) -> Result<IpdenyMetadata> {
 pub async fn fetch_ipdeny_country_prefixes(country: &str) -> Result<IpdenyCountryPrefixes> {
     let country = normalize_country(country)?;
     let client = ipdeny_client()?;
-    let (metadata, body) = fetch_country_body(&client, &country, None).await?;
-    Ok(IpdenyCountryPrefixes {
-        prefixes: parse_ipdeny_body(&country, &body)?,
-        metadata,
-    })
+    let (metadata, prefixes) = fetch_country_prefixes_streaming(&client, &country, None)
+        .await?
+        .context("geo provider returned not-modified without cached metadata")?;
+    Ok(IpdenyCountryPrefixes { prefixes, metadata })
 }
 
 fn parse_ipdeny_index(body: &str) -> Result<Vec<IpdenyIndexEntry>> {
@@ -708,8 +836,9 @@ async fn replace_geo_prefixes(
     let last_modified = metadata.last_modified.clone();
     let etag = metadata.etag.clone();
     let prefix_count = i32::try_from(prefixes.len()).context("geo prefix count exceeds i32")?;
-    let cidrs = prefixes.iter().map(geo_prefix_to_cidr).collect::<Vec<_>>();
-    let cidrs_json = serde_json::to_string(&cidrs).context("failed to encode geo CIDRs as JSON")?;
+    let cidrs_json = cidrs_json_from_prefixes(prefixes);
+    let cidrs_json_bytes = cidrs_json.len();
+    let log_country = country.clone();
     db.transaction::<_, (), sea_orm::DbErr>(|txn| {
         Box::pin(async move {
             geo_ip_prefix::Entity::delete_many()
@@ -755,6 +884,17 @@ async fn replace_geo_prefixes(
         })
     })
     .await?;
+    let snapshot = memory_snapshot();
+    debug!(
+        country = %log_country,
+        prefixes = prefix_count,
+        cidrs_json_bytes,
+        memory_limit = snapshot.memory_limit.as_deref().unwrap_or("-"),
+        memory_current = snapshot.memory_current.as_deref().unwrap_or("-"),
+        vm_rss = snapshot.vm_rss.as_deref().unwrap_or("-"),
+        vm_hwm = snapshot.vm_hwm.as_deref().unwrap_or("-"),
+        "GeoIP country CIDR list persisted"
+    );
     Ok(())
 }
 
@@ -781,16 +921,75 @@ fn geo_prefix_to_cidr(prefix: &GeoPrefix) -> String {
     }
 }
 
+fn cidrs_json_from_prefixes(prefixes: &[GeoPrefix]) -> String {
+    let mut output = String::new();
+    output.push('[');
+    for (index, prefix) in prefixes.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('"');
+        output.push_str(&geo_prefix_to_cidr(prefix));
+        output.push('"');
+    }
+    output.push(']');
+    output
+}
+
 fn persisted_cidrs(row: &geo_ip_prefix::Model) -> Result<Vec<IpNet>> {
-    let cidrs = serde_json::from_str::<Vec<String>>(&row.cidrs_json)
-        .with_context(|| format!("invalid persisted geo CIDR JSON for {}", row.country))?;
-    cidrs
-        .into_iter()
-        .map(|cidr| {
-            cidr.parse::<IpNet>()
-                .with_context(|| format!("invalid persisted geo CIDR '{cidr}'"))
-        })
-        .collect()
+    let mut cidrs = Vec::new();
+    for_each_persisted_cidr(row, |cidr| {
+        cidrs.push(cidr);
+        Ok(())
+    })?;
+    Ok(cidrs)
+}
+
+fn for_each_persisted_cidr<F>(row: &geo_ip_prefix::Model, on_cidr: F) -> Result<usize>
+where
+    F: FnMut(IpNet) -> Result<()>,
+{
+    let mut deserializer = serde_json::Deserializer::from_str(&row.cidrs_json);
+    deserialize_cidr_array(&mut deserializer, on_cidr)
+        .with_context(|| format!("invalid persisted geo CIDR JSON for {}", row.country))
+}
+
+fn deserialize_cidr_array<'de, D, F>(
+    deserializer: D,
+    on_cidr: F,
+) -> std::result::Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+    F: FnMut(IpNet) -> Result<()>,
+{
+    struct CidrArrayVisitor<F> {
+        on_cidr: F,
+    }
+
+    impl<'de, F> Visitor<'de> for CidrArrayVisitor<F>
+    where
+        F: FnMut(IpNet) -> Result<()>,
+    {
+        type Value = usize;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an array of CIDR strings")
+        }
+
+        fn visit_seq<A>(mut self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut count = 0_usize;
+            while let Some(cidr) = seq.next_element::<IpNet>()? {
+                (self.on_cidr)(cidr).map_err(A::Error::custom)?;
+                count += 1;
+            }
+            Ok(count)
+        }
+    }
+
+    deserializer.deserialize_seq(CidrArrayVisitor { on_cidr })
 }
 
 pub async fn fetch_ipdeny_prefixes(countries: &[String]) -> Result<Vec<GeoPrefix>> {
@@ -802,36 +1001,32 @@ pub async fn fetch_ipdeny_prefixes(countries: &[String]) -> Result<Vec<GeoPrefix
     Ok(prefixes)
 }
 
-fn parse_ipdeny_body(country: &str, body: &str) -> Result<Vec<GeoPrefix>> {
-    let country_code = encode_country(country)?;
-    let mut prefixes = Vec::new();
-    for line in body.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let net = match line.parse::<IpNet>() {
-            Ok(net) => net,
-            Err(err) => {
-                warn!(
-                    country,
-                    cidr = line,
-                    error = %err,
-                    "skipping malformed IPdeny CIDR line"
-                );
-                continue;
-            }
-        };
-        let (addr, prefix) = match net {
-            IpNet::V4(net) => (IpAddr::V4(net.network()), net.prefix_len()),
-            IpNet::V6(net) => (IpAddr::V6(net.network()), net.prefix_len()),
-        };
-        prefixes.push(GeoPrefix {
-            addr,
-            prefix,
-            country: country_code,
-        });
+fn parse_ipdeny_line(country: &str, country_code: u16, line: &str) -> Option<GeoPrefix> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
     }
-    Ok(prefixes)
+    let net = match line.parse::<IpNet>() {
+        Ok(net) => net,
+        Err(err) => {
+            warn!(
+                country,
+                cidr = line,
+                error = %err,
+                "skipping malformed IPdeny CIDR line"
+            );
+            return None;
+        }
+    };
+    let (addr, prefix) = match net {
+        IpNet::V4(net) => (IpAddr::V4(net.network()), net.prefix_len()),
+        IpNet::V6(net) => (IpAddr::V6(net.network()), net.prefix_len()),
+    };
+    Some(GeoPrefix {
+        addr,
+        prefix,
+        country: country_code,
+    })
 }
 
 fn header_string(
@@ -871,11 +1066,11 @@ async fn fetch_country_metadata(client: &reqwest::Client, country: &str) -> Resu
     })
 }
 
-async fn fetch_country_body(
+async fn fetch_country_prefixes_streaming(
     client: &reqwest::Client,
     country: &str,
     existing: Option<&geo_ip_list_state::Model>,
-) -> Result<(IpdenyMetadata, String)> {
+) -> Result<Option<(IpdenyMetadata, Vec<GeoPrefix>)>> {
     let country = normalize_country(country)?;
     let url = ipdeny_country_url(&country)?;
     let mut request = client.get(&url);
@@ -896,25 +1091,23 @@ async fn fetch_country_body(
         .await
         .with_context(|| format!("failed to fetch {url}"))?;
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-        let metadata = IpdenyMetadata {
-            country,
-            url,
-            last_modified: existing.and_then(|row| row.last_modified.clone()),
-            etag: existing.and_then(|row| row.etag.clone()),
-        };
-        return Ok((metadata, String::new()));
+        return Ok(None);
     }
     let response = response
         .error_for_status()
         .with_context(|| format!("geo provider returned error for {url}"))?;
     let metadata = IpdenyMetadata {
-        country,
+        country: country.clone(),
         url,
         last_modified: header_string(response.headers(), LAST_MODIFIED),
         etag: header_string(response.headers(), ETAG),
     };
-    let body = response_text_limited(response, IPDENY_COUNTRY_MAX_BYTES).await?;
-    Ok((metadata, body))
+    let country_code = encode_country(&country)?;
+    let prefixes = response_lines_limited(response, IPDENY_COUNTRY_MAX_BYTES, |line| {
+        Ok(parse_ipdeny_line(&country, country_code, line))
+    })
+    .await?;
+    Ok(Some((metadata, prefixes)))
 }
 
 async fn fetch_text_limited(
@@ -949,6 +1142,56 @@ async fn response_text_limited(
         bytes.extend_from_slice(&chunk);
     }
     String::from_utf8(bytes).context("geo provider returned non-UTF-8 response")
+}
+
+async fn response_lines_limited<T, F>(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    mut parse_line: F,
+) -> Result<Vec<T>>
+where
+    F: FnMut(&str) -> Result<Option<T>>,
+{
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        bail!("geo provider response is too large: content-length exceeds {max_bytes} bytes");
+    }
+    let mut total = 0_usize;
+    let mut carry = Vec::new();
+    let mut parsed = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        total += chunk.len();
+        if total > max_bytes {
+            bail!("geo provider response exceeded {max_bytes} bytes");
+        }
+        carry.extend_from_slice(&chunk);
+        while let Some(newline) = carry.iter().position(|byte| *byte == b'\n') {
+            let mut line = carry.drain(..=newline).collect::<Vec<_>>();
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let line =
+                std::str::from_utf8(&line).context("geo provider returned non-UTF-8 line")?;
+            if let Some(value) = parse_line(line)? {
+                parsed.push(value);
+            }
+        }
+    }
+    if !carry.is_empty() {
+        if carry.last() == Some(&b'\r') {
+            carry.pop();
+        }
+        let line = std::str::from_utf8(&carry).context("geo provider returned non-UTF-8 line")?;
+        if let Some(value) = parse_line(line)? {
+            parsed.push(value);
+        }
+    }
+    Ok(parsed)
 }
 
 pub fn normalize_country(value: &str) -> Result<String> {
@@ -1066,5 +1309,45 @@ mod tests {
             lookup.lookup_country("198.51.100.10".parse().unwrap()),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn geoip_lookup_skips_ipv6_prefixes_for_ipdeny_ipv4_database() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.sqlx_logging(false);
+        let db = Database::connect(options).await.unwrap();
+        crate::db::migrate(&db).await.unwrap();
+
+        geo_country_catalog::ActiveModel {
+            code: Set("ZZ".to_string()),
+            name: Set("Test Country".to_string()),
+            url: Set(ipdeny_country_url("ZZ").unwrap()),
+            last_modified: Set(Some("test".to_string())),
+            size_bytes: Set(None),
+            last_checked_at: Set(chrono::Utc::now().naive_utc()),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        geo_ip_prefix::ActiveModel {
+            country: Set("ZZ".to_string()),
+            cidrs_json: Set(r#"["2001:db8::/32","203.0.113.0/24"]"#.to_string()),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let lookup = GeoIpLookup::default();
+        assert_eq!(lookup.rebuild_from_db(&db).await.unwrap(), 1);
+        assert_eq!(
+            lookup.lookup_country("203.0.113.10".parse().unwrap()),
+            Some("ZZ".to_string())
+        );
+        assert_eq!(lookup.lookup_country("2001:db8::1".parse().unwrap()), None);
     }
 }
