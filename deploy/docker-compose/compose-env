@@ -28,7 +28,7 @@ XDP_FIREWALL_XDS_PUSH_INTERVAL_SECONDS=5
 
 # XDP attach mode: auto, driver, or skb.
 # AWS ENA instances with jumbo MTU should use skb to skip noisy native attach fallback.
-XDP_FIREWALL_XDP_MODE=skb
+XDP_FIREWALL_XDP_MODE=auto
 
 # XDP attach strategy: direct or dispatcher. Dispatcher uses xdp-loader/libxdp
 # and is preferred when the interface may already run another XDP program.
