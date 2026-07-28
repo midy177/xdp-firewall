@@ -56,10 +56,10 @@ docker compose --env-file deploy/docker-compose/compose-env.local \
   -f deploy/docker-compose/compose.sqlite.yml exec api xdp-firewall policy show
 ```
 
-or the authenticated API:
+or the authenticated API to read the current policy version (inspect individual resources through their paginated endpoints such as `/rules` and `/geo-countries`):
 
 ```bash
-curl http://127.0.0.1:8080/policy \
+curl http://127.0.0.1:8080/policy/version \
   -H "authorization: Bearer $XDP_FIREWALL_API_TOKEN"
 ```
 
@@ -168,6 +168,7 @@ Notes:
 - XDP attach strategy defaults to `direct`. Direct mode refuses to start if the interface already has an XDP program attached; set `XDP_FIREWALL_XDP_ALLOW_REPLACE=true` only when compare-and-replace is intentional. Direct replacement does not restore the previous XDP program when this agent exits. `dispatcher` uses `xdp-loader`/libxdp multiprogram attach, pins maps under `/sys/fs/bpf/xdp-firewall/<interface>`, verifies with `bpftool` that the attached dispatcher program references those pinned map IDs, and orders this firewall by `XDP_FIREWALL_XDP_RUN_PRIORITY` where lower values run earlier. Dispatcher mode does not need `XDP_FIREWALL_XDP_ALLOW_REPLACE` because it replaces the same program name in the libxdp chain. Dispatcher programs are managed by xdp-loader and are not detached automatically when the agent process exits.
 - The Kubernetes DaemonSet template uses dispatcher attach by default so restarts converge on one `xdp_firewall` entry instead of failing or stacking duplicate direct attachments.
 - The Kubernetes API template uses a 512Mi memory limit because loading the persisted country IP lookup database and refreshing country IP metadata can exceed a small 256Mi control-plane limit.
+- The API template sets `XDP_FIREWALL_DB_MAX_CONNECTIONS=16`. Lower the database pool size for small deployments if idle connections become visible in steady RSS; set it higher only when many agents or concurrent API requests are waiting on database acquisition.
 - Use `xdp-firewall xdp status`, `xdp-firewall xdp unload --all`, or `xdp-firewall xdp replace --all` inside the privileged agent container for explicit dispatcher lifecycle operations. Pinned maps are preserved unless `--remove-pins` is provided with `--all`.
 - Trusted source prefixes can be managed through the API/frontend for persistence. `--trusted-cidr` and `XDP_FIREWALL_TRUSTED_CIDRS` are runtime-only xDS additions and do not mutate database rows. Trusted prefixes are the highest-priority whitelist and are allowed before firewall, threat-intelligence, country, and dynamic defense checks.
 - Dynamic defense supports global per-source-IP `ip_rate_limit` and `flood`, plus custom protocol/destination-port rate limits managed through the API/frontend. Custom dynamic limits are evaluated after country rules and before the global dynamic defense checks.

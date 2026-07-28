@@ -2,3 +2,5 @@ dist/
 frontend/node_modules/
 target/
 frontend/dist/
+heap*.pb.gz
+prom-*-6h.json

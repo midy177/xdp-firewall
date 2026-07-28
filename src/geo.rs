@@ -16,6 +16,7 @@ use serde::{
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt, fs,
+    io::Write,
     net::IpAddr,
     path::PathBuf,
     sync::{Arc, RwLock},
@@ -36,6 +37,12 @@ pub struct GeoPrefix {
     pub addr: IpAddr,
     pub prefix: u8,
     pub country: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeoPrefixPage {
+    pub prefixes: Vec<GeoPrefix>,
+    pub next_page_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,9 +215,21 @@ impl GeoIpLookup {
         }
 
         let path = geoip_temp_path();
-        let bytes = writer.to_bytes()?;
-        fs::write(&path, bytes)
-            .with_context(|| format!("failed to write temporary MMDB {}", path.display()))?;
+        // Stream the MMDB straight to disk instead of materializing the whole
+        // database in a heap `Vec` via `to_bytes()`. The one-shot large buffer
+        // was the main source of allocator fragmentation on periodic rebuilds,
+        // which kept steady-state RSS from being returned to the OS.
+        {
+            let file = fs::File::create(&path)
+                .with_context(|| format!("failed to create temporary MMDB {}", path.display()))?;
+            let mut file = std::io::BufWriter::new(file);
+            writer
+                .write_to(&mut file)
+                .with_context(|| format!("failed to write temporary MMDB {}", path.display()))?;
+            file.flush()
+                .with_context(|| format!("failed to flush temporary MMDB {}", path.display()))?;
+        }
+        drop(writer);
         log_geo_memory_snapshot("after temporary MMDB write");
         // SAFETY: the generated file path is unique and is not modified after this mmap is opened.
         let reader = unsafe { Reader::open_mmap(&path) }
@@ -671,18 +690,7 @@ pub async fn load_persisted_geo_prefixes(
             );
             continue;
         };
-        let cidrs = match persisted_cidrs(&row) {
-            Ok(cidrs) => cidrs,
-            Err(err) => {
-                warn!(
-                    country,
-                    error = %err,
-                    "skipping malformed persisted country IP list"
-                );
-                continue;
-            }
-        };
-        for net in cidrs {
+        match for_each_persisted_cidr(&row, |net| {
             let (addr, prefix) = match net {
                 IpNet::V4(net) => (IpAddr::V4(net.network()), net.prefix_len()),
                 IpNet::V6(net) => (IpAddr::V6(net.network()), net.prefix_len()),
@@ -692,9 +700,114 @@ pub async fn load_persisted_geo_prefixes(
                 prefix,
                 country: country_code,
             });
+            Ok(())
+        }) {
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    country,
+                    error = %err,
+                    "skipping malformed persisted country IP list"
+                );
+                continue;
+            }
         }
     }
     Ok(prefixes)
+}
+
+pub async fn load_persisted_geo_prefix_page(
+    db: &DatabaseConnection,
+    countries: &[String],
+    page_token: Option<&str>,
+    page_size: usize,
+) -> Result<GeoPrefixPage> {
+    let page_size = page_size.max(1);
+    let (start_country_index, start_prefix_offset) = parse_geo_prefix_page_token(page_token)?;
+    let mut prefixes = Vec::with_capacity(page_size);
+    let mut next_page_token = None;
+
+    for (country_index, country) in countries.iter().enumerate().skip(start_country_index) {
+        let country = normalize_country(country)?;
+        let country_code = encode_country(&country)?;
+        let Some(row) = geo_ip_prefix::Entity::find()
+            .filter(geo_ip_prefix::Column::Country.eq(&country))
+            .one(db)
+            .await?
+        else {
+            warn!(
+                country,
+                "enabled country rule has no persisted IP list yet; run /geo-countries/refresh"
+            );
+            continue;
+        };
+
+        let mut offset = 0_usize;
+        let skip_until = if country_index == start_country_index {
+            start_prefix_offset
+        } else {
+            0
+        };
+        match for_each_persisted_cidr(&row, |net| {
+            if offset < skip_until {
+                offset += 1;
+                return Ok(());
+            }
+            if prefixes.len() < page_size {
+                let (addr, prefix) = match net {
+                    IpNet::V4(net) => (IpAddr::V4(net.network()), net.prefix_len()),
+                    IpNet::V6(net) => (IpAddr::V6(net.network()), net.prefix_len()),
+                };
+                prefixes.push(GeoPrefix {
+                    addr,
+                    prefix,
+                    country: country_code,
+                });
+                offset += 1;
+                return Ok(());
+            }
+            if next_page_token.is_none() {
+                next_page_token = Some(format!("{country_index}:{offset}"));
+            }
+            offset += 1;
+            Ok(())
+        }) {
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    country,
+                    error = %err,
+                    "skipping malformed persisted country IP list"
+                );
+                continue;
+            }
+        }
+        if next_page_token.is_some() {
+            break;
+        }
+    }
+
+    Ok(GeoPrefixPage {
+        prefixes,
+        next_page_token,
+    })
+}
+
+fn parse_geo_prefix_page_token(page_token: Option<&str>) -> Result<(usize, usize)> {
+    let Some(page_token) = page_token.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok((0, 0));
+    };
+    let Some((country_index, prefix_offset)) = page_token.split_once(':') else {
+        bail!("invalid GeoIP page token");
+    };
+    Ok((
+        country_index
+            .parse::<usize>()
+            .context("invalid GeoIP page token country index")?,
+        prefix_offset
+            .parse::<usize>()
+            .context("invalid GeoIP page token prefix offset")?,
+    ))
 }
 
 pub async fn fetch_ipdeny_metadata(country: &str) -> Result<IpdenyMetadata> {
@@ -914,7 +1027,7 @@ async fn touch_geo_ip_list_state(
     Ok(())
 }
 
-fn geo_prefix_to_cidr(prefix: &GeoPrefix) -> String {
+pub fn geo_prefix_to_cidr(prefix: &GeoPrefix) -> String {
     match prefix.addr {
         IpAddr::V4(addr) => format!("{addr}/{}", prefix.prefix),
         IpAddr::V6(addr) => format!("{addr}/{}", prefix.prefix),
@@ -1259,6 +1372,85 @@ mod tests {
         };
         assert!(geo_ip_list_changed(Some(&state), false, Some("same"), None));
         assert!(!geo_ip_list_changed(Some(&state), true, Some("same"), None));
+    }
+
+    #[tokio::test]
+    async fn load_persisted_geo_prefix_page_paginates_without_empty_tail_page() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.sqlx_logging(false);
+        let db = Database::connect(options).await.unwrap();
+        crate::db::migrate(&db).await.unwrap();
+
+        for (country, cidrs_json) in [
+            ("CN", r#"["198.51.100.0/24","198.51.101.0/24"]"#),
+            ("US", r#"["203.0.113.0/24"]"#),
+        ] {
+            geo_ip_prefix::ActiveModel {
+                country: Set(country.to_string()),
+                cidrs_json: Set(cidrs_json.to_string()),
+                updated_at: Set(chrono::Utc::now().naive_utc()),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+
+        let countries = vec!["CN".to_string(), "US".to_string()];
+        let page = load_persisted_geo_prefix_page(&db, &countries, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(page.prefixes.len(), 2);
+        assert_eq!(geo_prefix_to_cidr(&page.prefixes[0]), "198.51.100.0/24");
+        assert_eq!(geo_prefix_to_cidr(&page.prefixes[1]), "198.51.101.0/24");
+        assert_eq!(page.next_page_token.as_deref(), Some("1:0"));
+
+        let page =
+            load_persisted_geo_prefix_page(&db, &countries, page.next_page_token.as_deref(), 2)
+                .await
+                .unwrap();
+        assert_eq!(page.prefixes.len(), 1);
+        assert_eq!(geo_prefix_to_cidr(&page.prefixes[0]), "203.0.113.0/24");
+        assert_eq!(page.next_page_token, None);
+    }
+
+    #[tokio::test]
+    async fn load_persisted_geo_prefix_page_splits_within_a_single_country() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.sqlx_logging(false);
+        let db = Database::connect(options).await.unwrap();
+        crate::db::migrate(&db).await.unwrap();
+
+        geo_ip_prefix::ActiveModel {
+            country: Set("CN".to_string()),
+            cidrs_json: Set(
+                r#"["198.51.100.0/24","198.51.101.0/24","198.51.102.0/24"]"#.to_string()
+            ),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let countries = vec!["CN".to_string()];
+        // Page size 2 forces a cursor into the middle of a single country's
+        // prefix list, exercising the prefix_offset > 0 branch of the token.
+        let page = load_persisted_geo_prefix_page(&db, &countries, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(page.prefixes.len(), 2);
+        assert_eq!(geo_prefix_to_cidr(&page.prefixes[0]), "198.51.100.0/24");
+        assert_eq!(geo_prefix_to_cidr(&page.prefixes[1]), "198.51.101.0/24");
+        assert_eq!(page.next_page_token.as_deref(), Some("0:2"));
+
+        let page =
+            load_persisted_geo_prefix_page(&db, &countries, page.next_page_token.as_deref(), 2)
+                .await
+                .unwrap();
+        assert_eq!(page.prefixes.len(), 1);
+        assert_eq!(geo_prefix_to_cidr(&page.prefixes[0]), "198.51.102.0/24");
+        assert_eq!(page.next_page_token, None);
     }
 
     #[tokio::test]

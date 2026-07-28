@@ -4,8 +4,8 @@ use crate::{firewall, geo, k8s, monitor, security};
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, Set, TransactionTrait,
-    sea_query::OnConflict,
+    ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder, Set,
+    TransactionTrait, sea_query::OnConflict,
 };
 use serde::Serialize;
 use std::{
@@ -38,9 +38,13 @@ pub mod proto {
 use proto::firewall_xds_client::FirewallXdsClient;
 use proto::firewall_xds_server::{FirewallXds, FirewallXdsServer};
 use proto::{
-    DropEvent, DropEventResponse, FetchPolicyRequest, FetchPolicyResponse, HeartbeatRequest,
+    DropEvent, DropEventResponse, FetchGeoPrefixesRequest, FetchGeoPrefixesResponse,
+    FetchPolicyRequest, FetchPolicyResponse, GeoPrefix as ProtoGeoPrefix, HeartbeatRequest,
     HeartbeatResponse, PolicyUpdate, StreamPolicyRequest,
 };
+
+const GEO_PREFIX_PAGE_SIZE: u32 = 4096;
+const MAX_GEO_PREFIX_PAGE_SIZE: u32 = 10_000;
 
 #[derive(Clone)]
 pub struct XdsClientConfig {
@@ -700,13 +704,17 @@ impl XdsClient {
             node_id: node_id.to_string(),
             interface_name: interface_name.to_string(),
             current_version,
+            supports_external_geo_prefixes: true,
         })?;
         let response = self.inner.fetch_policy(request).await?.into_inner();
         if response.unchanged {
             return Ok(None);
         }
-        let snapshot = serde_json::from_str(&response.policy_json)
+        let mut snapshot: firewall::PolicySnapshot = serde_json::from_str(&response.policy_json)
             .context("xDS control plane returned invalid policy JSON")?;
+        if response.external_geo_prefixes {
+            snapshot.geo_prefixes = self.fetch_geo_prefixes(response.geo_prefix_version).await?;
+        }
         Ok(Some((response.version, snapshot)))
     }
 
@@ -720,22 +728,59 @@ impl XdsClient {
             node_id: node_id.to_string(),
             interface_name: interface_name.to_string(),
             current_version,
+            supports_external_geo_prefixes: true,
         })?;
         Ok(self.inner.stream_policy(request).await?.into_inner())
     }
 
-    pub fn policy_from_update(
+    pub async fn policy_from_update(
+        &mut self,
         update: PolicyUpdate,
     ) -> Result<(i64, Option<firewall::PolicySnapshot>, bool)> {
-        let snapshot = if update.policy_json.trim().is_empty() {
+        let mut snapshot = if update.policy_json.trim().is_empty() {
             None
         } else {
             Some(
-                serde_json::from_str(&update.policy_json)
+                serde_json::from_str::<firewall::PolicySnapshot>(&update.policy_json)
                     .context("xDS control plane returned invalid policy JSON")?,
             )
         };
+        if let Some(snapshot) = snapshot.as_mut()
+            && update.external_geo_prefixes
+        {
+            snapshot.geo_prefixes = self.fetch_geo_prefixes(update.geo_prefix_version).await?;
+        }
         Ok((update.version, snapshot, update.drop_monitor_enabled))
+    }
+
+    async fn fetch_geo_prefixes(
+        &mut self,
+        version: i64,
+    ) -> Result<Vec<firewall::GeoIpPrefixPolicy>> {
+        let mut prefixes = Vec::new();
+        let mut page_token = String::new();
+        loop {
+            let request = self.with_auth(FetchGeoPrefixesRequest {
+                version,
+                page_size: GEO_PREFIX_PAGE_SIZE,
+                page_token,
+            })?;
+            let response = self.inner.fetch_geo_prefixes(request).await?.into_inner();
+            for prefix in response.prefixes {
+                prefixes.push(firewall::GeoIpPrefixPolicy {
+                    cidr: prefix
+                        .cidr
+                        .parse()
+                        .with_context(|| format!("invalid xDS GeoIP CIDR '{}'", prefix.cidr))?,
+                    country: geo::normalize_country(&prefix.country)?,
+                });
+            }
+            if response.next_page_token.trim().is_empty() {
+                break;
+            }
+            page_token = response.next_page_token;
+        }
+        Ok(prefixes)
     }
 
     pub async fn report_heartbeat(
@@ -834,19 +879,27 @@ impl FirewallXds for XdsService {
                 version,
                 unchanged: true,
                 policy_json: String::new(),
+                external_geo_prefixes: false,
+                geo_prefix_version: 0,
             }));
         }
 
-        let (snapshot, runtime_fingerprint) =
-            load_xds_snapshot(&self.db, &self.runtime_trusted_cidrs)
-                .await
-                .map_err(internal_status)?;
+        let external_geo_prefixes = request.supports_external_geo_prefixes;
+        let (snapshot, runtime_fingerprint) = load_xds_snapshot(
+            &self.db,
+            &self.runtime_trusted_cidrs,
+            !external_geo_prefixes,
+        )
+        .await
+        .map_err(internal_status)?;
+        let geo_prefix_version = if external_geo_prefixes { version } else { 0 };
         let policy_json = serde_json::to_string(&snapshot).map_err(internal_status)?;
         info!(
             node_id = %request.node_id,
             interface = %request.interface_name,
             requested_version = request.current_version,
             version,
+            external_geo_prefixes,
             runtime_fingerprint,
             "xDS returned updated policy"
         );
@@ -854,6 +907,57 @@ impl FirewallXds for XdsService {
             version,
             unchanged: false,
             policy_json,
+            external_geo_prefixes,
+            geo_prefix_version,
+        }))
+    }
+
+    async fn fetch_geo_prefixes(
+        &self,
+        request: Request<FetchGeoPrefixesRequest>,
+    ) -> std::result::Result<Response<FetchGeoPrefixesResponse>, Status> {
+        if !self.authorized(request.metadata()) {
+            return Err(unauthenticated_status());
+        }
+        let request = request.into_inner();
+        let version = latest_version(&self.db).await.map_err(internal_status)?;
+        if request.version > 0 && request.version != version {
+            return Err(Status::failed_precondition(
+                "GeoIP prefix version changed; refetch policy",
+            ));
+        }
+        let page_size = if request.page_size == 0 {
+            GEO_PREFIX_PAGE_SIZE
+        } else {
+            request.page_size.min(MAX_GEO_PREFIX_PAGE_SIZE)
+        } as usize;
+        let countries = enabled_geo_countries(&self.db)
+            .await
+            .map_err(internal_status)?;
+        let page = geo::load_persisted_geo_prefix_page(
+            &self.db,
+            &countries,
+            Some(&request.page_token),
+            page_size,
+        )
+        .await
+        .map_err(internal_status)?;
+        let prefixes = page
+            .prefixes
+            .iter()
+            .map(|prefix| {
+                Ok(ProtoGeoPrefix {
+                    cidr: geo::geo_prefix_to_cidr(prefix),
+                    country: geo::decode_country(prefix.country)
+                        .with_context(|| "invalid persisted geo country code")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .map_err(internal_status)?;
+        Ok(Response::new(FetchGeoPrefixesResponse {
+            version,
+            prefixes,
+            next_page_token: page.next_page_token.unwrap_or_default(),
         }))
     }
 
@@ -874,6 +978,7 @@ impl FirewallXds for XdsService {
         let (tx, rx) = mpsc::channel(8);
 
         tokio::spawn(async move {
+            let supports_external_geo_prefixes = request.supports_external_geo_prefixes;
             let mut sent_version = request.current_version;
             let mut sent_runtime_fingerprint = None;
             let mut sent_drop_monitor_enabled = drop_events.enabled_for_node(&request.node_id);
@@ -883,6 +988,8 @@ impl FirewallXds for XdsService {
                         version: sent_version.max(0),
                         policy_json: String::new(),
                         drop_monitor_enabled: sent_drop_monitor_enabled,
+                        external_geo_prefixes: false,
+                        geo_prefix_version: 0,
                     }))
                     .is_err()
             {
@@ -898,6 +1005,7 @@ impl FirewallXds for XdsService {
                     sent_runtime_fingerprint.as_deref(),
                     &runtime_trusted_cidrs,
                     &temp_ban_cleanup,
+                    supports_external_geo_prefixes,
                 )
                 .await
                 {
@@ -947,6 +1055,8 @@ impl FirewallXds for XdsService {
                                 version: sent_version.max(0),
                                 policy_json: String::new(),
                                 drop_monitor_enabled: enabled,
+                                external_geo_prefixes: false,
+                                geo_prefix_version: 0,
                             })) {
                                 Ok(()) => {
                                     info!(
@@ -1161,12 +1271,25 @@ async fn geo_ip_lists_missing(db: &DatabaseConnection) -> Result<bool> {
     Ok(false)
 }
 
+async fn enabled_geo_countries(db: &DatabaseConnection) -> Result<Vec<String>> {
+    Ok(geo_country_policy::Entity::find()
+        .filter(geo_country_policy::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(geo_country_policy::Column::Enabled.eq(true))
+        .order_by_asc(geo_country_policy::Column::Country)
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| row.country)
+        .collect())
+}
+
 async fn build_policy_update(
     db: &DatabaseConnection,
     current_version: i64,
     current_runtime_fingerprint: Option<&str>,
     runtime_trusted_cidrs: &RuntimeTrustedCidrs,
     temp_ban_cleanup: &TempBanCleanup,
+    supports_external_geo_prefixes: bool,
 ) -> Result<Option<(PolicyUpdate, String)>> {
     temp_ban_cleanup.maybe_run(db).await?;
     let version = latest_version(db).await?;
@@ -1178,14 +1301,25 @@ async fn build_policy_update(
     {
         return Ok(None);
     }
-    let mut snapshot = firewall::load_policy(db, firewall::DEFAULT_POLICY_NAME).await?;
+    let mut snapshot = if supports_external_geo_prefixes {
+        firewall::load_policy_without_geo_prefixes(db, firewall::DEFAULT_POLICY_NAME).await?
+    } else {
+        firewall::load_policy(db, firewall::DEFAULT_POLICY_NAME).await?
+    };
     inject_runtime_trusted_cidrs(&mut snapshot, runtime_cidrs);
+    let geo_prefix_version = if supports_external_geo_prefixes {
+        version
+    } else {
+        0
+    };
     let policy_json = serde_json::to_string(&snapshot)?;
     Ok(Some((
         PolicyUpdate {
             version,
             policy_json,
             drop_monitor_enabled: false,
+            external_geo_prefixes: supports_external_geo_prefixes,
+            geo_prefix_version,
         },
         runtime_fingerprint,
     )))
@@ -1194,10 +1328,15 @@ async fn build_policy_update(
 async fn load_xds_snapshot(
     db: &DatabaseConnection,
     runtime_trusted_cidrs: &RuntimeTrustedCidrs,
+    include_geo_prefixes: bool,
 ) -> Result<(firewall::PolicySnapshot, String)> {
     let runtime_cidrs = runtime_trusted_cidrs.current().await;
     let runtime_fingerprint = cidr_fingerprint(&runtime_cidrs);
-    let mut snapshot = firewall::load_policy(db, firewall::DEFAULT_POLICY_NAME).await?;
+    let mut snapshot = if include_geo_prefixes {
+        firewall::load_policy(db, firewall::DEFAULT_POLICY_NAME).await?
+    } else {
+        firewall::load_policy_without_geo_prefixes(db, firewall::DEFAULT_POLICY_NAME).await?
+    };
     inject_runtime_trusted_cidrs(&mut snapshot, runtime_cidrs);
     Ok((snapshot, runtime_fingerprint))
 }
@@ -1387,5 +1526,84 @@ mod tests {
         let rows = temp_ban::Entity::find().all(&db).await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(latest_version(&db).await.unwrap(), 1);
+    }
+
+    fn test_service(db: DatabaseConnection) -> XdsService {
+        XdsService {
+            db,
+            agent_token: None,
+            push_interval: Duration::from_secs(1),
+            drop_events: DropEventHub::new(),
+            runtime_trusted_cidrs: RuntimeTrustedCidrs::new(Vec::new(), None),
+            temp_ban_cleanup: TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL),
+            geo_lookup: geo::GeoIpLookup::default(),
+        }
+    }
+
+    async fn seed_enabled_country_with_prefixes(db: &DatabaseConnection) {
+        let now = chrono::Utc::now().naive_utc();
+        geo_country_policy::ActiveModel {
+            policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+            enabled: Set(true),
+            country: Set("US".to_string()),
+            action: Set("deny".to_string()),
+            packets_per_second: Set(None),
+            burst: Set(None),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        geo_ip_prefix::ActiveModel {
+            country: Set("US".to_string()),
+            cidrs_json: Set(r#"["203.0.113.0/24","203.0.114.0/24"]"#.to_string()),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        crate::db::next_policy_version(db, firewall::DEFAULT_POLICY_NAME)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_geo_prefixes_rejects_stale_version() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.sqlx_logging(false);
+        let db = Database::connect(options).await.unwrap();
+        crate::db::migrate(&db).await.unwrap();
+        seed_enabled_country_with_prefixes(&db).await;
+        let version = latest_version(&db).await.unwrap();
+
+        let service = test_service(db);
+
+        // Matching version returns the persisted prefixes.
+        let ok = service
+            .fetch_geo_prefixes(Request::new(FetchGeoPrefixesRequest {
+                version,
+                page_size: 0,
+                page_token: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(ok.version, version);
+        assert_eq!(ok.prefixes.len(), 2);
+        assert!(ok.next_page_token.is_empty());
+
+        // A stale version is rejected so the agent refetches the policy instead
+        // of mixing a new policy with an old GeoIP snapshot.
+        let stale = service
+            .fetch_geo_prefixes(Request::new(FetchGeoPrefixesRequest {
+                version: version + 1,
+                page_size: 0,
+                page_token: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
     }
 }

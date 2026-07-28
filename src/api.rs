@@ -90,6 +90,11 @@ struct HealthResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct PolicyVersionResponse {
+    version: i64,
+}
+
+#[derive(Debug, Serialize)]
 struct Versioned<T> {
     version: i64,
     data: T,
@@ -273,7 +278,7 @@ pub async fn serve(
 
 fn router(state: ApiState) -> Router {
     let api_routes = Router::new()
-        .route("/policy", get(get_policy))
+        .route("/policy/version", get(get_policy_version))
         .route("/policy/bump-version", post(bump_policy_version))
         .route("/policy/seed-example", post(seed_example_policy))
         .route("/policies", any(removed_multi_policy_api))
@@ -313,11 +318,12 @@ fn router(state: ApiState) -> Router {
         .route("/trusted-cidrs/{id}", delete(delete_trusted_cidr))
         .route("/nodes", get(list_nodes))
         .route("/nodes/{node_id}", get(get_node))
-        .route("/drop-events/stream", get(stream_drop_events))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_api_token,
-        ));
+        .route("/drop-events/stream", get(stream_drop_events));
+
+    let api_routes = api_routes.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        require_api_token,
+    ));
 
     Router::new()
         .route("/", get(frontend_index))
@@ -474,10 +480,15 @@ async fn removed_multi_policy_api() -> ApiResult<()> {
     ))
 }
 
-async fn get_policy(State(state): State<ApiState>) -> ApiResult<Json<firewall::PolicySnapshot>> {
-    Ok(Json(
-        firewall::load_policy(&state.db, firewall::DEFAULT_POLICY_NAME).await?,
-    ))
+/// Returns only the current policy version. Clients that just need to detect a
+/// policy change (e.g. the UI header) use this instead of loading the full
+/// snapshot, which would include the large GeoIP prefix list.
+async fn get_policy_version(
+    State(state): State<ApiState>,
+) -> ApiResult<Json<PolicyVersionResponse>> {
+    Ok(Json(PolicyVersionResponse {
+        version: current_policy_version(&state.db).await?,
+    }))
 }
 
 async fn bump_policy_version(

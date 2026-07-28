@@ -4,6 +4,7 @@ package xdp_firewall.xds.v1;
 
 service FirewallXds {
   rpc FetchPolicy(FetchPolicyRequest) returns (FetchPolicyResponse);
+  rpc FetchGeoPrefixes(FetchGeoPrefixesRequest) returns (FetchGeoPrefixesResponse);
   rpc StreamPolicy(StreamPolicyRequest) returns (stream PolicyUpdate);
   rpc ReportHeartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc ReportDropEvents(stream DropEvent) returns (DropEventResponse);
@@ -13,24 +14,47 @@ message FetchPolicyRequest {
   string node_id = 1;
   string interface_name = 2;
   int64 current_version = 3;
+  bool supports_external_geo_prefixes = 4;
 }
 
 message FetchPolicyResponse {
   int64 version = 1;
   bool unchanged = 2;
   string policy_json = 3;
+  bool external_geo_prefixes = 4;
+  int64 geo_prefix_version = 5;
+}
+
+message FetchGeoPrefixesRequest {
+  int64 version = 1;
+  uint32 page_size = 2;
+  string page_token = 3;
+}
+
+message GeoPrefix {
+  string cidr = 1;
+  string country = 2;
+}
+
+message FetchGeoPrefixesResponse {
+  int64 version = 1;
+  repeated GeoPrefix prefixes = 2;
+  string next_page_token = 3;
 }
 
 message StreamPolicyRequest {
   string node_id = 1;
   string interface_name = 2;
   int64 current_version = 3;
+  bool supports_external_geo_prefixes = 4;
 }
 
 message PolicyUpdate {
   int64 version = 1;
   string policy_json = 2;
   bool drop_monitor_enabled = 3;
+  bool external_geo_prefixes = 4;
+  int64 geo_prefix_version = 5;
 }
 
 message HeartbeatRequest {

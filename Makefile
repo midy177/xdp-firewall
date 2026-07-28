@@ -7,6 +7,7 @@ API_BIND ?= 0.0.0.0:8080
 API_PORT ?= 8080
 ZIG_TARGET_AMD64 ?= x86_64-unknown-linux-musl
 ZIG_TARGET_ARM64 ?= aarch64-unknown-linux-musl
+ZIG ?= zig
 DOCKER_PLATFORM ?= linux/amd64
 DOCKER_PLATFORMS ?= linux/amd64,linux/arm64
 DIST_DIR ?= dist

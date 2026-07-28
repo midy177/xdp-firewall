@@ -32,7 +32,7 @@ Useful endpoints:
 
 - `GET /health`
 - `GET /countries`
-- `GET /policy`
+- `GET /policy/version`
 - `POST /policy/seed-example`
 - `POST /policy/bump-version`
 - `GET /rules?page=1&page_size=100`
@@ -196,6 +196,8 @@ The xDS control plane runs the same IPdeny index check from a dedicated backgrou
 
 On control-plane startup and after a changed country refresh, Rust rebuilds an MMDB from the persisted `firewall_geo_ip_prefixes.cidrs_json` arrays. The IPdeny aggregated source is IPv4, so the generated lookup database uses an IPv4 MMDB tree and includes all persisted IPv4 country prefixes; any unexpected IPv6 prefixes in the table are skipped with a warning until an IPv6 country feed is added. The rebuild reads prefix rows in small pages and the active reader uses a memory-mapped temporary MMDB file instead of keeping the final database bytes in a heap `Vec`. This lowers steady-state heap use, while the writer still needs temporary memory for the build tree during refresh. MMDB records include both `country.iso_code` and `country.names.en`. The UI country page can query this lookup through `GET /geo/lookup?ip=8.8.8.8`, and realtime Drop events are enriched with a country code from the same MMDB when the agent/BPF event does not already include one.
 
+The control-plane database pool is explicitly configurable and defaults to `XDP_FIREWALL_DB_MAX_CONNECTIONS=16`, `XDP_FIREWALL_DB_MIN_CONNECTIONS=1`, `XDP_FIREWALL_DB_IDLE_TIMEOUT_SECONDS=300`, and `XDP_FIREWALL_DB_MAX_LIFETIME_SECONDS=1800`. Lower the max/min connection counts for small control-plane deployments if idle database connections become visible in steady RSS; raise them only when database acquisition is a measured bottleneck.
+
 For memory troubleshooting during country refresh or lookup rebuilds, run the control plane with `RUST_LOG=xdp_firewall=debug`. The GeoIP path logs cgroup memory and `/proc/self/status` RSS/HWM after each country CIDR JSON row is persisted, after the temporary MMDB file is written, and after the mmap reader is opened.
 
 ## Temporary Bans
@@ -240,7 +242,7 @@ Use `agent` for persistent enforcement. The agent does not connect to the config
 
 `sync-once` fetches one policy snapshot from xDS, applies it, then exits; on Linux this means the process no longer owns the XDP attachment. It is useful for validation workflows, not for keeping a node protected.
 
-Do not use `xdp-firewall policy show` inside an agent-only container to inspect the applied policy. `policy show` is a database command, while agent containers intentionally do not receive `DATABASE_URL` and set `XDP_FIREWALL_AGENT_ONLY=true` to reject control-plane database commands. Use the API container, the `GET /policy` API, or the agent apply log instead.
+Do not use `xdp-firewall policy show` inside an agent-only container to inspect the applied policy. `policy show` is a database command, while agent containers intentionally do not receive `DATABASE_URL` and set `XDP_FIREWALL_AGENT_ONLY=true` to reject control-plane database commands. Use the API container's per-resource endpoints (`GET /rules`, `GET /geo-countries`, etc.), or the agent apply log instead.
 
 The control plane controls push cadence with `xdp-firewall api --xds-push-interval-seconds 5`. Agents do not poll the database. They keep a streaming gRPC subscription open and apply updates when xDS pushes a newer version. Heartbeats still run from the agent to xDS with `--heartbeat-seconds`.
 

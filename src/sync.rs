@@ -139,7 +139,23 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
                 update = stream.message() => {
                     match update {
                         Ok(Some(update)) => {
-                            let (version, snapshot, drop_monitor_enabled) = xds::XdsClient::policy_from_update(update)?;
+                            let (version, snapshot, drop_monitor_enabled) =
+                                match client.policy_from_update(update).await {
+                                    Ok(update) => update,
+                                    Err(err) => {
+                                        let details = format!("{err:#}");
+                                        error!(error = %details, "failed to decode xDS policy update");
+                                        client.report_heartbeat(
+                                            &node_id,
+                                            &interface,
+                                            applied_version.max(0),
+                                            "error",
+                                            Some(&details),
+                                        ).await?;
+                                        tokio::time::sleep(reconnect_delay).await;
+                                        break;
+                                    }
+                                };
                             reconcile_drop_monitor(
                                 &mut xdp,
                                 &mut drop_monitor,

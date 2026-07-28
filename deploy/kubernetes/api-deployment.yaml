@@ -43,6 +43,8 @@ spec:
               value: ""
             - name: XDP_FIREWALL_K8S_DISCOVERY
               value: "false"
+            - name: XDP_FIREWALL_DB_MAX_CONNECTIONS
+              value: "16"
             - name: RUST_LOG
               value: xdp_firewall=info
           ports:

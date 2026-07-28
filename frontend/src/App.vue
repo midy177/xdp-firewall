@@ -820,7 +820,7 @@ type DynamicDefense = {
 };
 type NodeState = { node_id: string; interface_name: string; last_applied_version: number; status: string; last_seen_at: string; error?: string };
 type DropEvent = { local_id: number; node_id: string; interface_name: string; time: string; event_time_ns: number; cpu: number; reason: string; src: string; family: number; proto: string; dport: number; country?: string; action: string };
-type Snapshot = { version: number; rules: unknown[]; geo_countries: unknown[]; geo_prefixes: unknown[]; temp_bans: unknown[]; dynamic_defense: DynamicDefense; dynamic_rate_limits: unknown[]; trusted_cidrs: unknown[]; threat_sources: unknown[] };
+type Snapshot = { version: number };
 type Page<T> = { items: T[]; total: number; page: number; page_size: number; total_pages: number };
 type PageState = { page: number; total_pages: number; total: number };
 type ApiDocEndpoint = { method: string; path: string; summary: string; body?: string; curl?: string };
@@ -1192,12 +1192,12 @@ const validationMessages = {
 const apiDocsZh: ApiDocSection[] = [
   {
     title: "系统",
-    description: "健康检查、国家列表和完整策略快照。",
+    description: "健康检查、国家列表和策略版本。",
     endpoints: [
       { method: "GET", path: "/health", summary: "健康检查，公开接口。" },
       { method: "GET", path: "/countries", summary: "返回国家下拉列表，公开接口。" },
       { method: "GET", path: "/geo/lookup?ip=8.8.8.8", summary: "通过控制面内存 MMDB 查询 IP 归属国家。" },
-      { method: "GET", path: "/policy", summary: "返回当前单一策略快照。" },
+      { method: "GET", path: "/policy/version", summary: "返回当前策略版本号。" },
       { method: "POST", path: "/policy/bump-version", summary: "手动递增策略版本，触发 xDS 推送。" },
       { method: "POST", path: "/policy/seed-example", summary: "初始化示例规则，保留白名单和动态防御配置。" }
     ]
@@ -1380,12 +1380,12 @@ const apiDocsZh: ApiDocSection[] = [
 const apiDocsEn: ApiDocSection[] = [
   {
     title: "System",
-    description: "Health, country options, and full policy snapshot.",
+    description: "Health, country options, and policy version.",
     endpoints: [
       { method: "GET", path: "/health", summary: "Health check. Public." },
       { method: "GET", path: "/countries", summary: "Country dropdown options. Public." },
       { method: "GET", path: "/geo/lookup?ip=8.8.8.8", summary: "Query the control-plane in-memory MMDB for an IP country." },
-      { method: "GET", path: "/policy", summary: "Return the current single policy snapshot." },
+      { method: "GET", path: "/policy/version", summary: "Return the current policy version number." },
       { method: "POST", path: "/policy/bump-version", summary: "Increment the policy version and trigger xDS push." },
       { method: "POST", path: "/policy/seed-example", summary: "Seed example rules while preserving whitelist and dynamic defense settings." }
     ]
@@ -1975,7 +1975,7 @@ async function loadHealth() {
 }
 
 async function loadPolicy() {
-  snapshot.value = await api<Snapshot>("policy");
+  snapshot.value = await api<Snapshot>("policy/version");
 }
 
 async function loadRules(page = rulePage.page) {

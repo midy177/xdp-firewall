@@ -211,6 +211,21 @@ pub struct XdpDynamicRateLimit {
 }
 
 pub async fn load_policy(db: &DatabaseConnection, policy_name: &str) -> Result<PolicySnapshot> {
+    load_policy_with_geo_prefixes(db, policy_name, true).await
+}
+
+pub async fn load_policy_without_geo_prefixes(
+    db: &DatabaseConnection,
+    policy_name: &str,
+) -> Result<PolicySnapshot> {
+    load_policy_with_geo_prefixes(db, policy_name, false).await
+}
+
+async fn load_policy_with_geo_prefixes(
+    db: &DatabaseConnection,
+    policy_name: &str,
+    include_geo_prefixes: bool,
+) -> Result<PolicySnapshot> {
     let version = policy_version::Entity::find_by_id(policy_name.to_string())
         .one(db)
         .await?
@@ -238,17 +253,21 @@ pub async fn load_policy(db: &DatabaseConnection, policy_name: &str) -> Result<P
         .iter()
         .map(|policy| policy.country.clone())
         .collect::<Vec<_>>();
-    let geo_prefixes = geo::load_persisted_geo_prefixes(db, &geo_country_codes)
-        .await?
-        .into_iter()
-        .map(|prefix| {
-            Ok(GeoIpPrefixPolicy {
-                cidr: geo_prefix_to_ipnet(prefix.addr, prefix.prefix)?,
-                country: geo::decode_country(prefix.country)
-                    .with_context(|| "invalid persisted geo country code")?,
+    let geo_prefixes = if include_geo_prefixes {
+        geo::load_persisted_geo_prefixes(db, &geo_country_codes)
+            .await?
+            .into_iter()
+            .map(|prefix| {
+                Ok(GeoIpPrefixPolicy {
+                    cidr: geo_prefix_to_ipnet(prefix.addr, prefix.prefix)?,
+                    country: geo::decode_country(prefix.country)
+                        .with_context(|| "invalid persisted geo country code")?,
+                })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
 
     let threat_sources = threat_source::Entity::find()
         .filter(threat_source::Column::PolicyName.eq(policy_name))
@@ -891,6 +910,8 @@ fn parse_protocol(value: &str) -> Result<L4Protocol> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::entities::geo_ip_prefix;
+    use sea_orm::{ConnectOptions, Database};
 
     #[test]
     fn normalizes_trusted_cidrs_from_repeated_and_comma_values() {
@@ -961,5 +982,47 @@ mod tests {
         };
 
         assert!(validate_dynamic_rate_limit_policy(&policy).is_err());
+    }
+
+    #[tokio::test]
+    async fn load_policy_without_geo_prefixes_keeps_country_rules_but_skips_prefixes() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.sqlx_logging(false);
+        let db = Database::connect(options).await.unwrap();
+        crate::db::migrate(&db).await.unwrap();
+        let now = chrono::Utc::now().naive_utc();
+
+        geo_country_policy::ActiveModel {
+            policy_name: Set(DEFAULT_POLICY_NAME.to_string()),
+            enabled: Set(true),
+            country: Set("US".to_string()),
+            action: Set("deny".to_string()),
+            packets_per_second: Set(None),
+            burst: Set(None),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        geo_ip_prefix::ActiveModel {
+            country: Set("US".to_string()),
+            cidrs_json: Set(r#"["203.0.113.0/24"]"#.to_string()),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let full = load_policy(&db, DEFAULT_POLICY_NAME).await.unwrap();
+        assert_eq!(full.geo_countries.len(), 1);
+        assert_eq!(full.geo_prefixes.len(), 1);
+
+        let slim = load_policy_without_geo_prefixes(&db, DEFAULT_POLICY_NAME)
+            .await
+            .unwrap();
+        assert_eq!(slim.geo_countries.len(), 1);
+        assert!(slim.geo_prefixes.is_empty());
     }
 }
