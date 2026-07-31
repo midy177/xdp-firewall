@@ -287,6 +287,26 @@ main {
   justify-content: start;
 }
 
+.rule-filter-form {
+  grid-template-columns: 120px minmax(220px, 1fr) 120px 100px 100px auto;
+  border-bottom: 1px solid #dfe5eb;
+}
+
+.rule-filter-form .field {
+  grid-template-rows: 16px 38px;
+}
+
+.filter-actions {
+  display: flex;
+  align-items: end;
+  gap: 8px;
+  min-height: 59px;
+}
+
+.filter-actions .ui-button {
+  white-space: nowrap;
+}
+
 .geo-form {
   grid-template-columns: minmax(180px, 260px) 120px 38px;
 }
@@ -926,6 +946,7 @@ pre code {
   }
 
   .rule-form,
+  .rule-filter-form,
   .geo-form,
   .threat-form,
   .custom-rate-form,
@@ -950,6 +971,7 @@ pre code {
 
 @media (max-width: 560px) {
   .rule-form,
+  .rule-filter-form,
   .geo-form,
   .geo-lookup-form,
   .threat-form,

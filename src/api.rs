@@ -15,8 +15,8 @@ use axum::{
     routing::{any, delete, get, post},
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set, sea_query::OnConflict,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, Set, sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -104,6 +104,93 @@ struct Versioned<T> {
 struct PaginationQuery {
     page: Option<u64>,
     page_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuleQuery {
+    page: Option<u64>,
+    page_size: Option<u64>,
+    action: Option<String>,
+    cidr: Option<String>,
+    protocol: Option<String>,
+    port: Option<i32>,
+    priority: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuleMatchQuery {
+    action: String,
+    cidr: String,
+    protocol: String,
+    port: i32,
+    priority: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeoCountryQuery {
+    page: Option<u64>,
+    page_size: Option<u64>,
+    country: Option<String>,
+    action: Option<String>,
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeoCountryMatchQuery {
+    country: String,
+    action: String,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreatSourceQuery {
+    page: Option<u64>,
+    page_size: Option<u64>,
+    name: Option<String>,
+    url: Option<String>,
+    format: Option<String>,
+    enabled: Option<bool>,
+    min_score: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThreatSourceMatchQuery {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DynamicRateLimitQuery {
+    page: Option<u64>,
+    page_size: Option<u64>,
+    enabled: Option<bool>,
+    priority: Option<i32>,
+    protocol: Option<String>,
+    port: Option<i32>,
+    packets_per_second: Option<i32>,
+    burst: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DynamicRateLimitMatchQuery {
+    enabled: bool,
+    priority: i32,
+    protocol: String,
+    port: i32,
+    packets_per_second: i32,
+    burst: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrustedCidrQuery {
+    page: Option<u64>,
+    page_size: Option<u64>,
+    cidr: Option<String>,
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrustedCidrMatchQuery {
+    cidr: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -283,18 +370,25 @@ fn router(state: ApiState) -> Router {
         .route("/policy/seed-example", post(seed_example_policy))
         .route("/policies", any(removed_multi_policy_api))
         .route("/policies/{*path}", any(removed_multi_policy_api))
-        .route("/rules", get(list_rules).post(create_rule))
+        .route(
+            "/rules",
+            get(list_rules).post(create_rule).delete(delete_rules),
+        )
         .route("/rules/{id}", delete(delete_rule))
         .route(
             "/geo-countries",
-            get(list_geo_countries).post(create_geo_country),
+            get(list_geo_countries)
+                .post(create_geo_country)
+                .delete(delete_geo_countries),
         )
         .route("/geo-countries/refresh", post(refresh_geo_countries))
         .route("/geo/lookup", get(lookup_geo_ip))
         .route("/geo-countries/{id}", delete(delete_geo_country))
         .route(
             "/threat-sources",
-            get(list_threat_sources).post(create_threat_source),
+            get(list_threat_sources)
+                .post(create_threat_source)
+                .delete(delete_threat_sources),
         )
         .route("/threat-sources/{id}", delete(delete_threat_source))
         .route(
@@ -303,7 +397,9 @@ fn router(state: ApiState) -> Router {
         )
         .route(
             "/dynamic-rate-limits",
-            get(list_dynamic_rate_limits).post(create_dynamic_rate_limit),
+            get(list_dynamic_rate_limits)
+                .post(create_dynamic_rate_limit)
+                .delete(delete_dynamic_rate_limits),
         )
         .route(
             "/dynamic-rate-limits/{id}",
@@ -313,7 +409,9 @@ fn router(state: ApiState) -> Router {
         .route("/temp-bans/{id}", delete(delete_temp_ban))
         .route(
             "/trusted-cidrs",
-            get(list_trusted_cidrs).post(create_trusted_cidr),
+            get(list_trusted_cidrs)
+                .post(create_trusted_cidr)
+                .delete(delete_trusted_cidrs),
         )
         .route("/trusted-cidrs/{id}", delete(delete_trusted_cidr))
         .route("/nodes", get(list_nodes))
@@ -513,11 +611,11 @@ async fn seed_example_policy(
 
 async fn list_rules(
     State(state): State<ApiState>,
-    Query(query): Query<PaginationQuery>,
+    Query(query): Query<RuleQuery>,
 ) -> ApiResult<Json<Page<firewall_rule::Model>>> {
-    let pagination = query.normalize()?;
-    let paginator = firewall_rule::Entity::find()
-        .filter(firewall_rule::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+    let pagination = query.pagination().normalize()?;
+    let paginator = query
+        .apply_filters(firewall_rule::Entity::find())?
         .order_by_asc(firewall_rule::Column::Priority)
         .paginate(&state.db, pagination.page_size);
     let total = paginator.num_items().await?;
@@ -574,18 +672,85 @@ async fn delete_rule(
     }))
 }
 
+async fn delete_rules(
+    State(state): State<ApiState>,
+    Query(query): Query<RuleMatchQuery>,
+) -> ApiResult<Json<Versioned<serde_json::Value>>> {
+    let deleted = query
+        .apply_filters(firewall_rule::Entity::delete_many())?
+        .exec(&state.db)
+        .await?;
+    if deleted.rows_affected == 0 {
+        return Err(ApiError::not_found("rule not found"));
+    }
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok(Json(Versioned {
+        version,
+        data: serde_json::json!({ "deleted": deleted.rows_affected }),
+    }))
+}
+
 async fn list_geo_countries(
     State(state): State<ApiState>,
-    Query(query): Query<PaginationQuery>,
+    Query(query): Query<GeoCountryQuery>,
 ) -> ApiResult<Json<Page<geo_country_policy::Model>>> {
-    let pagination = query.normalize()?;
-    let paginator = geo_country_policy::Entity::find()
-        .filter(geo_country_policy::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+    let pagination = PaginationQuery {
+        page: query.page,
+        page_size: query.page_size,
+    }
+    .normalize()?;
+    let mut select = geo_country_policy::Entity::find()
+        .filter(geo_country_policy::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME));
+    if let Some(country) = query.country.as_deref() {
+        select =
+            select.filter(geo_country_policy::Column::Country.eq(geo::normalize_country(country)?));
+    }
+    if let Some(action) = query.action.as_deref() {
+        select = select.filter(geo_country_policy::Column::Action.eq(normalize_action(action)?));
+    }
+    if let Some(enabled) = query.enabled {
+        select = select.filter(geo_country_policy::Column::Enabled.eq(enabled));
+    }
+    let paginator = select
         .order_by_asc(geo_country_policy::Column::Country)
         .paginate(&state.db, pagination.page_size);
     let total = paginator.num_items().await?;
     let items = paginator.fetch_page(pagination.page - 1).await?;
     Ok(Json(Page::new(items, total, pagination)))
+}
+
+async fn delete_geo_countries(
+    State(state): State<ApiState>,
+    Query(query): Query<GeoCountryMatchQuery>,
+) -> ApiResult<Json<Versioned<serde_json::Value>>> {
+    let country = geo::normalize_country(&query.country)?;
+    let action = normalize_action(&query.action)?;
+    let filter = geo_country_policy::Entity::find()
+        .filter(geo_country_policy::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(geo_country_policy::Column::Country.eq(country))
+        .filter(geo_country_policy::Column::Action.eq(action))
+        .filter(geo_country_policy::Column::Enabled.eq(query.enabled));
+    let matches = filter.clone().count(&state.db).await?;
+    if matches > 1 {
+        return Err(ApiError::conflict(
+            "multiple geo country policies match; delete by id",
+        ));
+    }
+    let deleted = geo_country_policy::Entity::delete_many()
+        .filter(geo_country_policy::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(geo_country_policy::Column::Country.eq(geo::normalize_country(&query.country)?))
+        .filter(geo_country_policy::Column::Action.eq(normalize_action(&query.action)?))
+        .filter(geo_country_policy::Column::Enabled.eq(query.enabled))
+        .exec(&state.db)
+        .await?;
+    if deleted.rows_affected == 0 {
+        return Err(ApiError::not_found("geo country policy not found"));
+    }
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok(Json(Versioned {
+        version,
+        data: serde_json::json!({ "deleted": deleted.rows_affected }),
+    }))
 }
 
 async fn create_geo_country(
@@ -780,16 +945,60 @@ async fn delete_geo_country(
 
 async fn list_threat_sources(
     State(state): State<ApiState>,
-    Query(query): Query<PaginationQuery>,
+    Query(query): Query<ThreatSourceQuery>,
 ) -> ApiResult<Json<Page<threat_source::Model>>> {
-    let pagination = query.normalize()?;
-    let paginator = threat_source::Entity::find()
-        .filter(threat_source::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+    let pagination = PaginationQuery {
+        page: query.page,
+        page_size: query.page_size,
+    }
+    .normalize()?;
+    let mut select = threat_source::Entity::find()
+        .filter(threat_source::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME));
+    if let Some(name) = query.name.as_deref() {
+        select = select.filter(threat_source::Column::Name.eq(name.trim()));
+    }
+    if let Some(url) = query.url.as_deref() {
+        select = select.filter(threat_source::Column::Url.eq(url.trim()));
+    }
+    if let Some(format) = query.format.as_deref() {
+        select = select.filter(threat_source::Column::Format.eq(normalize_threat_format(format)?));
+    }
+    if let Some(enabled) = query.enabled {
+        select = select.filter(threat_source::Column::Enabled.eq(enabled));
+    }
+    if let Some(min_score) = query.min_score {
+        validate_optional_non_negative("min_score", Some(min_score))?;
+        select = select.filter(threat_source::Column::MinScore.eq(min_score));
+    }
+    let paginator = select
         .order_by_asc(threat_source::Column::Name)
         .paginate(&state.db, pagination.page_size);
     let total = paginator.num_items().await?;
     let items = paginator.fetch_page(pagination.page - 1).await?;
     Ok(Json(Page::new(items, total, pagination)))
+}
+
+async fn delete_threat_sources(
+    State(state): State<ApiState>,
+    Query(query): Query<ThreatSourceMatchQuery>,
+) -> ApiResult<Json<Versioned<serde_json::Value>>> {
+    let name = query.name.trim();
+    if name.is_empty() {
+        return Err(ApiError::bad_request("name must not be empty"));
+    }
+    let deleted = threat_source::Entity::delete_many()
+        .filter(threat_source::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(threat_source::Column::Name.eq(name))
+        .exec(&state.db)
+        .await?;
+    if deleted.rows_affected == 0 {
+        return Err(ApiError::not_found("threat source not found"));
+    }
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok(Json(Versioned {
+        version,
+        data: serde_json::json!({ "deleted": deleted.rows_affected }),
+    }))
 }
 
 async fn create_threat_source(
@@ -894,16 +1103,90 @@ async fn update_dynamic_defense(
 
 async fn list_dynamic_rate_limits(
     State(state): State<ApiState>,
-    Query(query): Query<PaginationQuery>,
+    Query(query): Query<DynamicRateLimitQuery>,
 ) -> ApiResult<Json<Page<dynamic_rate_limit::Model>>> {
-    let pagination = query.normalize()?;
-    let paginator = dynamic_rate_limit::Entity::find()
-        .filter(dynamic_rate_limit::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+    let pagination = PaginationQuery {
+        page: query.page,
+        page_size: query.page_size,
+    }
+    .normalize()?;
+    let protocol = query
+        .protocol
+        .as_deref()
+        .map(normalize_protocol)
+        .transpose()?;
+    let port = validate_dynamic_rate_port(protocol.as_deref().unwrap_or("any"), query.port)?;
+    let mut select = dynamic_rate_limit::Entity::find()
+        .filter(dynamic_rate_limit::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME));
+    if let Some(enabled) = query.enabled {
+        select = select.filter(dynamic_rate_limit::Column::Enabled.eq(enabled));
+    }
+    if let Some(priority) = query.priority {
+        select = select.filter(dynamic_rate_limit::Column::Priority.eq(priority));
+    }
+    if let Some(protocol) = protocol {
+        select = select.filter(dynamic_rate_limit::Column::Protocol.eq(protocol));
+    }
+    if let Some(port) = port {
+        select = select.filter(dynamic_rate_limit::Column::Port.eq(port));
+    }
+    if let Some(packets_per_second) = query.packets_per_second {
+        validate_positive_i32("packets_per_second", packets_per_second)?;
+        select = select.filter(dynamic_rate_limit::Column::PacketsPerSecond.eq(packets_per_second));
+    }
+    if let Some(burst) = query.burst {
+        validate_positive_i32("burst", burst)?;
+        select = select.filter(dynamic_rate_limit::Column::Burst.eq(burst));
+    }
+    let paginator = select
         .order_by_asc(dynamic_rate_limit::Column::Priority)
         .paginate(&state.db, pagination.page_size);
     let total = paginator.num_items().await?;
     let items = paginator.fetch_page(pagination.page - 1).await?;
     Ok(Json(Page::new(items, total, pagination)))
+}
+
+async fn delete_dynamic_rate_limits(
+    State(state): State<ApiState>,
+    Query(query): Query<DynamicRateLimitMatchQuery>,
+) -> ApiResult<Json<Versioned<serde_json::Value>>> {
+    let protocol = normalize_protocol(&query.protocol)?;
+    let port = validate_dynamic_rate_port(&protocol, Some(query.port))?
+        .expect("required port is always present");
+    validate_positive_i32("packets_per_second", query.packets_per_second)?;
+    validate_positive_i32("burst", query.burst)?;
+    let filter = dynamic_rate_limit::Entity::find()
+        .filter(dynamic_rate_limit::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(dynamic_rate_limit::Column::Enabled.eq(query.enabled))
+        .filter(dynamic_rate_limit::Column::Priority.eq(query.priority))
+        .filter(dynamic_rate_limit::Column::Protocol.eq(protocol))
+        .filter(dynamic_rate_limit::Column::Port.eq(port))
+        .filter(dynamic_rate_limit::Column::PacketsPerSecond.eq(query.packets_per_second))
+        .filter(dynamic_rate_limit::Column::Burst.eq(query.burst));
+    let matches = filter.clone().count(&state.db).await?;
+    if matches > 1 {
+        return Err(ApiError::conflict(
+            "multiple dynamic rate limits match; delete by id",
+        ));
+    }
+    let deleted = dynamic_rate_limit::Entity::delete_many()
+        .filter(dynamic_rate_limit::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(dynamic_rate_limit::Column::Enabled.eq(query.enabled))
+        .filter(dynamic_rate_limit::Column::Priority.eq(query.priority))
+        .filter(dynamic_rate_limit::Column::Protocol.eq(normalize_protocol(&query.protocol)?))
+        .filter(dynamic_rate_limit::Column::Port.eq(port))
+        .filter(dynamic_rate_limit::Column::PacketsPerSecond.eq(query.packets_per_second))
+        .filter(dynamic_rate_limit::Column::Burst.eq(query.burst))
+        .exec(&state.db)
+        .await?;
+    if deleted.rows_affected == 0 {
+        return Err(ApiError::not_found("dynamic rate limit not found"));
+    }
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok(Json(Versioned {
+        version,
+        data: serde_json::json!({ "deleted": deleted.rows_affected }),
+    }))
 }
 
 async fn create_dynamic_rate_limit(
@@ -1020,16 +1303,47 @@ async fn delete_temp_ban(
 
 async fn list_trusted_cidrs(
     State(state): State<ApiState>,
-    Query(query): Query<PaginationQuery>,
+    Query(query): Query<TrustedCidrQuery>,
 ) -> ApiResult<Json<Page<trusted_cidr::Model>>> {
-    let pagination = query.normalize()?;
-    let paginator = trusted_cidr::Entity::find()
-        .filter(trusted_cidr::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+    let pagination = PaginationQuery {
+        page: query.page,
+        page_size: query.page_size,
+    }
+    .normalize()?;
+    let mut select = trusted_cidr::Entity::find()
+        .filter(trusted_cidr::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME));
+    if let Some(cidr) = query.cidr.as_deref() {
+        select = select.filter(trusted_cidr::Column::Cidr.eq(normalize_cidr(cidr)?));
+    }
+    if let Some(enabled) = query.enabled {
+        select = select.filter(trusted_cidr::Column::Enabled.eq(enabled));
+    }
+    let paginator = select
         .order_by_asc(trusted_cidr::Column::Cidr)
         .paginate(&state.db, pagination.page_size);
     let total = paginator.num_items().await?;
     let items = paginator.fetch_page(pagination.page - 1).await?;
     Ok(Json(Page::new(items, total, pagination)))
+}
+
+async fn delete_trusted_cidrs(
+    State(state): State<ApiState>,
+    Query(query): Query<TrustedCidrMatchQuery>,
+) -> ApiResult<Json<Versioned<serde_json::Value>>> {
+    let cidr = normalize_cidr(&query.cidr)?;
+    let deleted = trusted_cidr::Entity::delete_many()
+        .filter(trusted_cidr::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(trusted_cidr::Column::Cidr.eq(cidr))
+        .exec(&state.db)
+        .await?;
+    if deleted.rows_affected == 0 {
+        return Err(ApiError::not_found("trusted CIDR not found"));
+    }
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok(Json(Versioned {
+        version,
+        data: serde_json::json!({ "deleted": deleted.rows_affected }),
+    }))
 }
 
 async fn create_trusted_cidr(
@@ -1155,6 +1469,83 @@ impl PaginationQuery {
     }
 }
 
+impl RuleQuery {
+    fn pagination(&self) -> PaginationQuery {
+        PaginationQuery {
+            page: self.page,
+            page_size: self.page_size,
+        }
+    }
+
+    fn apply_filters(
+        self,
+        mut select: sea_orm::Select<firewall_rule::Entity>,
+    ) -> ApiResult<sea_orm::Select<firewall_rule::Entity>> {
+        select = select.filter(firewall_rule::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME));
+
+        if let Some(action) = self.action.as_deref() {
+            select = select.filter(firewall_rule::Column::Action.eq(normalize_action(action)?));
+        }
+        if let Some(cidr) = self.cidr.as_deref() {
+            select = select.filter(firewall_rule::Column::Cidr.eq(normalize_cidr(cidr)?));
+        }
+
+        let protocol = self
+            .protocol
+            .as_deref()
+            .map(normalize_protocol)
+            .transpose()?;
+        let port = validate_port(protocol.as_deref(), self.port)?;
+
+        if let Some(priority) = self.priority {
+            select = select.filter(firewall_rule::Column::Priority.eq(priority));
+        }
+        if let Some(protocol) = protocol.as_deref() {
+            select = select.filter(rule_protocol_filter(protocol));
+        }
+        if let Some(port) = port {
+            select = select.filter(firewall_rule::Column::Port.eq(port));
+        }
+
+        Ok(select)
+    }
+}
+
+impl RuleMatchQuery {
+    fn apply_filters(
+        self,
+        mut delete: sea_orm::DeleteMany<firewall_rule::Entity>,
+    ) -> ApiResult<sea_orm::DeleteMany<firewall_rule::Entity>> {
+        let action = normalize_action(&self.action)?;
+        let cidr = normalize_cidr(&self.cidr)?;
+        let protocol = normalize_protocol(&self.protocol)?;
+        let port = validate_port(Some(&protocol), Some(self.port))?
+            .expect("required port is always present");
+
+        delete = delete
+            .filter(firewall_rule::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+            .filter(firewall_rule::Column::Priority.eq(self.priority))
+            .filter(firewall_rule::Column::Action.eq(action))
+            .filter(firewall_rule::Column::Cidr.eq(cidr));
+
+        delete = delete
+            .filter(rule_protocol_filter(&protocol))
+            .filter(firewall_rule::Column::Port.eq(port));
+
+        Ok(delete)
+    }
+}
+
+fn rule_protocol_filter(protocol: &str) -> Condition {
+    if protocol == "any" {
+        Condition::any()
+            .add(firewall_rule::Column::Protocol.eq("any"))
+            .add(firewall_rule::Column::Protocol.is_null())
+    } else {
+        Condition::all().add(firewall_rule::Column::Protocol.eq(protocol))
+    }
+}
+
 impl Default for Pagination {
     fn default() -> Self {
         Self {
@@ -1256,6 +1647,13 @@ impl ApiError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: message.into(),
         }
     }
@@ -1769,6 +2167,193 @@ mod tests {
         )
         .await;
         assert!(range_error.contains("port must be between 1 and 65535"));
+    }
+
+    #[tokio::test]
+    async fn rule_query_and_delete_support_tuple_filters() {
+        let (app, _db) = test_router().await;
+        response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules",
+                json!({
+                    "priority": 10,
+                    "action": "deny",
+                    "cidr": "203.0.113.42/24",
+                    "protocol": "tcp",
+                    "port": 443
+                }),
+            )
+            .await,
+        )
+        .await;
+        response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules",
+                json!({
+                    "priority": 10,
+                    "action": "deny",
+                    "cidr": "203.0.113.0/24",
+                    "protocol": "tcp",
+                    "port": 80
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        let page = response_json(
+            send_empty(
+                &app,
+                Method::GET,
+                "/rules?action=drop&cidr=203.0.113.99/24&protocol=tcp&port=443&priority=10",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["items"][0]["cidr"], "203.0.113.0/24");
+        assert_eq!(page["items"][0]["port"], 443);
+
+        let deleted = response_json(
+            send_empty(
+                &app,
+                Method::DELETE,
+                "/rules?action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(deleted["version"], 3);
+        assert_eq!(deleted["data"]["deleted"], 1);
+
+        let remaining = response_json(send_empty(&app, Method::GET, "/rules").await).await;
+        assert_eq!(remaining["total"], 1);
+        assert_eq!(remaining["items"][0]["port"], 80);
+    }
+
+    #[tokio::test]
+    async fn config_queries_and_field_deletes_support_stable_resources() {
+        let (app, _db) = test_router().await;
+        response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/geo-countries",
+                json!({"country": "cn", "action": "deny", "enabled": true}),
+            )
+            .await,
+        )
+        .await;
+        response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/threat-sources",
+                json!({
+                    "name": "test-feed",
+                    "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt",
+                    "format": "cidr"
+                }),
+            )
+            .await,
+        )
+        .await;
+        response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/dynamic-rate-limits",
+                json!({
+                    "enabled": true,
+                    "priority": 10,
+                    "protocol": "tcp",
+                    "port": 443,
+                    "packets_per_second": 1000,
+                    "burst": 2000
+                }),
+            )
+            .await,
+        )
+        .await;
+        response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/trusted-cidrs",
+                json!({"cidr": "10.1.2.3/8", "enabled": true}),
+            )
+            .await,
+        )
+        .await;
+
+        let countries = response_json(
+            send_empty(
+                &app,
+                Method::GET,
+                "/geo-countries?country=CN&action=drop&enabled=true",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(countries["total"], 1);
+        let threats = response_json(
+            send_empty(
+                &app,
+                Method::GET,
+                "/threat-sources?format=cidr&enabled=true",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(threats["total"], 1);
+        let limits = response_json(
+            send_empty(
+                &app,
+                Method::GET,
+                "/dynamic-rate-limits?protocol=tcp&port=443&priority=10",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(limits["total"], 1);
+        let trusted =
+            response_json(send_empty(&app, Method::GET, "/trusted-cidrs?cidr=10.1.2.99/8").await)
+                .await;
+        assert_eq!(trusted["total"], 1);
+
+        let deleted = response_json(
+            send_empty(
+                &app,
+                Method::DELETE,
+                "/geo-countries?country=cn&action=deny&enabled=true",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(deleted["data"]["deleted"], 1);
+        let deleted =
+            response_json(send_empty(&app, Method::DELETE, "/threat-sources?name=test-feed").await)
+                .await;
+        assert_eq!(deleted["data"]["deleted"], 1);
+        let deleted = response_json(
+            send_empty(
+                &app,
+                Method::DELETE,
+                "/dynamic-rate-limits?enabled=true&priority=10&protocol=tcp&port=443&packets_per_second=1000&burst=2000",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(deleted["data"]["deleted"], 1);
+        let deleted = response_json(
+            send_empty(&app, Method::DELETE, "/trusted-cidrs?cidr=10.1.2.99/8").await,
+        )
+        .await;
+        assert_eq!(deleted["data"]["deleted"], 1);
     }
 
     #[tokio::test]
