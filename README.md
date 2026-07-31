@@ -35,25 +35,25 @@ Useful endpoints:
 - `GET /policy/version`
 - `POST /policy/seed-example`
 - `POST /policy/bump-version`
-- `GET /rules?page=1&page_size=100&action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10`
+- `GET /rules?page=1&page_size=20&action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10`
 - `POST /rules`
 - `DELETE /rules/{id}`
 - `DELETE /rules?action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10`
-- `GET /geo-countries?page=1&page_size=100&country=CN&action=deny&enabled=true`
+- `GET /geo-countries?page=1&page_size=20&country=CN&action=deny&enabled=true`
 - `POST /geo-countries`
 - `DELETE /geo-countries?country=CN&action=deny&enabled=true`
 - `POST /geo-countries/refresh`
 - `GET /geo/lookup?ip=8.8.8.8`
-- `GET /temp-bans?page=1&page_size=100`
+- `GET /temp-bans?page=1&page_size=20`
 - `POST /temp-bans`
-- `GET /threat-sources?page=1&page_size=100&name=test-feed&format=cidr&enabled=true`
+- `GET /threat-sources?page=1&page_size=20&name=test-feed&format=cidr&enabled=true`
 - `POST /threat-sources`
 - `DELETE /threat-sources?name=test-feed`
-- `GET /dynamic-rate-limits?page=1&page_size=100&priority=10&protocol=tcp&port=443`
+- `GET /dynamic-rate-limits?page=1&page_size=20&priority=10&protocol=tcp&port=443`
 - `DELETE /dynamic-rate-limits?enabled=true&priority=10&protocol=tcp&port=443&packets_per_second=1000&burst=2000`
-- `GET /trusted-cidrs?page=1&page_size=100&cidr=10.0.0.0/8&enabled=true`
+- `GET /trusted-cidrs?page=1&page_size=20&cidr=10.0.0.0/8&enabled=true`
 - `DELETE /trusted-cidrs?cidr=10.0.0.0/8`
-- `GET /nodes?page=1&page_size=100`
+- `GET /nodes?page=1&page_size=20`
 
 Example:
 
@@ -66,7 +66,7 @@ curl -X POST http://127.0.0.1:8080/rules \
 
 Every mutating endpoint increments the policy version so the xDS control plane can push a fresh snapshot to running agents.
 
-List endpoints return `items`, `total`, `page`, `page_size`, and `total_pages`. The default page size is `100`; the maximum is `500`.
+List endpoints return `items`, `total`, `page`, `page_size`, and `total_pages`. The default page size is `20`; the maximum is `500`.
 
 `GET /rules` supports optional filters for `action`, `cidr`, `protocol`, `port`, and `priority`; omit all filters to page through all rules. Filters are combined with AND semantics. `DELETE /rules` deletes by the complete rule tuple and requires all five fields: `action`, `cidr`, `protocol`, `port`, and `priority`. Use `DELETE /rules/{id}` for rules that do not have a stored port. `protocol=any` also matches older rules whose protocol field is unset.
 
@@ -215,7 +215,7 @@ For memory troubleshooting during country refresh or lookup rebuilds, run the co
 
 Temporary bans block one source IP, optionally scoped by protocol and destination port. The default duration is 300 seconds.
 
-- `GET /temp-bans?page=1&page_size=100`
+- `GET /temp-bans?page=1&page_size=20`
 - `POST /temp-bans`
 - `DELETE /temp-bans/{id}`
 
@@ -241,7 +241,7 @@ Whitelist entries are evaluated before dynamic defense, so matching sources are 
 
 - `GET /dynamic-defense`
 - `PUT /dynamic-defense`
-- `GET /dynamic-rate-limits?page=1&page_size=100`
+- `GET /dynamic-rate-limits?page=1&page_size=20`
 - `POST /dynamic-rate-limits`
 - `DELETE /dynamic-rate-limits/{id}`
 

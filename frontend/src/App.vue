@@ -942,7 +942,7 @@ const dynamicDefense = reactive<DynamicDefense>({
 const actions = new Set(["allow", "deny"]);
 const protocols = new Set(["any", "tcp", "udp", "icmp"]);
 const threatFormats = new Set(["cidr", "ips", "ipsum", "spamhaus_drop"]);
-const pageSize = 100;
+const pageSize = 20;
 const authHeader = "Authorization";
 const apiTokenHeader = "X-API-Token";
 
@@ -957,7 +957,7 @@ const messages = {
     apiDocs: "API 文档",
     apiDocsHint: "查看控制面 HTTP API 的请求方式、参数和示例",
     apiPagination: "分页",
-    apiPaginationText: "列表接口支持 page 和 page_size，默认 page_size 为 100，最大 500。",
+    apiPaginationText: "列表接口支持 page 和 page_size，默认 page_size 为 20，最大 500。",
     allNodes: "全部节点",
     allActions: "全部动作",
     allProtocols: "全部协议",
@@ -1076,7 +1076,7 @@ const messages = {
     apiDocs: "API Docs",
     apiDocsHint: "HTTP control-plane API methods, parameters, and examples",
     apiPagination: "Pagination",
-    apiPaginationText: "List APIs support page and page_size. The default page_size is 100 and the maximum is 500.",
+    apiPaginationText: "List APIs support page and page_size. The default page_size is 20 and the maximum is 500.",
     allNodes: "All nodes",
     allActions: "All actions",
     allProtocols: "All protocols",
@@ -1247,7 +1247,7 @@ const apiDocsZh: ApiDocSection[] = [
     endpoints: [
       {
         method: "GET",
-        path: "/rules?page=1&page_size=100&action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10",
+        path: "/rules?page=1&page_size=20&action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10",
         summary: "分页列出普通防火墙规则，可按 action、cidr、protocol、port、priority 过滤；过滤条件按 AND 匹配。"
       },
       {
@@ -1279,7 +1279,7 @@ const apiDocsZh: ApiDocSection[] = [
     title: "国家规则",
     description: "按国家代码允许或拒绝。国家名称和更新时间来自 IPdeny /ipblocks/ 页面，CIDR 从 aggregated 列表下载。",
     endpoints: [
-      { method: "GET", path: "/geo-countries?page=1&page_size=100&country=CN&action=deny&enabled=true", summary: "分页列出国家规则，可按 country、action、enabled 过滤，条件按 AND 匹配。" },
+      { method: "GET", path: "/geo-countries?page=1&page_size=20&country=CN&action=deny&enabled=true", summary: "分页列出国家规则，可按 country、action、enabled 过滤，条件按 AND 匹配。" },
       { method: "POST", path: "/geo-countries/refresh", summary: "异步启动所有国家 IP 列表刷新；5 分钟内重复调用直接返回上一次刷新结果。" },
       {
         method: "POST",
@@ -1298,7 +1298,7 @@ const apiDocsZh: ApiDocSection[] = [
     title: "临时封禁",
     description: "临时封禁单个源 IP，可选协议和目的端口。duration_seconds 默认 300。",
     endpoints: [
-      { method: "GET", path: "/temp-bans?page=1&page_size=100", summary: "分页列出未过期临时封禁。" },
+      { method: "GET", path: "/temp-bans?page=1&page_size=20", summary: "分页列出未过期临时封禁。" },
       {
         method: "POST",
         path: "/temp-bans",
@@ -1322,7 +1322,7 @@ const apiDocsZh: ApiDocSection[] = [
     title: "威胁情报",
     description: "威胁源会被编译为拒绝前缀规则。内置 ipsum 和 spamhaus-drop。",
     endpoints: [
-      { method: "GET", path: "/threat-sources?page=1&page_size=100&name=test-feed&format=cidr&enabled=true", summary: "分页列出威胁源，可按 name、url、format、enabled、min_score 过滤，条件按 AND 匹配。" },
+      { method: "GET", path: "/threat-sources?page=1&page_size=20&name=test-feed&format=cidr&enabled=true", summary: "分页列出威胁源，可按 name、url、format、enabled、min_score 过滤，条件按 AND 匹配。" },
       {
         method: "POST",
         path: "/threat-sources",
@@ -1364,7 +1364,7 @@ const apiDocsZh: ApiDocSection[] = [
     title: "自定义限流",
     description: "按协议或目的端口配置动态防御限流，优先级高于全局 ip_rate_limit 和 flood。",
     endpoints: [
-      { method: "GET", path: "/dynamic-rate-limits?page=1&page_size=100&priority=10&protocol=tcp&port=443", summary: "分页列出自定义限流，可按 enabled、priority、protocol、port、packets_per_second、burst 过滤，条件按 AND 匹配。" },
+      { method: "GET", path: "/dynamic-rate-limits?page=1&page_size=20&priority=10&protocol=tcp&port=443", summary: "分页列出自定义限流，可按 enabled、priority、protocol、port、packets_per_second、burst 过滤，条件按 AND 匹配。" },
       {
         method: "POST",
         path: "/dynamic-rate-limits",
@@ -1386,7 +1386,7 @@ const apiDocsZh: ApiDocSection[] = [
     title: "白名单",
     description: "最高优先级源 CIDR 白名单。命中后直接允许。",
     endpoints: [
-      { method: "GET", path: "/trusted-cidrs?page=1&page_size=100", summary: "分页列出数据库管理的白名单。" },
+      { method: "GET", path: "/trusted-cidrs?page=1&page_size=20", summary: "分页列出数据库管理的白名单。" },
       {
         method: "POST",
         path: "/trusted-cidrs",
@@ -1405,7 +1405,7 @@ const apiDocsZh: ApiDocSection[] = [
     title: "节点",
     description: "查看 agent 心跳、最后应用版本和状态。",
     endpoints: [
-      { method: "GET", path: "/nodes?page=1&page_size=100", summary: "分页列出节点。" },
+      { method: "GET", path: "/nodes?page=1&page_size=20", summary: "分页列出节点。" },
       { method: "GET", path: "/nodes/{node_id}", summary: "查看单个节点状态。" }
     ]
   },
@@ -1448,7 +1448,7 @@ const apiDocsEn: ApiDocSection[] = [
     endpoints: [
       {
         method: "GET",
-        path: "/rules?page=1&page_size=100&action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10",
+        path: "/rules?page=1&page_size=20&action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10",
         summary: "List firewall rules, optionally filtered by action, cidr, protocol, port, and priority with AND semantics."
       },
       {
@@ -1480,7 +1480,7 @@ const apiDocsEn: ApiDocSection[] = [
     title: "Country Rules",
     description: "Allow or deny by country code. Country names and update metadata come from IPdeny /ipblocks/; CIDRs are downloaded from aggregated lists.",
     endpoints: [
-      { method: "GET", path: "/geo-countries?page=1&page_size=100&country=CN&action=deny&enabled=true", summary: "List country rules, optionally filtered by country, action, and enabled with AND semantics." },
+      { method: "GET", path: "/geo-countries?page=1&page_size=20&country=CN&action=deny&enabled=true", summary: "List country rules, optionally filtered by country, action, and enabled with AND semantics." },
       { method: "POST", path: "/geo-countries/refresh", summary: "Start an async refresh for all country IP lists; repeated calls within 5 minutes return the previous result." },
       {
         method: "POST",
@@ -1499,7 +1499,7 @@ const apiDocsEn: ApiDocSection[] = [
     title: "Temporary Bans",
     description: "Temporarily block one source IP with optional protocol and destination port. duration_seconds defaults to 300.",
     endpoints: [
-      { method: "GET", path: "/temp-bans?page=1&page_size=100", summary: "List unexpired temporary bans." },
+      { method: "GET", path: "/temp-bans?page=1&page_size=20", summary: "List unexpired temporary bans." },
       {
         method: "POST",
         path: "/temp-bans",
@@ -1523,7 +1523,7 @@ const apiDocsEn: ApiDocSection[] = [
     title: "Threat Intelligence",
     description: "Threat feeds compile into deny prefix rules. Built-ins include ipsum and spamhaus-drop.",
     endpoints: [
-      { method: "GET", path: "/threat-sources?page=1&page_size=100&name=test-feed&format=cidr&enabled=true", summary: "List threat sources, optionally filtered by name, url, format, enabled, and min_score with AND semantics." },
+      { method: "GET", path: "/threat-sources?page=1&page_size=20&name=test-feed&format=cidr&enabled=true", summary: "List threat sources, optionally filtered by name, url, format, enabled, and min_score with AND semantics." },
       {
         method: "POST",
         path: "/threat-sources",
@@ -1565,7 +1565,7 @@ const apiDocsEn: ApiDocSection[] = [
     title: "Custom Rate Limits",
     description: "Protocol or destination-port dynamic defense limits. They run before global ip_rate_limit and flood.",
     endpoints: [
-      { method: "GET", path: "/dynamic-rate-limits?page=1&page_size=100&priority=10&protocol=tcp&port=443", summary: "List custom rate limits, optionally filtered by enabled, priority, protocol, port, packets_per_second, and burst with AND semantics." },
+      { method: "GET", path: "/dynamic-rate-limits?page=1&page_size=20&priority=10&protocol=tcp&port=443", summary: "List custom rate limits, optionally filtered by enabled, priority, protocol, port, packets_per_second, and burst with AND semantics." },
       {
         method: "POST",
         path: "/dynamic-rate-limits",
@@ -1587,7 +1587,7 @@ const apiDocsEn: ApiDocSection[] = [
     title: "Whitelist",
     description: "Highest-priority source CIDR whitelist. Matching sources pass immediately.",
     endpoints: [
-      { method: "GET", path: "/trusted-cidrs?page=1&page_size=100", summary: "List database-managed whitelist entries." },
+      { method: "GET", path: "/trusted-cidrs?page=1&page_size=20", summary: "List database-managed whitelist entries." },
       {
         method: "POST",
         path: "/trusted-cidrs",
@@ -1606,7 +1606,7 @@ const apiDocsEn: ApiDocSection[] = [
     title: "Nodes",
     description: "Agent heartbeat, last applied version, and status.",
     endpoints: [
-      { method: "GET", path: "/nodes?page=1&page_size=100", summary: "List nodes." },
+      { method: "GET", path: "/nodes?page=1&page_size=20", summary: "List nodes." },
       { method: "GET", path: "/nodes/{node_id}", summary: "Read one node." }
     ]
   },
@@ -1646,7 +1646,7 @@ const pageResponseExample = `{
   "items": [],
   "total": 0,
   "page": 1,
-  "page_size": 100,
+  "page_size": 20,
   "total_pages": 0
 }`;
 

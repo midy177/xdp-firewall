@@ -32,7 +32,7 @@ use tracing::{debug, error, info, warn};
 const API_TOKEN_ENV: &str = "XDP_FIREWALL_API_TOKEN";
 const ALLOW_UNAUTHENTICATED_ENV: &str = "XDP_FIREWALL_ALLOW_UNAUTHENTICATED";
 const API_TOKEN_HEADER: &str = "x-api-token";
-const DEFAULT_PAGE_SIZE: u64 = 100;
+const DEFAULT_PAGE_SIZE: u64 = 20;
 const MAX_PAGE_SIZE: u64 = 500;
 const FRONTEND_CACHE_CONTROL: &str = "no-store, max-age=0";
 const FRONTEND_ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
