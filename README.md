@@ -44,12 +44,12 @@ Useful endpoints:
 - `DELETE /geo-countries?country=CN&action=deny&enabled=true`
 - `POST /geo-countries/refresh`
 - `GET /geo/lookup?ip=8.8.8.8`
-- `GET /temp-bans?page=1&page_size=20`
+- `GET /temp-bans?page=1&page_size=20&ip=203.0.113.10&protocol=tcp&port=443`
 - `POST /temp-bans`
 - `GET /threat-sources?page=1&page_size=20&name=test-feed&format=cidr&enabled=true`
 - `POST /threat-sources`
 - `DELETE /threat-sources?name=test-feed`
-- `GET /dynamic-rate-limits?page=1&page_size=20&priority=10&protocol=tcp&port=443`
+- `GET /dynamic-rate-limits?page=1&page_size=20&enabled=true&priority=10&protocol=tcp&port=443&packets_per_second=1000&burst=2000`
 - `DELETE /dynamic-rate-limits?enabled=true&priority=10&protocol=tcp&port=443&packets_per_second=1000&burst=2000`
 - `GET /trusted-cidrs?page=1&page_size=20&cidr=10.0.0.0/8&enabled=true`
 - `DELETE /trusted-cidrs?cidr=10.0.0.0/8`
@@ -70,7 +70,7 @@ List endpoints return `items`, `total`, `page`, `page_size`, and `total_pages`. 
 
 `GET /rules` supports optional filters for `action`, `cidr`, `protocol`, `port`, and `priority`; omit all filters to page through all rules. Filters are combined with AND semantics. `DELETE /rules` deletes by the complete rule tuple and requires all five fields: `action`, `cidr`, `protocol`, `port`, and `priority`. Use `DELETE /rules/{id}` for rules that do not have a stored port. `protocol=any` also matches older rules whose protocol field is unset.
 
-`GET /geo-countries`, `GET /threat-sources`, `GET /dynamic-rate-limits`, and `GET /trusted-cidrs` also support optional field filters combined with AND semantics. Their collection DELETE endpoints require the identifying fields: country rules require `country`, `action`, and `enabled`; threat sources require the unique `name`; dynamic rate limits require `enabled`, `priority`, `protocol`, `port`, `packets_per_second`, and `burst`; trusted CIDRs require the unique `cidr`. Use the existing ID DELETE endpoints for temporary bans and configurations whose identifying fields are not stable or unique. Dynamic rate limits without a stored port must also be deleted by ID.
+`GET /geo-countries`, `GET /temp-bans`, `GET /threat-sources`, `GET /dynamic-rate-limits`, and `GET /trusted-cidrs` also support optional field filters combined with AND semantics. Temporary bans support `ip`, `protocol`, and `port` filters and should still be deleted by ID. Their collection DELETE endpoints require the identifying fields: country rules require `country`, `action`, and `enabled`; threat sources require the unique `name`; dynamic rate limits require `enabled`, `priority`, `protocol`, `port`, `packets_per_second`, and `burst`; trusted CIDRs require the unique `cidr`. Use the existing ID DELETE endpoints for configurations whose identifying fields are not stable or unique. Dynamic rate limits without a stored port must also be deleted by ID.
 
 Set `XDP_FIREWALL_API_TOKEN` to protect configuration and `/nodes` API routes. The API refuses to bind to a non-loopback address without a token unless `XDP_FIREWALL_ALLOW_UNAUTHENTICATED=true` is explicitly set. Clients can send either `Authorization: Bearer <token>` or `X-API-Token: <token>`. `/health`, `/countries`, and embedded frontend assets stay public for probes and page loading. When the embedded frontend is used with auth enabled, enter the token in the API token field; it is kept in memory only and is cleared when leaving the page.
 

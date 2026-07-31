@@ -307,6 +307,45 @@ main {
   white-space: nowrap;
 }
 
+.trusted-filter-form {
+  grid-template-columns: minmax(220px, 420px) 120px auto;
+  border-bottom: 1px solid #dfe5eb;
+}
+
+.trusted-filter-form .field {
+  grid-template-rows: 16px 38px;
+}
+
+.geo-filter-form,
+.temp-ban-filter-form,
+.threat-filter-form,
+.custom-rate-filter-form {
+  border-bottom: 1px solid #dfe5eb;
+}
+
+.geo-filter-form {
+  grid-template-columns: minmax(180px, 260px) 120px 120px auto;
+}
+
+.temp-ban-filter-form {
+  grid-template-columns: minmax(220px, 360px) 120px 100px auto;
+}
+
+.threat-filter-form {
+  grid-template-columns: minmax(180px, 260px) minmax(220px, 1fr) 140px 120px 100px auto;
+}
+
+.custom-rate-filter-form {
+  grid-template-columns: 100px 120px 100px 100px 100px 120px auto;
+}
+
+.geo-filter-form .field,
+.temp-ban-filter-form .field,
+.threat-filter-form .field,
+.custom-rate-filter-form .field {
+  grid-template-rows: 16px 38px;
+}
+
 .geo-form {
   grid-template-columns: minmax(180px, 260px) 120px 38px;
 }
@@ -529,10 +568,16 @@ tbody tr:hover {
   color: #ffffff;
   box-shadow: 0 12px 28px rgba(16, 24, 32, 0.22);
   cursor: pointer;
+  touch-action: none;
+  user-select: none;
 }
 
 .help-fab:hover {
   background: #1f5590;
+}
+
+.help-fab.dragging {
+  cursor: grabbing;
 }
 
 .help-overlay {
@@ -947,6 +992,11 @@ pre code {
 
   .rule-form,
   .rule-filter-form,
+  .trusted-filter-form,
+  .geo-filter-form,
+  .temp-ban-filter-form,
+  .threat-filter-form,
+  .custom-rate-filter-form,
   .geo-form,
   .threat-form,
   .custom-rate-form,
@@ -972,6 +1022,11 @@ pre code {
 @media (max-width: 560px) {
   .rule-form,
   .rule-filter-form,
+  .trusted-filter-form,
+  .geo-filter-form,
+  .temp-ban-filter-form,
+  .threat-filter-form,
+  .custom-rate-filter-form,
   .geo-form,
   .geo-lookup-form,
   .threat-form,

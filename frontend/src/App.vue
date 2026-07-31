@@ -48,35 +48,35 @@
       <div class="summary-grid">
         <div class="summary-item">
           <span>{{ t("rules") }}</span>
-          <strong>{{ rulePage.total }}</strong>
+          <strong>{{ loadedTabs.has("rules") ? rulePage.total : "-" }}</strong>
         </div>
         <div class="summary-item">
           <span>{{ t("countries") }}</span>
-          <strong>{{ geoPage.total }}</strong>
+          <strong>{{ loadedTabs.has("geo") ? geoPage.total : "-" }}</strong>
         </div>
         <div class="summary-item">
           <span>{{ t("tempBans") }}</span>
-          <strong>{{ tempBanPage.total }}</strong>
+          <strong>{{ loadedTabs.has("tempBans") ? tempBanPage.total : "-" }}</strong>
         </div>
         <div class="summary-item">
           <span>{{ t("threatSources") }}</span>
-          <strong>{{ threatPage.total }}</strong>
+          <strong>{{ loadedTabs.has("threats") ? threatPage.total : "-" }}</strong>
         </div>
         <div class="summary-item">
           <span>{{ t("dynamicDefense") }}</span>
-          <strong>{{ dynamicDefense.enabled ? t("enabledShort") : t("disabledShort") }}</strong>
+          <strong>{{ loadedTabs.has("defense") ? (dynamicDefense.enabled ? t("enabledShort") : t("disabledShort")) : "-" }}</strong>
         </div>
         <div class="summary-item">
           <span>{{ t("customRateLimits") }}</span>
-          <strong>{{ dynamicRatePage.total }}</strong>
+          <strong>{{ loadedTabs.has("defense") ? dynamicRatePage.total : "-" }}</strong>
         </div>
         <div class="summary-item">
           <span>{{ t("trustedCidrs") }}</span>
-          <strong>{{ trustedPage.total }}</strong>
+          <strong>{{ loadedTabs.has("trusted") ? trustedPage.total : "-" }}</strong>
         </div>
         <div class="summary-item">
           <span>{{ t("nodes") }}</span>
-          <strong>{{ nodePage.total }}</strong>
+          <strong>{{ loadedTabs.has("nodes") ? nodePage.total : "-" }}</strong>
         </div>
         <div class="summary-item">
           <span>{{ t("dropEvents") }}</span>
@@ -268,6 +268,35 @@
             <strong>{{ geoLookupResult ? geoLookupLabel : '-' }}</strong>
           </div>
         </div>
+        <div class="form-grid geo-filter-form">
+          <label class="field">
+            <span>{{ t("country") }}</span>
+            <Select v-model="geoFilters.country" aria-label="Country filter">
+              <option value="all">{{ t("allCountries") }}</option>
+              <option v-for="country in countries" :key="country.code" :value="country.code">{{ countryLabel(country) }}</option>
+            </Select>
+          </label>
+          <label class="field">
+            <span>{{ t("action") }}</span>
+            <Select v-model="geoFilters.action" aria-label="Country action filter">
+              <option value="all">{{ t("allActions") }}</option>
+              <option value="allow">{{ t("allow") }}</option>
+              <option value="deny">{{ t("deny") }}</option>
+            </Select>
+          </label>
+          <label class="field">
+            <span>{{ t("status") }}</span>
+            <Select v-model="geoFilters.enabled" aria-label="Country status filter">
+              <option value="all">{{ t("allStatuses") }}</option>
+              <option value="true">{{ t("enabled") }}</option>
+              <option value="false">{{ t("disabledShort") }}</option>
+            </Select>
+          </label>
+          <div class="filter-actions">
+            <Button :disabled="actionBusy" :title="t('query')" @click="runAction(queryGeo)"><Search :size="15" /><span>{{ t("query") }}</span></Button>
+            <Button variant="secondary" :disabled="actionBusy || !hasGeoFilters" :title="t('clear')" @click="runAction(clearGeoFilters)"><X :size="15" /><span>{{ t("clear") }}</span></Button>
+          </div>
+        </div>
         <table>
           <thead>
             <tr>
@@ -348,6 +377,30 @@
           </label>
           <Button class="form-submit" :title="t('add')" :disabled="actionBusy || hasFieldErrors(tempBanErrorFields)" @click="runAction(createTempBan)"><Plus :size="16" /></Button>
         </div>
+        <div class="form-grid temp-ban-filter-form">
+          <label class="field">
+            <span>{{ t("sourceIp") }}</span>
+            <Input v-model="tempBanFilters.ip" aria-label="Temporary ban source IP filter" placeholder="203.0.113.10" />
+          </label>
+          <label class="field">
+            <span>{{ t("protocol") }}</span>
+            <Select v-model="tempBanFilters.protocol" aria-label="Temporary ban protocol filter">
+              <option value="all">{{ t("allProtocols") }}</option>
+              <option value="any">any</option>
+              <option value="tcp">tcp</option>
+              <option value="udp">udp</option>
+              <option value="icmp">icmp</option>
+            </Select>
+          </label>
+          <label class="field">
+            <span>{{ t("port") }}</span>
+            <Input v-model="tempBanFilters.port" type="number" min="1" max="65535" aria-label="Temporary ban port filter" placeholder="443" />
+          </label>
+          <div class="filter-actions">
+            <Button :disabled="actionBusy" :title="t('query')" @click="runAction(queryTempBans)"><Search :size="15" /><span>{{ t("query") }}</span></Button>
+            <Button variant="secondary" :disabled="actionBusy || !hasTempBanFilters" :title="t('clear')" @click="runAction(clearTempBanFilters)"><X :size="15" /><span>{{ t("clear") }}</span></Button>
+          </div>
+        </div>
         <table>
           <thead>
             <tr>
@@ -410,6 +463,42 @@
             <Input v-model.number="threatForm.min_score" type="number" aria-label="Score" />
           </label>
           <Button class="form-submit" :title="t('add')" :disabled="actionBusy" @click="runAction(createThreat)"><Plus :size="16" /></Button>
+        </div>
+        <div class="form-grid threat-filter-form">
+          <label class="field">
+            <span>{{ t("name") }}</span>
+            <Input v-model="threatFilters.name" aria-label="Threat source name filter" placeholder="ipsum" />
+          </label>
+          <label class="field">
+            <span>URL</span>
+            <Input v-model="threatFilters.url" aria-label="Threat source URL filter" placeholder="https://..." />
+          </label>
+          <label class="field">
+            <span>{{ t("format") }}</span>
+            <Select v-model="threatFilters.format" aria-label="Threat source format filter">
+              <option value="all">{{ t("allFormats") }}</option>
+              <option value="cidr">cidr</option>
+              <option value="ips">ips</option>
+              <option value="ipsum">ipsum</option>
+              <option value="spamhaus_drop">spamhaus_drop</option>
+            </Select>
+          </label>
+          <label class="field">
+            <span>{{ t("status") }}</span>
+            <Select v-model="threatFilters.enabled" aria-label="Threat source status filter">
+              <option value="all">{{ t("allStatuses") }}</option>
+              <option value="true">{{ t("enabled") }}</option>
+              <option value="false">{{ t("disabledShort") }}</option>
+            </Select>
+          </label>
+          <label class="field">
+            <span>{{ t("score") }}</span>
+            <Input v-model="threatFilters.min_score" type="number" min="0" aria-label="Threat source score filter" placeholder="3" />
+          </label>
+          <div class="filter-actions">
+            <Button :disabled="actionBusy" :title="t('query')" @click="runAction(queryThreats)"><Search :size="15" /><span>{{ t("query") }}</span></Button>
+            <Button variant="secondary" :disabled="actionBusy || !hasThreatFilters" :title="t('clear')" @click="runAction(clearThreatFilters)"><X :size="15" /><span>{{ t("clear") }}</span></Button>
+          </div>
         </div>
         <table>
           <thead>
@@ -536,6 +625,46 @@
           </label>
           <Button class="form-submit" :title="t('add')" :disabled="actionBusy || hasFieldErrors(dynamicRateErrorFields)" @click="runAction(createDynamicRateLimit)"><Plus :size="16" /></Button>
         </div>
+        <div class="form-grid custom-rate-filter-form">
+          <label class="field">
+            <span>{{ t("priority") }}</span>
+            <Input v-model="dynamicRateFilters.priority" type="number" aria-label="Dynamic rate priority filter" placeholder="10" />
+          </label>
+          <label class="field">
+            <span>{{ t("protocol") }}</span>
+            <Select v-model="dynamicRateFilters.protocol" aria-label="Dynamic rate protocol filter">
+              <option value="all">{{ t("allProtocols") }}</option>
+              <option value="any">any</option>
+              <option value="tcp">tcp</option>
+              <option value="udp">udp</option>
+              <option value="icmp">icmp</option>
+            </Select>
+          </label>
+          <label class="field">
+            <span>{{ t("port") }}</span>
+            <Input v-model="dynamicRateFilters.port" type="number" min="1" max="65535" aria-label="Dynamic rate port filter" placeholder="443" />
+          </label>
+          <label class="field">
+            <span>PPS</span>
+            <Input v-model="dynamicRateFilters.packets_per_second" type="number" min="1" aria-label="Dynamic rate PPS filter" placeholder="1000" />
+          </label>
+          <label class="field">
+            <span>{{ t("burst") }}</span>
+            <Input v-model="dynamicRateFilters.burst" type="number" min="1" aria-label="Dynamic rate burst filter" placeholder="2000" />
+          </label>
+          <label class="field">
+            <span>{{ t("status") }}</span>
+            <Select v-model="dynamicRateFilters.enabled" aria-label="Dynamic rate status filter">
+              <option value="all">{{ t("allStatuses") }}</option>
+              <option value="true">{{ t("enabled") }}</option>
+              <option value="false">{{ t("disabledShort") }}</option>
+            </Select>
+          </label>
+          <div class="filter-actions">
+            <Button :disabled="actionBusy" :title="t('query')" @click="runAction(queryDynamicRateLimits)"><Search :size="15" /><span>{{ t("query") }}</span></Button>
+            <Button variant="secondary" :disabled="actionBusy || !hasDynamicRateFilters" :title="t('clear')" @click="runAction(clearDynamicRateFilters)"><X :size="15" /><span>{{ t("clear") }}</span></Button>
+          </div>
+        </div>
         <table>
           <thead>
             <tr>
@@ -600,6 +729,24 @@
             <Input v-model="trustedForm.comment" aria-label="Comment" />
           </label>
           <Button class="form-submit" :title="t('add')" :disabled="actionBusy || hasFieldErrors(trustedErrorFields)" @click="runAction(createTrustedCidr)"><Plus :size="16" /></Button>
+        </div>
+        <div class="form-grid trusted-filter-form">
+          <label class="field">
+            <span>CIDR</span>
+            <Input v-model="trustedFilters.cidr" aria-label="Trusted CIDR filter" placeholder="10.0.0.0/8" />
+          </label>
+          <label class="field">
+            <span>{{ t("status") }}</span>
+            <Select v-model="trustedFilters.enabled" aria-label="Trusted CIDR status filter">
+              <option value="all">{{ t("allStatuses") }}</option>
+              <option value="true">{{ t("enabled") }}</option>
+              <option value="false">{{ t("disabledShort") }}</option>
+            </Select>
+          </label>
+          <div class="filter-actions">
+            <Button :disabled="actionBusy" :title="t('query')" @click="runAction(queryTrustedCidrs)"><Search :size="15" /><span>{{ t("query") }}</span></Button>
+            <Button variant="secondary" :disabled="actionBusy || !hasTrustedFilters" :title="t('clear')" @click="runAction(clearTrustedFilters)"><X :size="15" /><span>{{ t("clear") }}</span></Button>
+          </div>
         </div>
         <table>
           <thead>
@@ -750,7 +897,18 @@
       <p v-else-if="notice" class="notice">{{ notice }}</p>
     </main>
 
-    <button class="help-fab" :aria-label="t('help')" :title="t('help')" @click="helpOpen = true">
+    <button
+      class="help-fab"
+      :class="{ dragging: helpFabDragging }"
+      :style="helpFabStyle"
+      :aria-label="t('help')"
+      :title="t('help')"
+      @click="openHelpFromFab"
+      @pointerdown="startHelpFabDrag"
+      @pointermove="moveHelpFab"
+      @pointerup="endHelpFabDrag"
+      @pointercancel="endHelpFabDrag"
+    >
       <BookOpen :size="20" />
     </button>
 
@@ -883,7 +1041,13 @@ const tabs = [
 ] as const;
 
 const tab = ref<(typeof tabs)[number]["id"]>("rules");
+const loadedTabs = reactive(new Set<string>());
+const pendingTabLoads = new Map<string, Promise<void>>();
 const helpOpen = ref(false);
+const helpFabDragging = ref(false);
+const helpFabMoved = ref(false);
+const helpFabPosition = reactive<{ left: number | null; top: number | null }>({ left: null, top: null });
+let helpFabStart = { x: 0, y: 0, left: 0, top: 0 };
 const language = ref<Lang>(localStorage.getItem("xdp-firewall-language") === "en" ? "en" : "zh");
 const health = ref("loading");
 const error = ref("");
@@ -922,12 +1086,17 @@ const nodePage = reactive<PageState>({ page: 1, total_pages: 0, total: 0 });
 const ruleForm = reactive({ priority: 10, action: "deny", cidr: "203.0.113.0/24", protocol: "any", port: "" });
 const ruleFilters = reactive({ action: "all", cidr: "", protocol: "all", port: "", priority: "" });
 const geoForm = reactive({ country: "CN", action: "allow" });
+const geoFilters = reactive({ country: "all", action: "all", enabled: "all" });
 const geoLookupForm = reactive({ ip: "8.8.8.8" });
 const geoLookupResult = ref<GeoLookupResponse | null>(null);
 const threatForm = reactive({ name: "ipsum", url: "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt", format: "ipsum", min_score: 3 });
+const threatFilters = reactive({ name: "", url: "", format: "all", enabled: "all", min_score: "" });
 const trustedForm = reactive({ cidr: "10.0.0.0/8", comment: "" });
+const trustedFilters = reactive({ cidr: "", enabled: "all" });
 const dynamicRateForm = reactive({ priority: 10, protocol: "tcp", port: "443", packets_per_second: 1000, burst: 2000, comment: "" });
+const dynamicRateFilters = reactive({ priority: "", protocol: "all", port: "", packets_per_second: "", burst: "", enabled: "all" });
 const tempBanForm = reactive({ ip: "203.0.113.10", protocol: "any", port: "", duration_seconds: 300, comment: "" });
+const tempBanFilters = reactive({ ip: "", protocol: "all", port: "" });
 const dynamicDefense = reactive<DynamicDefense>({
   enabled: true,
   ip_rate_limit_enabled: true,
@@ -960,7 +1129,10 @@ const messages = {
     apiPaginationText: "列表接口支持 page 和 page_size，默认 page_size 为 20，最大 500。",
     allNodes: "全部节点",
     allActions: "全部动作",
+    allCountries: "全部国家",
+    allFormats: "全部格式",
     allProtocols: "全部协议",
+    allStatuses: "全部状态",
     authInvalid: "API 令牌缺失或无效",
     blockSeconds: "封禁秒数",
     burst: "突发",
@@ -1079,7 +1251,10 @@ const messages = {
     apiPaginationText: "List APIs support page and page_size. The default page_size is 20 and the maximum is 500.",
     allNodes: "All nodes",
     allActions: "All actions",
+    allCountries: "All countries",
+    allFormats: "All formats",
     allProtocols: "All protocols",
+    allStatuses: "All statuses",
     authInvalid: "missing or invalid API token",
     blockSeconds: "Block seconds",
     burst: "Burst",
@@ -1298,7 +1473,7 @@ const apiDocsZh: ApiDocSection[] = [
     title: "临时封禁",
     description: "临时封禁单个源 IP，可选协议和目的端口。duration_seconds 默认 300。",
     endpoints: [
-      { method: "GET", path: "/temp-bans?page=1&page_size=20", summary: "分页列出未过期临时封禁。" },
+      { method: "GET", path: "/temp-bans?page=1&page_size=20&ip=203.0.113.10&protocol=tcp&port=443", summary: "分页列出未过期临时封禁，可按 ip、protocol、port 过滤，条件按 AND 匹配。" },
       {
         method: "POST",
         path: "/temp-bans",
@@ -1364,7 +1539,7 @@ const apiDocsZh: ApiDocSection[] = [
     title: "自定义限流",
     description: "按协议或目的端口配置动态防御限流，优先级高于全局 ip_rate_limit 和 flood。",
     endpoints: [
-      { method: "GET", path: "/dynamic-rate-limits?page=1&page_size=20&priority=10&protocol=tcp&port=443", summary: "分页列出自定义限流，可按 enabled、priority、protocol、port、packets_per_second、burst 过滤，条件按 AND 匹配。" },
+      { method: "GET", path: "/dynamic-rate-limits?page=1&page_size=20&enabled=true&priority=10&protocol=tcp&port=443&packets_per_second=1000&burst=2000", summary: "分页列出自定义限流，可按 enabled、priority、protocol、port、packets_per_second、burst 过滤，条件按 AND 匹配。" },
       {
         method: "POST",
         path: "/dynamic-rate-limits",
@@ -1499,7 +1674,7 @@ const apiDocsEn: ApiDocSection[] = [
     title: "Temporary Bans",
     description: "Temporarily block one source IP with optional protocol and destination port. duration_seconds defaults to 300.",
     endpoints: [
-      { method: "GET", path: "/temp-bans?page=1&page_size=20", summary: "List unexpired temporary bans." },
+      { method: "GET", path: "/temp-bans?page=1&page_size=20&ip=203.0.113.10&protocol=tcp&port=443", summary: "List unexpired temporary bans, optionally filtered by ip, protocol, and port with AND semantics." },
       {
         method: "POST",
         path: "/temp-bans",
@@ -1565,7 +1740,7 @@ const apiDocsEn: ApiDocSection[] = [
     title: "Custom Rate Limits",
     description: "Protocol or destination-port dynamic defense limits. They run before global ip_rate_limit and flood.",
     endpoints: [
-      { method: "GET", path: "/dynamic-rate-limits?page=1&page_size=20&priority=10&protocol=tcp&port=443", summary: "List custom rate limits, optionally filtered by enabled, priority, protocol, port, packets_per_second, and burst with AND semantics." },
+      { method: "GET", path: "/dynamic-rate-limits?page=1&page_size=20&enabled=true&priority=10&protocol=tcp&port=443&packets_per_second=1000&burst=2000", summary: "List custom rate limits, optionally filtered by enabled, priority, protocol, port, packets_per_second, and burst with AND semantics." },
       {
         method: "POST",
         path: "/dynamic-rate-limits",
@@ -1882,6 +2057,68 @@ function t(key: TextKey): string {
   return messages[language.value][key];
 }
 
+const helpFabStyle = computed(() => {
+  if (helpFabPosition.left === null || helpFabPosition.top === null) {
+    return {};
+  }
+  return {
+    left: `${helpFabPosition.left}px`,
+    top: `${helpFabPosition.top}px`,
+    right: "auto",
+    bottom: "auto"
+  };
+});
+
+function startHelpFabDrag(event: PointerEvent) {
+  if (event.button !== 0) {
+    return;
+  }
+  const button = event.currentTarget as HTMLElement;
+  const rect = button.getBoundingClientRect();
+  if (helpFabPosition.left === null || helpFabPosition.top === null) {
+    helpFabPosition.left = rect.left;
+    helpFabPosition.top = rect.top;
+  }
+  helpFabStart = { x: event.clientX, y: event.clientY, left: rect.left, top: rect.top };
+  helpFabMoved.value = false;
+  helpFabDragging.value = true;
+  button.setPointerCapture(event.pointerId);
+}
+
+function moveHelpFab(event: PointerEvent) {
+  if (!helpFabDragging.value) {
+    return;
+  }
+  const button = event.currentTarget as HTMLElement;
+  const rect = button.getBoundingClientRect();
+  const dx = event.clientX - helpFabStart.x;
+  const dy = event.clientY - helpFabStart.y;
+  helpFabMoved.value ||= Math.abs(dx) > 4 || Math.abs(dy) > 4;
+  const maxLeft = Math.max(8, window.innerWidth - rect.width - 8);
+  const maxTop = Math.max(8, window.innerHeight - rect.height - 8);
+  helpFabPosition.left = Math.min(maxLeft, Math.max(8, helpFabStart.left + dx));
+  helpFabPosition.top = Math.min(maxTop, Math.max(8, helpFabStart.top + dy));
+}
+
+function endHelpFabDrag(event: PointerEvent) {
+  if (!helpFabDragging.value) {
+    return;
+  }
+  const button = event.currentTarget as HTMLElement;
+  if (button.hasPointerCapture(event.pointerId)) {
+    button.releasePointerCapture(event.pointerId);
+  }
+  helpFabDragging.value = false;
+}
+
+function openHelpFromFab() {
+  if (helpFabMoved.value) {
+    helpFabMoved.value = false;
+    return;
+  }
+  helpOpen.value = true;
+}
+
 function v(key: ValidationKey, label = ""): string {
   return validationMessages[language.value][key](label);
 }
@@ -1935,6 +2172,88 @@ function rulePageQuery(page: number): string {
   }
   if (ruleFilters.priority.trim()) {
     params.set("priority", ruleFilters.priority.trim());
+  }
+  return params.toString();
+}
+
+function trustedPageQuery(page: number): string {
+  const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+  if (trustedFilters.cidr.trim()) {
+    params.set("cidr", trustedFilters.cidr.trim());
+  }
+  if (trustedFilters.enabled !== "all") {
+    params.set("enabled", trustedFilters.enabled);
+  }
+  return params.toString();
+}
+
+function geoPageQuery(page: number): string {
+  const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+  if (geoFilters.country !== "all") {
+    params.set("country", geoFilters.country);
+  }
+  if (geoFilters.action !== "all") {
+    params.set("action", geoFilters.action);
+  }
+  if (geoFilters.enabled !== "all") {
+    params.set("enabled", geoFilters.enabled);
+  }
+  return params.toString();
+}
+
+function tempBanPageQuery(page: number): string {
+  const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+  if (tempBanFilters.ip.trim()) {
+    params.set("ip", tempBanFilters.ip.trim());
+  }
+  if (tempBanFilters.protocol !== "all") {
+    params.set("protocol", tempBanFilters.protocol);
+  }
+  if (tempBanFilters.port.trim()) {
+    params.set("port", tempBanFilters.port.trim());
+  }
+  return params.toString();
+}
+
+function threatPageQuery(page: number): string {
+  const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+  if (threatFilters.name.trim()) {
+    params.set("name", threatFilters.name.trim());
+  }
+  if (threatFilters.url.trim()) {
+    params.set("url", threatFilters.url.trim());
+  }
+  if (threatFilters.format !== "all") {
+    params.set("format", threatFilters.format);
+  }
+  if (threatFilters.enabled !== "all") {
+    params.set("enabled", threatFilters.enabled);
+  }
+  if (threatFilters.min_score.trim()) {
+    params.set("min_score", threatFilters.min_score.trim());
+  }
+  return params.toString();
+}
+
+function dynamicRatePageQuery(page: number): string {
+  const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+  if (dynamicRateFilters.priority.trim()) {
+    params.set("priority", dynamicRateFilters.priority.trim());
+  }
+  if (dynamicRateFilters.protocol !== "all") {
+    params.set("protocol", dynamicRateFilters.protocol);
+  }
+  if (dynamicRateFilters.port.trim()) {
+    params.set("port", dynamicRateFilters.port.trim());
+  }
+  if (dynamicRateFilters.packets_per_second.trim()) {
+    params.set("packets_per_second", dynamicRateFilters.packets_per_second.trim());
+  }
+  if (dynamicRateFilters.burst.trim()) {
+    params.set("burst", dynamicRateFilters.burst.trim());
+  }
+  if (dynamicRateFilters.enabled !== "all") {
+    params.set("enabled", dynamicRateFilters.enabled);
   }
   return params.toString();
 }
@@ -2009,16 +2328,8 @@ async function refreshAll() {
   loading.value = true;
   try {
     await loadHealth();
-    await loadCountries();
     await loadPolicy();
-    await loadRules();
-    await loadGeo();
-    await loadTempBans();
-    await loadThreats();
-    await loadDynamicDefense();
-    await loadDynamicRateLimits();
-    await loadTrustedCidrs();
-    await loadNodes();
+    await loadTabData(tab.value);
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
@@ -2030,7 +2341,9 @@ async function refreshPublic() {
   loading.value = true;
   try {
     await loadHealth();
-    await loadCountries();
+    if (tab.value === "geo") {
+      await loadCountries();
+    }
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
   } finally {
@@ -2040,6 +2353,57 @@ async function refreshPublic() {
 
 async function refreshCurrentView() {
   await refreshAll();
+}
+
+async function ensureTabLoaded(value: (typeof tabs)[number]["id"]) {
+  if (loadedTabs.has(value)) {
+    return;
+  }
+  const pending = pendingTabLoads.get(value);
+  if (pending) {
+    await pending;
+    return;
+  }
+  const load = loadTabData(value).then(() => {
+    loadedTabs.add(value);
+  });
+  pendingTabLoads.set(value, load);
+  try {
+    await load;
+  } finally {
+    pendingTabLoads.delete(value);
+  }
+}
+
+async function loadTabData(value: (typeof tabs)[number]["id"]) {
+  switch (value) {
+    case "rules":
+      await loadRules();
+      break;
+    case "geo":
+      await loadCountries();
+      await loadGeo();
+      break;
+    case "tempBans":
+      await loadTempBans();
+      break;
+    case "threats":
+      await loadThreats();
+      break;
+    case "defense":
+      await loadDynamicDefense();
+      await loadDynamicRateLimits();
+      break;
+    case "trusted":
+      await loadTrustedCidrs();
+      break;
+    case "nodes":
+      await loadNodes();
+      break;
+    case "drops":
+      break;
+  }
+  loadedTabs.add(value);
 }
 
 async function runAction(action: () => Promise<void>) {
@@ -2087,21 +2451,68 @@ async function clearRuleFilters() {
 }
 
 async function loadGeo(page = geoPage.page) {
-  const data = await api<Page<GeoCountry>>(`geo-countries?${pageQuery(page)}`);
+  const data = await api<Page<GeoCountry>>(`geo-countries?${geoPageQuery(page)}`);
   geoCountries.value = data.items;
   updatePage(geoPage, data);
 }
 
 async function loadTempBans(page = tempBanPage.page) {
-  const data = await api<Page<TempBan>>(`temp-bans?${pageQuery(page)}`);
+  const data = await api<Page<TempBan>>(`temp-bans?${tempBanPageQuery(page)}`);
   tempBans.value = data.items;
   updatePage(tempBanPage, data);
 }
 
 async function loadThreats(page = threatPage.page) {
-  const data = await api<Page<ThreatSource>>(`threat-sources?${pageQuery(page)}`);
+  const data = await api<Page<ThreatSource>>(`threat-sources?${threatPageQuery(page)}`);
   threatSources.value = data.items;
   updatePage(threatPage, data);
+}
+
+const hasGeoFilters = computed(() => {
+  return geoFilters.country !== "all" || geoFilters.action !== "all" || geoFilters.enabled !== "all";
+});
+
+async function queryGeo() {
+  await loadGeo(1);
+}
+
+async function clearGeoFilters() {
+  geoFilters.country = "all";
+  geoFilters.action = "all";
+  geoFilters.enabled = "all";
+  await loadGeo(1);
+}
+
+const hasTempBanFilters = computed(() => {
+  return Boolean(tempBanFilters.ip.trim() || tempBanFilters.port.trim()) || tempBanFilters.protocol !== "all";
+});
+
+async function queryTempBans() {
+  await loadTempBans(1);
+}
+
+async function clearTempBanFilters() {
+  tempBanFilters.ip = "";
+  tempBanFilters.protocol = "all";
+  tempBanFilters.port = "";
+  await loadTempBans(1);
+}
+
+const hasThreatFilters = computed(() => {
+  return Boolean(threatFilters.name.trim() || threatFilters.url.trim() || threatFilters.min_score.trim()) || threatFilters.format !== "all" || threatFilters.enabled !== "all";
+});
+
+async function queryThreats() {
+  await loadThreats(1);
+}
+
+async function clearThreatFilters() {
+  threatFilters.name = "";
+  threatFilters.url = "";
+  threatFilters.format = "all";
+  threatFilters.enabled = "all";
+  threatFilters.min_score = "";
+  await loadThreats(1);
 }
 
 async function loadDynamicDefense() {
@@ -2110,15 +2521,47 @@ async function loadDynamicDefense() {
 }
 
 async function loadDynamicRateLimits(page = dynamicRatePage.page) {
-  const data = await api<Page<DynamicRateLimit>>(`dynamic-rate-limits?${pageQuery(page)}`);
+  const data = await api<Page<DynamicRateLimit>>(`dynamic-rate-limits?${dynamicRatePageQuery(page)}`);
   dynamicRateLimits.value = data.items;
   updatePage(dynamicRatePage, data);
 }
 
+const hasDynamicRateFilters = computed(() => {
+  return Boolean(dynamicRateFilters.priority.trim() || dynamicRateFilters.port.trim() || dynamicRateFilters.packets_per_second.trim() || dynamicRateFilters.burst.trim()) || dynamicRateFilters.protocol !== "all" || dynamicRateFilters.enabled !== "all";
+});
+
+async function queryDynamicRateLimits() {
+  await loadDynamicRateLimits(1);
+}
+
+async function clearDynamicRateFilters() {
+  dynamicRateFilters.priority = "";
+  dynamicRateFilters.protocol = "all";
+  dynamicRateFilters.port = "";
+  dynamicRateFilters.packets_per_second = "";
+  dynamicRateFilters.burst = "";
+  dynamicRateFilters.enabled = "all";
+  await loadDynamicRateLimits(1);
+}
+
 async function loadTrustedCidrs(page = trustedPage.page) {
-  const data = await api<Page<TrustedCidr>>(`trusted-cidrs?${pageQuery(page)}`);
+  const data = await api<Page<TrustedCidr>>(`trusted-cidrs?${trustedPageQuery(page)}`);
   trustedCidrs.value = data.items;
   updatePage(trustedPage, data);
+}
+
+const hasTrustedFilters = computed(() => {
+  return Boolean(trustedFilters.cidr.trim()) || trustedFilters.enabled !== "all";
+});
+
+async function queryTrustedCidrs() {
+  await loadTrustedCidrs(1);
+}
+
+async function clearTrustedFilters() {
+  trustedFilters.cidr = "";
+  trustedFilters.enabled = "all";
+  await loadTrustedCidrs(1);
 }
 
 async function loadCountries() {
@@ -2356,6 +2799,9 @@ watch(tab, (value) => {
   if (value !== "drops") {
     stopDropStream();
   }
+  void ensureTabLoaded(value).catch((err) => {
+    error.value = err instanceof Error ? err.message : String(err);
+  });
 });
 watch(dropNodeFilter, () => {
   clearDropEvents();

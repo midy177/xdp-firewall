@@ -194,6 +194,15 @@ struct TrustedCidrMatchQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct TempBanQuery {
+    page: Option<u64>,
+    page_size: Option<u64>,
+    ip: Option<String>,
+    protocol: Option<String>,
+    port: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
 struct DropEventQuery {
     node_id: Option<String>,
 }
@@ -1236,12 +1245,33 @@ async fn delete_dynamic_rate_limit(
 
 async fn list_temp_bans(
     State(state): State<ApiState>,
-    Query(query): Query<PaginationQuery>,
+    Query(query): Query<TempBanQuery>,
 ) -> ApiResult<Json<Page<temp_ban::Model>>> {
-    let pagination = query.normalize()?;
-    let paginator = temp_ban::Entity::find()
+    let pagination = PaginationQuery {
+        page: query.page,
+        page_size: query.page_size,
+    }
+    .normalize()?;
+    let protocol = query
+        .protocol
+        .as_deref()
+        .filter(|value| *value != "all")
+        .map(normalize_protocol)
+        .transpose()?;
+    let port = validate_dynamic_rate_port(protocol.as_deref().unwrap_or("any"), query.port)?;
+    let mut select = temp_ban::Entity::find()
         .filter(temp_ban::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
-        .filter(temp_ban::Column::ExpiresAt.gt(chrono::Utc::now().naive_utc()))
+        .filter(temp_ban::Column::ExpiresAt.gt(chrono::Utc::now().naive_utc()));
+    if let Some(ip) = query.ip.as_deref() {
+        select = select.filter(temp_ban::Column::Ip.eq(normalize_ip(ip)?));
+    }
+    if let Some(protocol) = protocol {
+        select = select.filter(temp_ban::Column::Protocol.eq(protocol));
+    }
+    if let Some(port) = port {
+        select = select.filter(temp_ban::Column::Port.eq(port));
+    }
+    let paginator = select
         .order_by_asc(temp_ban::Column::ExpiresAt)
         .paginate(&state.db, pagination.page_size);
     let total = paginator.num_items().await?;
@@ -2392,6 +2422,32 @@ mod tests {
         )
         .await;
         assert!(port_error.contains("port must be between 1 and 65535"));
+
+        response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/temp-bans",
+                json!({
+                    "ip": "203.0.113.10",
+                    "protocol": "tcp",
+                    "port": 443,
+                    "duration_seconds": 300
+                }),
+            )
+            .await,
+        )
+        .await;
+        let filtered = response_json(
+            send_empty(
+                &app,
+                Method::GET,
+                "/temp-bans?ip=203.0.113.10&protocol=tcp&port=443",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(filtered["total"], 1);
     }
 
     #[tokio::test]
