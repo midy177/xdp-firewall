@@ -296,7 +296,7 @@
   - Decode watch lines as `k8s_openapi::apimachinery::pkg::apis::meta::v1::WatchEvent<T>`.
   - Remove manual `serde_json::Value` path walkers from Kubernetes discovery.
 - [completed] Update Rust and frontend dependencies to current registry releases, refresh lockfiles, and run the standard validation suite after dependency resolution.
-- [pending] Evaluate threat-intelligence prefix caching/persistence so agents do not repeatedly download and parse built-in feeds during policy compilation.
+- [completed] Add automatic threat-intelligence feed checks with persisted content fingerprints so xDS only bumps policy versions when enabled feeds change.
 - [pending] Keep MMDB lookup coverage as all persisted countries for correct IP ownership queries; optimize only the full-MMDB build path and refresh cadence.
 
 ## Validation Commands

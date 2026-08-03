@@ -1,7 +1,7 @@
 use crate::cli::{ApiArgs, SeedExampleArgs};
 use crate::db::entities::{
     dynamic_defense, dynamic_rate_limit, firewall_rule, geo_country_policy, node, policy_version,
-    temp_ban, threat_source, trusted_cidr,
+    temp_ban, threat_source, threat_source_state, trusted_cidr,
 };
 use crate::{db, firewall, geo, security, threat, xds};
 use anyhow::{Context, Result, bail};
@@ -15,11 +15,12 @@ use axum::{
     routing::{any, delete, get, post},
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, Set, sea_query::OnConflict,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, Set, TransactionTrait, sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     convert::Infallible,
     net::SocketAddr,
     sync::{Arc, Mutex as StdMutex},
@@ -39,6 +40,7 @@ const FRONTEND_ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable"
 const DEFAULT_TEMP_BAN_SECONDS: i64 = 300;
 const MAX_TEMP_BAN_SECONDS: i64 = 31_536_000;
 const GEO_REFRESH_RATE_LIMIT: Duration = Duration::from_secs(300);
+const MAX_BATCH_SIZE: usize = 500;
 
 mod frontend_assets {
     include!(concat!(env!("OUT_DIR"), "/frontend_assets.rs"));
@@ -51,6 +53,7 @@ struct ApiState {
     drop_events: xds::DropEventHub,
     geo_lookup: geo::GeoIpLookup,
     geo_refresh_limiter: GeoRefreshLimiter,
+    threat_refresh_limiter: ThreatRefreshLimiter,
 }
 
 #[derive(Clone, Default)]
@@ -75,6 +78,28 @@ struct CachedGeoRefresh {
     report: geo::GeoRefreshReport,
 }
 
+#[derive(Clone, Default)]
+struct ThreatRefreshLimiter {
+    state: Arc<StdMutex<ThreatRefreshLimiterState>>,
+}
+
+#[derive(Default)]
+struct ThreatRefreshLimiterState {
+    last_started: Option<Instant>,
+    running: bool,
+    last_result: Option<CachedThreatRefresh>,
+}
+
+struct ThreatRefreshPermit {
+    limiter: ThreatRefreshLimiter,
+}
+
+#[derive(Clone)]
+struct CachedThreatRefresh {
+    version: i64,
+    report: threat::ThreatRefreshReport,
+}
+
 enum GeoRefreshDecision {
     Start {
         permit: GeoRefreshPermit,
@@ -82,6 +107,15 @@ enum GeoRefreshDecision {
     },
     Running(Option<CachedGeoRefresh>),
     RateLimited(Option<CachedGeoRefresh>),
+}
+
+enum ThreatRefreshDecision {
+    Start {
+        permit: ThreatRefreshPermit,
+        previous: Option<CachedThreatRefresh>,
+    },
+    Running(Option<CachedThreatRefresh>),
+    RateLimited(Option<CachedThreatRefresh>),
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +132,21 @@ struct PolicyVersionResponse {
 struct Versioned<T> {
     version: i64,
     data: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchRequest<T> {
+    items: Vec<T>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchDeleteRequest {
+    ids: Vec<i32>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchDeleteResponse {
+    deleted: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,6 +399,7 @@ pub async fn serve(
         drop_events,
         geo_lookup,
         geo_refresh_limiter: GeoRefreshLimiter::default(),
+        threat_refresh_limiter: ThreatRefreshLimiter::default(),
     });
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -383,12 +433,20 @@ fn router(state: ApiState) -> Router {
             "/rules",
             get(list_rules).post(create_rule).delete(delete_rules),
         )
+        .route(
+            "/rules/batch",
+            post(create_rules).delete(delete_rules_batch),
+        )
         .route("/rules/{id}", delete(delete_rule))
         .route(
             "/geo-countries",
             get(list_geo_countries)
                 .post(create_geo_country)
                 .delete(delete_geo_countries),
+        )
+        .route(
+            "/geo-countries/batch",
+            post(create_geo_countries).delete(delete_geo_countries_batch),
         )
         .route("/geo-countries/refresh", post(refresh_geo_countries))
         .route("/geo/lookup", get(lookup_geo_ip))
@@ -399,6 +457,11 @@ fn router(state: ApiState) -> Router {
                 .post(create_threat_source)
                 .delete(delete_threat_sources),
         )
+        .route(
+            "/threat-sources/batch",
+            post(create_threat_sources).delete(delete_threat_sources_batch),
+        )
+        .route("/threat-sources/refresh", post(refresh_threat_sources))
         .route("/threat-sources/{id}", delete(delete_threat_source))
         .route(
             "/dynamic-defense",
@@ -411,16 +474,28 @@ fn router(state: ApiState) -> Router {
                 .delete(delete_dynamic_rate_limits),
         )
         .route(
+            "/dynamic-rate-limits/batch",
+            post(create_dynamic_rate_limits).delete(delete_dynamic_rate_limits_batch),
+        )
+        .route(
             "/dynamic-rate-limits/{id}",
             delete(delete_dynamic_rate_limit),
         )
         .route("/temp-bans", get(list_temp_bans).post(create_temp_ban))
+        .route(
+            "/temp-bans/batch",
+            post(create_temp_bans).delete(delete_temp_bans_batch),
+        )
         .route("/temp-bans/{id}", delete(delete_temp_ban))
         .route(
             "/trusted-cidrs",
             get(list_trusted_cidrs)
                 .post(create_trusted_cidr)
                 .delete(delete_trusted_cidrs),
+        )
+        .route(
+            "/trusted-cidrs/batch",
+            post(create_trusted_cidrs).delete(delete_trusted_cidrs_batch),
         )
         .route("/trusted-cidrs/{id}", delete(delete_trusted_cidr))
         .route("/nodes", get(list_nodes))
@@ -636,6 +711,39 @@ async fn create_rule(
     State(state): State<ApiState>,
     Json(request): Json<CreateRuleRequest>,
 ) -> ApiResult<(StatusCode, Json<Versioned<firewall_rule::Model>>)> {
+    let row = rule_active_model(request)?.insert(&state.db).await?;
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
+}
+
+async fn create_rules(
+    State(state): State<ApiState>,
+    Json(request): Json<BatchRequest<CreateRuleRequest>>,
+) -> ApiResult<(StatusCode, Json<Versioned<Vec<firewall_rule::Model>>>)> {
+    validate_batch_len(request.items.len())?;
+    let models = request
+        .items
+        .into_iter()
+        .map(rule_active_model)
+        .collect::<ApiResult<Vec<_>>>()?;
+    let txn = state.db.begin().await?;
+    let mut rows = Vec::with_capacity(models.len());
+    for model in models {
+        rows.push(model.insert(&txn).await?);
+    }
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(Versioned {
+            version,
+            data: rows,
+        }),
+    ))
+}
+
+fn rule_active_model(request: CreateRuleRequest) -> ApiResult<firewall_rule::ActiveModel> {
     validate_action(&request.action)?;
     let cidr = normalize_cidr(&request.cidr)?;
     let protocol = request
@@ -644,7 +752,7 @@ async fn create_rule(
         .map(normalize_protocol)
         .transpose()?;
     let port = validate_port(protocol.as_deref(), request.port)?;
-    let row = firewall_rule::ActiveModel {
+    Ok(firewall_rule::ActiveModel {
         policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
         enabled: Set(request.enabled.unwrap_or(true)),
         priority: Set(request.priority),
@@ -655,11 +763,7 @@ async fn create_rule(
         comment: Set(request.comment),
         updated_at: Set(chrono::Utc::now().naive_utc()),
         ..Default::default()
-    }
-    .insert(&state.db)
-    .await?;
-    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
-    Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
+    })
 }
 
 async fn delete_rule(
@@ -678,6 +782,29 @@ async fn delete_rule(
     Ok(Json(Versioned {
         version,
         data: serde_json::json!({ "deleted": id }),
+    }))
+}
+
+async fn delete_rules_batch(
+    State(state): State<ApiState>,
+    Json(request): Json<BatchDeleteRequest>,
+) -> ApiResult<Json<Versioned<BatchDeleteResponse>>> {
+    let ids = validate_batch_ids(request.ids)?;
+    let txn = state.db.begin().await?;
+    let deleted = firewall_rule::Entity::delete_many()
+        .filter(firewall_rule::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(firewall_rule::Column::Id.is_in(ids.iter().copied()))
+        .exec(&txn)
+        .await?;
+    ensure_all_ids_deleted(deleted.rows_affected, ids.len(), "rule not found")?;
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
+    Ok(Json(Versioned {
+        version,
+        data: BatchDeleteResponse {
+            deleted: deleted.rows_affected,
+        },
     }))
 }
 
@@ -766,9 +893,44 @@ async fn create_geo_country(
     State(state): State<ApiState>,
     Json(request): Json<CreateGeoCountryRequest>,
 ) -> ApiResult<(StatusCode, Json<Versioned<geo_country_policy::Model>>)> {
+    let row = geo_country_active_model(request)?.insert(&state.db).await?;
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
+}
+
+async fn create_geo_countries(
+    State(state): State<ApiState>,
+    Json(request): Json<BatchRequest<CreateGeoCountryRequest>>,
+) -> ApiResult<(StatusCode, Json<Versioned<Vec<geo_country_policy::Model>>>)> {
+    validate_batch_len(request.items.len())?;
+    let models = request
+        .items
+        .into_iter()
+        .map(geo_country_active_model)
+        .collect::<ApiResult<Vec<_>>>()?;
+    let txn = state.db.begin().await?;
+    let mut rows = Vec::with_capacity(models.len());
+    for model in models {
+        rows.push(model.insert(&txn).await?);
+    }
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(Versioned {
+            version,
+            data: rows,
+        }),
+    ))
+}
+
+fn geo_country_active_model(
+    request: CreateGeoCountryRequest,
+) -> ApiResult<geo_country_policy::ActiveModel> {
     validate_action(&request.action)?;
     let country = geo::normalize_country(&request.country)?;
-    let row = geo_country_policy::ActiveModel {
+    Ok(geo_country_policy::ActiveModel {
         policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
         enabled: Set(request.enabled.unwrap_or(true)),
         country: Set(country),
@@ -777,11 +939,7 @@ async fn create_geo_country(
         burst: Set(None),
         updated_at: Set(chrono::Utc::now().naive_utc()),
         ..Default::default()
-    }
-    .insert(&state.db)
-    .await?;
-    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
-    Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
+    })
 }
 
 async fn refresh_geo_countries(
@@ -952,6 +1110,33 @@ async fn delete_geo_country(
     }))
 }
 
+async fn delete_geo_countries_batch(
+    State(state): State<ApiState>,
+    Json(request): Json<BatchDeleteRequest>,
+) -> ApiResult<Json<Versioned<BatchDeleteResponse>>> {
+    let ids = validate_batch_ids(request.ids)?;
+    let txn = state.db.begin().await?;
+    let deleted = geo_country_policy::Entity::delete_many()
+        .filter(geo_country_policy::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(geo_country_policy::Column::Id.is_in(ids.iter().copied()))
+        .exec(&txn)
+        .await?;
+    ensure_all_ids_deleted(
+        deleted.rows_affected,
+        ids.len(),
+        "geo country policy not found",
+    )?;
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
+    Ok(Json(Versioned {
+        version,
+        data: BatchDeleteResponse {
+            deleted: deleted.rows_affected,
+        },
+    }))
+}
+
 async fn list_threat_sources(
     State(state): State<ApiState>,
     Query(query): Query<ThreatSourceQuery>,
@@ -995,15 +1180,19 @@ async fn delete_threat_sources(
     if name.is_empty() {
         return Err(ApiError::bad_request("name must not be empty"));
     }
+    let txn = state.db.begin().await?;
     let deleted = threat_source::Entity::delete_many()
         .filter(threat_source::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
         .filter(threat_source::Column::Name.eq(name))
-        .exec(&state.db)
+        .exec(&txn)
         .await?;
     if deleted.rows_affected == 0 {
         return Err(ApiError::not_found("threat source not found"));
     }
-    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    delete_threat_source_states_by_name(&txn, std::iter::once(name)).await?;
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
     Ok(Json(Versioned {
         version,
         data: serde_json::json!({ "deleted": deleted.rows_affected }),
@@ -1014,10 +1203,47 @@ async fn create_threat_source(
     State(state): State<ApiState>,
     Json(request): Json<CreateThreatSourceRequest>,
 ) -> ApiResult<(StatusCode, Json<Versioned<threat_source::Model>>)> {
+    let row = threat_source_active_model(request)?
+        .insert(&state.db)
+        .await?;
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
+}
+
+async fn create_threat_sources(
+    State(state): State<ApiState>,
+    Json(request): Json<BatchRequest<CreateThreatSourceRequest>>,
+) -> ApiResult<(StatusCode, Json<Versioned<Vec<threat_source::Model>>>)> {
+    validate_batch_len(request.items.len())?;
+    let models = request
+        .items
+        .into_iter()
+        .map(threat_source_active_model)
+        .collect::<ApiResult<Vec<_>>>()?;
+    let txn = state.db.begin().await?;
+    let mut rows = Vec::with_capacity(models.len());
+    for model in models {
+        rows.push(model.insert(&txn).await?);
+    }
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(Versioned {
+            version,
+            data: rows,
+        }),
+    ))
+}
+
+fn threat_source_active_model(
+    request: CreateThreatSourceRequest,
+) -> ApiResult<threat_source::ActiveModel> {
     let format = normalize_threat_format(&request.format)?;
     threat::validate_source_url(&request.url)?;
     validate_optional_non_negative("min_score", request.min_score)?;
-    let row = threat_source::ActiveModel {
+    Ok(threat_source::ActiveModel {
         policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
         enabled: Set(request.enabled.unwrap_or(true)),
         name: Set(request.name),
@@ -1026,30 +1252,200 @@ async fn create_threat_source(
         min_score: Set(request.min_score),
         updated_at: Set(chrono::Utc::now().naive_utc()),
         ..Default::default()
+    })
+}
+
+async fn refresh_threat_sources(
+    State(state): State<ApiState>,
+) -> ApiResult<Json<Versioned<threat::ThreatRefreshReport>>> {
+    match state
+        .threat_refresh_limiter
+        .start_or_cached(GEO_REFRESH_RATE_LIMIT)
+    {
+        ThreatRefreshDecision::Start { permit, previous } => {
+            let db = state.db.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                match run_threat_refresh(db).await {
+                    Ok(result) => {
+                        info!(
+                            version = result.version,
+                            enabled_threat_sources = result.report.enabled_source_count,
+                            changed_threat_sources = result.report.changed_source_count,
+                            prefixes = result.report.prefix_count,
+                            "threat intelligence refresh completed"
+                        );
+                        _permit.finish_success(result);
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "threat intelligence refresh failed");
+                    }
+                }
+            });
+            let version = previous
+                .as_ref()
+                .map(|cached| cached.version)
+                .unwrap_or(current_policy_version(&state.db).await?);
+            let report = previous
+                .map(|cached| threat_refresh_response_report(cached.report, "running", true, true))
+                .unwrap_or_else(|| {
+                    threat_refresh_response_report(
+                        threat::ThreatRefreshReport::empty("running"),
+                        "running",
+                        false,
+                        true,
+                    )
+                });
+            Ok(Json(Versioned {
+                version,
+                data: report,
+            }))
+        }
+        ThreatRefreshDecision::Running(cached) => {
+            let version = cached
+                .as_ref()
+                .map(|cached| cached.version)
+                .unwrap_or(current_policy_version(&state.db).await?);
+            let report = cached
+                .map(|cached| threat_refresh_response_report(cached.report, "running", true, true))
+                .unwrap_or_else(|| {
+                    threat_refresh_response_report(
+                        threat::ThreatRefreshReport::empty("running"),
+                        "running",
+                        false,
+                        true,
+                    )
+                });
+            Ok(Json(Versioned {
+                version,
+                data: report,
+            }))
+        }
+        ThreatRefreshDecision::RateLimited(cached) => {
+            let version = cached
+                .as_ref()
+                .map(|cached| cached.version)
+                .unwrap_or(current_policy_version(&state.db).await?);
+            let report = cached
+                .map(|cached| {
+                    threat_refresh_response_report(cached.report, "rate_limited", true, false)
+                })
+                .unwrap_or_else(|| {
+                    threat_refresh_response_report(
+                        threat::ThreatRefreshReport::empty("rate_limited"),
+                        "rate_limited",
+                        false,
+                        false,
+                    )
+                });
+            Ok(Json(Versioned {
+                version,
+                data: report,
+            }))
+        }
     }
-    .insert(&state.db)
-    .await?;
-    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
-    Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
+}
+
+async fn run_threat_refresh(db: DatabaseConnection) -> Result<CachedThreatRefresh> {
+    let mut report = threat::refresh_enabled_threat_sources(&db).await?;
+    let version = current_policy_version(&db).await?;
+    let status = report.refresh_status.clone();
+    let running = report.running;
+    report = threat_refresh_response_report(report, &status, false, running);
+    Ok(CachedThreatRefresh { version, report })
+}
+
+fn threat_refresh_response_report(
+    mut report: threat::ThreatRefreshReport,
+    status: &str,
+    cached: bool,
+    running: bool,
+) -> threat::ThreatRefreshReport {
+    report.refresh_status = status.to_string();
+    report.cached = cached;
+    report.running = running;
+    report
 }
 
 async fn delete_threat_source(
     State(state): State<ApiState>,
     Path(id): Path<i32>,
 ) -> ApiResult<Json<Versioned<serde_json::Value>>> {
+    let row = threat_source::Entity::find()
+        .filter(threat_source::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(threat_source::Column::Id.eq(id))
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::not_found("threat source not found"))?;
+    let txn = state.db.begin().await?;
     let deleted = threat_source::Entity::delete_many()
         .filter(threat_source::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
         .filter(threat_source::Column::Id.eq(id))
-        .exec(&state.db)
+        .exec(&txn)
         .await?;
     if deleted.rows_affected == 0 {
         return Err(ApiError::not_found("threat source not found"));
     }
-    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    delete_threat_source_states_by_name(&txn, std::iter::once(row.name.as_str())).await?;
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
     Ok(Json(Versioned {
         version,
         data: serde_json::json!({ "deleted": id }),
     }))
+}
+
+async fn delete_threat_sources_batch(
+    State(state): State<ApiState>,
+    Json(request): Json<BatchDeleteRequest>,
+) -> ApiResult<Json<Versioned<BatchDeleteResponse>>> {
+    let ids = validate_batch_ids(request.ids)?;
+    let rows = threat_source::Entity::find()
+        .filter(threat_source::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(threat_source::Column::Id.is_in(ids.iter().copied()))
+        .all(&state.db)
+        .await?;
+    if rows.len() != ids.len() {
+        return Err(ApiError::not_found("threat source not found"));
+    }
+    let names = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>();
+    let txn = state.db.begin().await?;
+    let deleted = threat_source::Entity::delete_many()
+        .filter(threat_source::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(threat_source::Column::Id.is_in(ids.iter().copied()))
+        .exec(&txn)
+        .await?;
+    ensure_all_ids_deleted(deleted.rows_affected, ids.len(), "threat source not found")?;
+    delete_threat_source_states_by_name(&txn, names.into_iter()).await?;
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
+    Ok(Json(Versioned {
+        version,
+        data: BatchDeleteResponse {
+            deleted: deleted.rows_affected,
+        },
+    }))
+}
+
+async fn delete_threat_source_states_by_name<'a, I>(
+    db: &impl ConnectionTrait,
+    names: I,
+) -> ApiResult<()>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let names = names.into_iter().collect::<Vec<_>>();
+    if names.is_empty() {
+        return Ok(());
+    }
+    threat_source_state::Entity::delete_many()
+        .filter(threat_source_state::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(threat_source_state::Column::SourceName.is_in(names))
+        .exec(db)
+        .await?;
+    Ok(())
 }
 
 async fn get_dynamic_defense(
@@ -1202,11 +1598,48 @@ async fn create_dynamic_rate_limit(
     State(state): State<ApiState>,
     Json(request): Json<CreateDynamicRateLimitRequest>,
 ) -> ApiResult<(StatusCode, Json<Versioned<dynamic_rate_limit::Model>>)> {
+    let row = dynamic_rate_limit_active_model(request)?
+        .insert(&state.db)
+        .await?;
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
+}
+
+async fn create_dynamic_rate_limits(
+    State(state): State<ApiState>,
+    Json(request): Json<BatchRequest<CreateDynamicRateLimitRequest>>,
+) -> ApiResult<(StatusCode, Json<Versioned<Vec<dynamic_rate_limit::Model>>>)> {
+    validate_batch_len(request.items.len())?;
+    let models = request
+        .items
+        .into_iter()
+        .map(dynamic_rate_limit_active_model)
+        .collect::<ApiResult<Vec<_>>>()?;
+    let txn = state.db.begin().await?;
+    let mut rows = Vec::with_capacity(models.len());
+    for model in models {
+        rows.push(model.insert(&txn).await?);
+    }
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(Versioned {
+            version,
+            data: rows,
+        }),
+    ))
+}
+
+fn dynamic_rate_limit_active_model(
+    request: CreateDynamicRateLimitRequest,
+) -> ApiResult<dynamic_rate_limit::ActiveModel> {
     let protocol = normalize_protocol(&request.protocol)?;
     let port = validate_dynamic_rate_port(protocol.as_str(), request.port)?;
     validate_positive_i32("packets_per_second", request.packets_per_second)?;
     validate_positive_i32("burst", request.burst)?;
-    let row = dynamic_rate_limit::ActiveModel {
+    Ok(dynamic_rate_limit::ActiveModel {
         policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
         enabled: Set(request.enabled.unwrap_or(true)),
         priority: Set(request.priority),
@@ -1217,11 +1650,7 @@ async fn create_dynamic_rate_limit(
         comment: Set(request.comment),
         updated_at: Set(chrono::Utc::now().naive_utc()),
         ..Default::default()
-    }
-    .insert(&state.db)
-    .await?;
-    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
-    Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
+    })
 }
 
 async fn delete_dynamic_rate_limit(
@@ -1240,6 +1669,33 @@ async fn delete_dynamic_rate_limit(
     Ok(Json(Versioned {
         version,
         data: serde_json::json!({ "deleted": id }),
+    }))
+}
+
+async fn delete_dynamic_rate_limits_batch(
+    State(state): State<ApiState>,
+    Json(request): Json<BatchDeleteRequest>,
+) -> ApiResult<Json<Versioned<BatchDeleteResponse>>> {
+    let ids = validate_batch_ids(request.ids)?;
+    let txn = state.db.begin().await?;
+    let deleted = dynamic_rate_limit::Entity::delete_many()
+        .filter(dynamic_rate_limit::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(dynamic_rate_limit::Column::Id.is_in(ids.iter().copied()))
+        .exec(&txn)
+        .await?;
+    ensure_all_ids_deleted(
+        deleted.rows_affected,
+        ids.len(),
+        "dynamic rate limit not found",
+    )?;
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
+    Ok(Json(Versioned {
+        version,
+        data: BatchDeleteResponse {
+            deleted: deleted.rows_affected,
+        },
     }))
 }
 
@@ -1283,6 +1739,39 @@ async fn create_temp_ban(
     State(state): State<ApiState>,
     Json(request): Json<CreateTempBanRequest>,
 ) -> ApiResult<(StatusCode, Json<Versioned<temp_ban::Model>>)> {
+    let row = temp_ban_active_model(request)?.insert(&state.db).await?;
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
+}
+
+async fn create_temp_bans(
+    State(state): State<ApiState>,
+    Json(request): Json<BatchRequest<CreateTempBanRequest>>,
+) -> ApiResult<(StatusCode, Json<Versioned<Vec<temp_ban::Model>>>)> {
+    validate_batch_len(request.items.len())?;
+    let models = request
+        .items
+        .into_iter()
+        .map(temp_ban_active_model)
+        .collect::<ApiResult<Vec<_>>>()?;
+    let txn = state.db.begin().await?;
+    let mut rows = Vec::with_capacity(models.len());
+    for model in models {
+        rows.push(model.insert(&txn).await?);
+    }
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(Versioned {
+            version,
+            data: rows,
+        }),
+    ))
+}
+
+fn temp_ban_active_model(request: CreateTempBanRequest) -> ApiResult<temp_ban::ActiveModel> {
     let ip = normalize_ip(&request.ip)?;
     let protocol = request
         .protocol
@@ -1296,7 +1785,7 @@ async fn create_temp_ban(
     let expires_at = now
         .checked_add_signed(chrono::Duration::seconds(duration_seconds))
         .context("temporary ban expiration overflowed")?;
-    let row = temp_ban::ActiveModel {
+    Ok(temp_ban::ActiveModel {
         policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
         ip: Set(ip),
         protocol: Set(protocol),
@@ -1305,11 +1794,7 @@ async fn create_temp_ban(
         comment: Set(request.comment),
         created_at: Set(now),
         ..Default::default()
-    }
-    .insert(&state.db)
-    .await?;
-    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
-    Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
+    })
 }
 
 async fn delete_temp_ban(
@@ -1328,6 +1813,29 @@ async fn delete_temp_ban(
     Ok(Json(Versioned {
         version,
         data: serde_json::json!({ "deleted": id }),
+    }))
+}
+
+async fn delete_temp_bans_batch(
+    State(state): State<ApiState>,
+    Json(request): Json<BatchDeleteRequest>,
+) -> ApiResult<Json<Versioned<BatchDeleteResponse>>> {
+    let ids = validate_batch_ids(request.ids)?;
+    let txn = state.db.begin().await?;
+    let deleted = temp_ban::Entity::delete_many()
+        .filter(temp_ban::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(temp_ban::Column::Id.is_in(ids.iter().copied()))
+        .exec(&txn)
+        .await?;
+    ensure_all_ids_deleted(deleted.rows_affected, ids.len(), "temporary ban not found")?;
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
+    Ok(Json(Versioned {
+        version,
+        data: BatchDeleteResponse {
+            deleted: deleted.rows_affected,
+        },
     }))
 }
 
@@ -1381,15 +1889,60 @@ async fn create_trusted_cidr(
     Json(request): Json<CreateTrustedCidrRequest>,
 ) -> ApiResult<(StatusCode, Json<Versioned<trusted_cidr::Model>>)> {
     let cidr = normalize_cidr(&request.cidr)?;
-    let now = chrono::Utc::now().naive_utc();
-    let enabled = request.enabled.unwrap_or(true);
-    let comment = request.comment;
     let existed = trusted_cidr::Entity::find()
         .filter(trusted_cidr::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
         .filter(trusted_cidr::Column::Cidr.eq(&cidr))
         .one(&state.db)
         .await?
         .is_some();
+    let row = upsert_trusted_cidr(&state.db, request, Some(cidr)).await?;
+    let status = if existed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+
+    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    Ok((status, Json(Versioned { version, data: row })))
+}
+
+async fn create_trusted_cidrs(
+    State(state): State<ApiState>,
+    Json(request): Json<BatchRequest<CreateTrustedCidrRequest>>,
+) -> ApiResult<(StatusCode, Json<Versioned<Vec<trusted_cidr::Model>>>)> {
+    validate_batch_len(request.items.len())?;
+    let txn = state.db.begin().await?;
+    let mut rows = Vec::with_capacity(request.items.len());
+    for item in request.items {
+        rows.push(upsert_trusted_cidr(&txn, item, None).await?);
+    }
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(Versioned {
+            version,
+            data: rows,
+        }),
+    ))
+}
+
+async fn upsert_trusted_cidr<C>(
+    db: &C,
+    request: CreateTrustedCidrRequest,
+    normalized_cidr: Option<String>,
+) -> ApiResult<trusted_cidr::Model>
+where
+    C: ConnectionTrait,
+{
+    let cidr = match normalized_cidr {
+        Some(cidr) => cidr,
+        None => normalize_cidr(&request.cidr)?,
+    };
+    let now = chrono::Utc::now().naive_utc();
+    let enabled = request.enabled.unwrap_or(true);
+    let comment = request.comment;
 
     trusted_cidr::Entity::insert(trusted_cidr::ActiveModel {
         policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
@@ -1408,22 +1961,15 @@ async fn create_trusted_cidr(
             ])
             .to_owned(),
     )
-    .exec_without_returning(&state.db)
+    .exec_without_returning(db)
     .await?;
     let row = trusted_cidr::Entity::find()
         .filter(trusted_cidr::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
         .filter(trusted_cidr::Column::Cidr.eq(&cidr))
-        .one(&state.db)
+        .one(db)
         .await?
         .context("trusted CIDR upsert succeeded but row was not found")?;
-    let status = if existed {
-        StatusCode::OK
-    } else {
-        StatusCode::CREATED
-    };
-
-    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
-    Ok((status, Json(Versioned { version, data: row })))
+    Ok(row)
 }
 
 async fn delete_trusted_cidr(
@@ -1442,6 +1988,29 @@ async fn delete_trusted_cidr(
     Ok(Json(Versioned {
         version,
         data: serde_json::json!({ "deleted": id }),
+    }))
+}
+
+async fn delete_trusted_cidrs_batch(
+    State(state): State<ApiState>,
+    Json(request): Json<BatchDeleteRequest>,
+) -> ApiResult<Json<Versioned<BatchDeleteResponse>>> {
+    let ids = validate_batch_ids(request.ids)?;
+    let txn = state.db.begin().await?;
+    let deleted = trusted_cidr::Entity::delete_many()
+        .filter(trusted_cidr::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(trusted_cidr::Column::Id.is_in(ids.iter().copied()))
+        .exec(&txn)
+        .await?;
+    ensure_all_ids_deleted(deleted.rows_affected, ids.len(), "trusted CIDR not found")?;
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
+    Ok(Json(Versioned {
+        version,
+        data: BatchDeleteResponse {
+            deleted: deleted.rows_affected,
+        },
     }))
 }
 
@@ -1497,6 +2066,51 @@ impl PaginationQuery {
         }
         Ok(Pagination { page, page_size })
     }
+}
+
+fn validate_batch_len(len: usize) -> ApiResult<()> {
+    if len == 0 {
+        return Err(ApiError::bad_request("items must not be empty"));
+    }
+    if len > MAX_BATCH_SIZE {
+        return Err(ApiError::bad_request(format!(
+            "items must contain at most {MAX_BATCH_SIZE} entries"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_batch_ids(ids: Vec<i32>) -> ApiResult<Vec<i32>> {
+    if ids.is_empty() {
+        return Err(ApiError::bad_request("ids must not be empty"));
+    }
+    if ids.len() > MAX_BATCH_SIZE {
+        return Err(ApiError::bad_request(format!(
+            "ids must contain at most {MAX_BATCH_SIZE} entries"
+        )));
+    }
+    let mut seen = HashSet::with_capacity(ids.len());
+    let mut unique = Vec::with_capacity(ids.len());
+    for id in ids {
+        if id <= 0 {
+            return Err(ApiError::bad_request("ids must be positive integers"));
+        }
+        if seen.insert(id) {
+            unique.push(id);
+        }
+    }
+    Ok(unique)
+}
+
+fn ensure_all_ids_deleted(
+    deleted: u64,
+    requested: usize,
+    not_found: &'static str,
+) -> ApiResult<()> {
+    if deleted != requested as u64 {
+        return Err(ApiError::not_found(not_found));
+    }
+    Ok(())
 }
 
 impl RuleQuery {
@@ -1655,6 +2269,55 @@ impl Drop for GeoRefreshPermit {
             .state
             .lock()
             .expect("geo refresh limiter mutex poisoned");
+        state.running = false;
+    }
+}
+
+impl ThreatRefreshLimiter {
+    fn start_or_cached(&self, interval: Duration) -> ThreatRefreshDecision {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .expect("threat refresh limiter mutex poisoned");
+        if state.running {
+            return ThreatRefreshDecision::Running(state.last_result.clone());
+        }
+        if let Some(last_started) = state.last_started {
+            let elapsed = now.saturating_duration_since(last_started);
+            if elapsed < interval {
+                return ThreatRefreshDecision::RateLimited(state.last_result.clone());
+            }
+        }
+        state.running = true;
+        state.last_started = Some(now);
+        ThreatRefreshDecision::Start {
+            permit: ThreatRefreshPermit {
+                limiter: self.clone(),
+            },
+            previous: state.last_result.clone(),
+        }
+    }
+}
+
+impl ThreatRefreshPermit {
+    fn finish_success(&self, result: CachedThreatRefresh) {
+        let mut state = self
+            .limiter
+            .state
+            .lock()
+            .expect("threat refresh limiter mutex poisoned");
+        state.last_result = Some(result);
+    }
+}
+
+impl Drop for ThreatRefreshPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .limiter
+            .state
+            .lock()
+            .expect("threat refresh limiter mutex poisoned");
         state.running = false;
     }
 }
@@ -1944,6 +2607,7 @@ mod tests {
             drop_events: xds::DropEventHub::new(),
             geo_lookup: geo::GeoIpLookup::default(),
             geo_refresh_limiter: GeoRefreshLimiter::default(),
+            threat_refresh_limiter: ThreatRefreshLimiter::default(),
         });
         (app, db)
     }
@@ -2267,7 +2931,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_queries_and_field_deletes_support_stable_resources() {
-        let (app, _db) = test_router().await;
+        let (app, db) = test_router().await;
         response_json(
             send_json(
                 &app,
@@ -2340,6 +3004,19 @@ mod tests {
         )
         .await;
         assert_eq!(threats["total"], 1);
+        threat_source_state::ActiveModel {
+            policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+            source_name: Set(threats["items"][0]["name"].as_str().unwrap().to_string()),
+            fingerprint: Set("test-fingerprint".to_string()),
+            prefix_count: Set(1),
+            last_checked_at: Set(chrono::Utc::now().naive_utc()),
+            last_changed_at: Set(Some(chrono::Utc::now().naive_utc())),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
         let limits = response_json(
             send_empty(
                 &app,
@@ -2369,6 +3046,12 @@ mod tests {
             response_json(send_empty(&app, Method::DELETE, "/threat-sources?name=test-feed").await)
                 .await;
         assert_eq!(deleted["data"]["deleted"], 1);
+        let stale_threat_states = threat_source_state::Entity::find()
+            .filter(threat_source_state::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+            .count(&db)
+            .await
+            .unwrap();
+        assert_eq!(stale_threat_states, 0);
         let deleted = response_json(
             send_empty(
                 &app,
@@ -2384,6 +3067,261 @@ mod tests {
         )
         .await;
         assert_eq!(deleted["data"]["deleted"], 1);
+    }
+
+    #[tokio::test]
+    async fn threat_source_refresh_endpoint_debounces_manual_refreshes() {
+        let (app, _db) = test_router().await;
+
+        let first =
+            response_json(send_empty(&app, Method::POST, "/threat-sources/refresh").await).await;
+        assert_eq!(first["data"]["refresh_status"], "running");
+        assert_eq!(first["data"]["running"], true);
+
+        let second =
+            response_json(send_empty(&app, Method::POST, "/threat-sources/refresh").await).await;
+        assert_eq!(second["data"]["refresh_status"], "running");
+        assert_eq!(second["data"]["running"], true);
+    }
+
+    #[tokio::test]
+    async fn batch_create_and_delete_support_config_resources() {
+        let (app, _db) = test_router().await;
+
+        let rules = response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules/batch",
+                json!({
+                    "items": [
+                        {
+                            "priority": 10,
+                            "action": "deny",
+                            "cidr": "203.0.113.1/24",
+                            "protocol": "tcp",
+                            "port": 443
+                        },
+                        {
+                            "priority": 20,
+                            "action": "allow",
+                            "cidr": "198.51.100.0/24",
+                            "protocol": "udp",
+                            "port": 53
+                        }
+                    ]
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(rules["version"], 1);
+        assert_eq!(rules["data"].as_array().unwrap().len(), 2);
+        assert_eq!(rules["data"][0]["cidr"], "203.0.113.0/24");
+
+        let countries = response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/geo-countries/batch",
+                json!({
+                    "items": [
+                        {"country": "cn", "action": "deny", "enabled": true},
+                        {"country": "us", "action": "allow", "enabled": false}
+                    ]
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(countries["version"], 2);
+        assert_eq!(countries["data"].as_array().unwrap().len(), 2);
+        assert_eq!(countries["data"][0]["country"], "CN");
+
+        let threats = response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/threat-sources/batch",
+                json!({
+                    "items": [
+                        {
+                            "name": "batch-feed-a",
+                            "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt",
+                            "format": "cidr"
+                        },
+                        {
+                            "enabled": false,
+                            "name": "batch-feed-b",
+                            "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/levels/1.txt",
+                            "format": "cidr",
+                            "min_score": 1
+                        }
+                    ]
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(threats["version"], 3);
+        assert_eq!(threats["data"].as_array().unwrap().len(), 2);
+
+        let limits = response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/dynamic-rate-limits/batch",
+                json!({
+                    "items": [
+                        {
+                            "enabled": true,
+                            "priority": 10,
+                            "protocol": "tcp",
+                            "port": 443,
+                            "packets_per_second": 1000,
+                            "burst": 2000
+                        },
+                        {
+                            "enabled": true,
+                            "priority": 20,
+                            "protocol": "any",
+                            "packets_per_second": 3000,
+                            "burst": 4000
+                        }
+                    ]
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(limits["version"], 4);
+        assert_eq!(limits["data"].as_array().unwrap().len(), 2);
+
+        let bans = response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/temp-bans/batch",
+                json!({
+                    "items": [
+                        {
+                            "ip": "203.0.113.10",
+                            "protocol": "tcp",
+                            "port": 443,
+                            "duration_seconds": 300
+                        },
+                        {
+                            "ip": "203.0.113.11",
+                            "protocol": "any",
+                            "duration_seconds": 600
+                        }
+                    ]
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(bans["version"], 5);
+        assert_eq!(bans["data"].as_array().unwrap().len(), 2);
+
+        let trusted = response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/trusted-cidrs/batch",
+                json!({
+                    "items": [
+                        {"cidr": "10.1.2.3/8", "enabled": true},
+                        {"cidr": "192.0.2.10/24", "enabled": false, "comment": "batch"}
+                    ]
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(trusted["version"], 6);
+        assert_eq!(trusted["data"].as_array().unwrap().len(), 2);
+        assert_eq!(trusted["data"][0]["cidr"], "10.0.0.0/8");
+
+        let delete_rules = response_json(
+            send_json(
+                &app,
+                Method::DELETE,
+                "/rules/batch",
+                json!({"ids": [rules["data"][0]["id"], rules["data"][1]["id"]]}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(delete_rules["version"], 7);
+        assert_eq!(delete_rules["data"]["deleted"], 2);
+
+        let delete_countries = response_json(
+            send_json(
+                &app,
+                Method::DELETE,
+                "/geo-countries/batch",
+                json!({"ids": [countries["data"][0]["id"], countries["data"][1]["id"]]}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(delete_countries["data"]["deleted"], 2);
+
+        let delete_threats = response_json(
+            send_json(
+                &app,
+                Method::DELETE,
+                "/threat-sources/batch",
+                json!({"ids": [threats["data"][0]["id"], threats["data"][1]["id"]]}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(delete_threats["data"]["deleted"], 2);
+
+        let delete_limits = response_json(
+            send_json(
+                &app,
+                Method::DELETE,
+                "/dynamic-rate-limits/batch",
+                json!({"ids": [limits["data"][0]["id"], limits["data"][1]["id"]]}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(delete_limits["data"]["deleted"], 2);
+
+        let delete_bans = response_json(
+            send_json(
+                &app,
+                Method::DELETE,
+                "/temp-bans/batch",
+                json!({"ids": [bans["data"][0]["id"], bans["data"][1]["id"]]}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(delete_bans["data"]["deleted"], 2);
+
+        let delete_trusted = response_json(
+            send_json(
+                &app,
+                Method::DELETE,
+                "/trusted-cidrs/batch",
+                json!({"ids": [trusted["data"][0]["id"], trusted["data"][1]["id"]]}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(delete_trusted["version"], 12);
+        assert_eq!(delete_trusted["data"]["deleted"], 2);
+
+        let empty_batch_error = response_error(
+            send_json(&app, Method::POST, "/rules/batch", json!({"items": []})).await,
+        )
+        .await;
+        assert!(empty_batch_error.contains("items must not be empty"));
     }
 
     #[tokio::test]

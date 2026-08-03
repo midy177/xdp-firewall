@@ -1,6 +1,6 @@
 use crate::cli::XdsArgs;
 use crate::db::entities::{geo_country_policy, geo_ip_prefix, node, policy_version, temp_ban};
-use crate::{firewall, geo, k8s, monitor, security};
+use crate::{firewall, geo, k8s, monitor, security, threat};
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use sea_orm::{
@@ -25,8 +25,9 @@ use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, trace, warn};
 
 const TEMP_BAN_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
-const GEO_IP_REFRESH_INTERVAL: Duration = Duration::from_secs(86_400);
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(86_400);
 const GEO_IP_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(300);
+const THREAT_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 const K8S_WATCH_TIMEOUT: Duration = Duration::from_secs(300);
 const K8S_WATCH_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const K8S_WATCH_CHANGE_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -90,6 +91,19 @@ struct GeoIpRefresh {
 
 #[derive(Default)]
 struct GeoIpRefreshState {
+    last_success: Option<Instant>,
+    last_attempt: Option<Instant>,
+    running: bool,
+}
+
+#[derive(Clone)]
+struct ThreatSourceRefresh {
+    state: Arc<StdMutex<ThreatSourceRefreshState>>,
+    interval: Duration,
+}
+
+#[derive(Default)]
+struct ThreatSourceRefreshState {
     last_success: Option<Instant>,
     last_attempt: Option<Instant>,
     running: bool,
@@ -342,6 +356,112 @@ impl GeoIpRefresh {
             }
         });
         Ok(())
+    }
+}
+
+impl ThreatSourceRefresh {
+    fn new(interval: Duration) -> Self {
+        Self {
+            state: Arc::new(StdMutex::new(ThreatSourceRefreshState {
+                last_success: Some(Instant::now()),
+                ..Default::default()
+            })),
+            interval,
+        }
+    }
+
+    async fn maybe_run(&self, db: &DatabaseConnection) -> Result<()> {
+        let started_at = Instant::now();
+        let (running, retry_throttled, within_interval) = {
+            let state = self
+                .state
+                .lock()
+                .expect("threat source refresh mutex poisoned");
+            (
+                state.running,
+                state
+                    .last_attempt
+                    .and_then(|last| started_at.checked_duration_since(last))
+                    .is_some_and(|elapsed| elapsed < THREAT_REFRESH_RETRY_INTERVAL),
+                state
+                    .last_success
+                    .and_then(|last| started_at.checked_duration_since(last))
+                    .is_some_and(|elapsed| elapsed < self.interval),
+            )
+        };
+        if running || retry_throttled {
+            return Ok(());
+        }
+        let missing_states = if !within_interval {
+            false
+        } else {
+            threat::enabled_threat_source_states_missing(db).await?
+        };
+        if within_interval && !missing_states {
+            return Ok(());
+        }
+
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("threat source refresh mutex poisoned");
+            if state.running {
+                return Ok(());
+            }
+            if state
+                .last_attempt
+                .and_then(|last| started_at.checked_duration_since(last))
+                .is_some_and(|elapsed| elapsed < THREAT_REFRESH_RETRY_INTERVAL)
+            {
+                return Ok(());
+            }
+            let within_interval = state
+                .last_success
+                .and_then(|last| started_at.checked_duration_since(last))
+                .is_some_and(|elapsed| elapsed < self.interval);
+            if within_interval && !missing_states {
+                return Ok(());
+            }
+            state.running = true;
+            state.last_attempt = Some(started_at);
+        }
+
+        let result = threat::refresh_enabled_threat_sources(db).await;
+        match result {
+            Ok(report) => {
+                {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .expect("threat source refresh mutex poisoned");
+                    state.running = false;
+                    state.last_success = Some(started_at);
+                }
+                if report.refreshed {
+                    let version = latest_version(db).await?;
+                    info!(
+                        enabled_threat_sources = report.enabled_source_count,
+                        version, "refreshed threat intelligence sources during xDS push tick"
+                    );
+                } else {
+                    debug!(
+                        status = %report.refresh_status,
+                        enabled_threat_sources = report.enabled_source_count,
+                        "skipping threat intelligence refresh"
+                    );
+                }
+                Ok(())
+            }
+            Err(err) => {
+                self.state
+                    .lock()
+                    .expect("threat source refresh mutex poisoned")
+                    .running = false;
+                warn!(error = %err, "threat intelligence refresh failed during xDS push tick");
+                Err(err)
+            }
+        }
     }
 }
 
@@ -647,10 +767,13 @@ pub async fn serve(
         runtime_trusted_cidrs = runtime_trusted_cidrs.configured.len(),
         k8s_discovery_enabled = runtime_trusted_cidrs.k8s_discovery.is_some(),
         k8s_watch_timeout_seconds = K8S_WATCH_TIMEOUT.as_secs(),
+        auto_refresh_interval_seconds = AUTO_REFRESH_INTERVAL.as_secs(),
         "xDS gRPC server listening"
     );
-    let geo_ip_refresh = GeoIpRefresh::new(GEO_IP_REFRESH_INTERVAL, geo_lookup.clone());
-    spawn_geo_refresh_loop(db.clone(), geo_ip_refresh.clone(), GEO_IP_REFRESH_INTERVAL);
+    let geo_ip_refresh = GeoIpRefresh::new(AUTO_REFRESH_INTERVAL, geo_lookup.clone());
+    spawn_geo_refresh_loop(db.clone(), geo_ip_refresh.clone(), AUTO_REFRESH_INTERVAL);
+    let threat_source_refresh = ThreatSourceRefresh::new(AUTO_REFRESH_INTERVAL);
+    spawn_threat_refresh_loop(db.clone(), threat_source_refresh, AUTO_REFRESH_INTERVAL);
     Server::builder()
         .add_service(FirewallXdsServer::new(XdsService {
             db,
@@ -675,6 +798,21 @@ fn spawn_geo_refresh_loop(
         loop {
             if let Err(err) = geo_ip_refresh.maybe_run(&db).await {
                 warn!(error = %err, "country IP background refresh trigger failed");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+fn spawn_threat_refresh_loop(
+    db: DatabaseConnection,
+    threat_source_refresh: ThreatSourceRefresh,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = threat_source_refresh.maybe_run(&db).await {
+                warn!(error = %err, "threat intelligence background refresh trigger failed");
             }
             tokio::time::sleep(interval).await;
         }

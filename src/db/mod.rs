@@ -123,6 +123,11 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
     .await?;
     create_table(
         db,
+        schema.create_table_from_entity(entities::threat_source_state::Entity),
+    )
+    .await?;
+    create_table(
+        db,
         schema.create_table_from_entity(entities::dynamic_defense::Entity),
     )
     .await?;
@@ -216,6 +221,18 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
             .table(entities::threat_source::Entity.table_ref())
             .col(entities::threat_source::Column::PolicyName)
             .col(entities::threat_source::Column::Name)
+            .unique()
+            .to_owned(),
+    )
+    .await?;
+    create_index(
+        db,
+        Index::create()
+            .if_not_exists()
+            .name("idx_firewall_threat_source_states_policy_name_source")
+            .table(entities::threat_source_state::Entity.table_ref())
+            .col(entities::threat_source_state::Column::PolicyName)
+            .col(entities::threat_source_state::Column::SourceName)
             .unique()
             .to_owned(),
     )

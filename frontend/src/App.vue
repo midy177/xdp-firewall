@@ -439,6 +439,9 @@
             <h2>{{ t("threatSources") }}</h2>
             <p>{{ t("threatsHint") }}</p>
           </div>
+          <Button variant="secondary" :title="t('refreshThreatFeeds')" :disabled="actionBusy" @click="runAction(refreshThreatSources)">
+            <RefreshCcw :class="{ spin: loading }" :size="16" />
+          </Button>
         </div>
         <div class="form-grid threat-form">
           <label class="field">
@@ -1020,6 +1023,7 @@ type PageState = { page: number; total_pages: number; total: number };
 type ApiDocEndpoint = { method: string; path: string; summary: string; body?: string; curl?: string };
 type ApiDocSection = { title: string; description: string; endpoints: ApiDocEndpoint[] };
 type GeoRefreshResponse = { countries: string[]; checked_country_count: number; changed_country_count: number; prefix_count: number; provider_base_url: string; refresh_status?: string; cached?: boolean; running?: boolean };
+type ThreatRefreshResponse = { enabled_source_count: number; changed_source_count: number; prefix_count: number; refreshed: boolean; refresh_status?: string; cached?: boolean; running?: boolean };
 type GeoLookupResponse = { ip: string; country?: string | null; country_name?: string | null };
 type Lang = "zh" | "en";
 type FieldKey = "ruleCidr" | "rulePort" | "geoLookupIp" | "tempBanIp" | "tempBanPort" | "dynamicRatePort" | "trustedCidr";
@@ -1204,6 +1208,7 @@ const messages = {
     query: "查询",
     refresh: "刷新",
     refreshCountryIps: "更新国家 IP 列表",
+    refreshThreatFeeds: "更新威胁源",
     rules: "规则",
     rulesHint: "按优先级匹配 CIDR、协议和端口，数字越小优先级越高",
     ruleAction: "规则动作",
@@ -1326,6 +1331,7 @@ const messages = {
     query: "Query",
     refresh: "Refresh",
     refreshCountryIps: "Refresh country IP lists",
+    refreshThreatFeeds: "Refresh threat feeds",
     rules: "Rules",
     rulesHint: "Match CIDR, protocol, and port by priority; lower numbers have higher priority",
     ruleAction: "Rule action",
@@ -1442,7 +1448,9 @@ const apiDocsZh: ApiDocSection[] = [
   -H "content-type: application/json" \\
   -d '{"priority":10,"action":"deny","cidr":"203.0.113.0/24","protocol":"tcp","port":443}'`
       },
+      { method: "POST", path: "/rules/batch", summary: "批量新增普通规则；请求体为 {\"items\":[...]}，每项格式同 POST /rules。" },
       { method: "DELETE", path: "/rules/{id}", summary: "按 id 删除普通规则。" },
+      { method: "DELETE", path: "/rules/batch", summary: "按 id 批量删除普通规则；请求体为 {\"ids\":[1,2]}。" },
       {
         method: "DELETE",
         path: "/rules?action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10",
@@ -1465,7 +1473,9 @@ const apiDocsZh: ApiDocSection[] = [
   "action": "allow"
 }`
       },
+      { method: "POST", path: "/geo-countries/batch", summary: "批量新增国家规则；请求体为 {\"items\":[...]}，每项格式同 POST /geo-countries。" },
       { method: "DELETE", path: "/geo-countries/{id}", summary: "按 id 删除国家规则。" },
+      { method: "DELETE", path: "/geo-countries/batch", summary: "按 id 批量删除国家规则；请求体为 {\"ids\":[1,2]}。" },
       { method: "DELETE", path: "/geo-countries?country=CN&action=deny&enabled=true", summary: "按 country、action、enabled 删除国家规则，三个字段必填。" }
     ]
   },
@@ -1490,7 +1500,9 @@ const apiDocsZh: ApiDocSection[] = [
   -H "content-type: application/json" \\
   -d '{"ip":"203.0.113.10","duration_seconds":300}'`
       },
-      { method: "DELETE", path: "/temp-bans/{id}", summary: "删除临时封禁，立即触发策略版本更新。" }
+      { method: "POST", path: "/temp-bans/batch", summary: "批量新增临时封禁；请求体为 {\"items\":[...]}，每项格式同 POST /temp-bans。" },
+      { method: "DELETE", path: "/temp-bans/{id}", summary: "删除临时封禁，立即触发策略版本更新。" },
+      { method: "DELETE", path: "/temp-bans/batch", summary: "按 id 批量删除临时封禁；请求体为 {\"ids\":[1,2]}。" }
     ]
   },
   {
@@ -1498,6 +1510,7 @@ const apiDocsZh: ApiDocSection[] = [
     description: "威胁源会被编译为拒绝前缀规则。内置 ipsum 和 spamhaus-drop。",
     endpoints: [
       { method: "GET", path: "/threat-sources?page=1&page_size=20&name=test-feed&format=cidr&enabled=true", summary: "分页列出威胁源，可按 name、url、format、enabled、min_score 过滤，条件按 AND 匹配。" },
+      { method: "POST", path: "/threat-sources/refresh", summary: "异步刷新启用的威胁源；5 分钟内重复调用直接返回上一次刷新结果。" },
       {
         method: "POST",
         path: "/threat-sources",
@@ -1509,7 +1522,9 @@ const apiDocsZh: ApiDocSection[] = [
   "min_score": 3
 }`
       },
+      { method: "POST", path: "/threat-sources/batch", summary: "批量新增威胁源；请求体为 {\"items\":[...]}，每项格式同 POST /threat-sources。" },
       { method: "DELETE", path: "/threat-sources/{id}", summary: "按 id 删除威胁源。" },
+      { method: "DELETE", path: "/threat-sources/batch", summary: "按 id 批量删除威胁源；请求体为 {\"ids\":[1,2]}。" },
       { method: "DELETE", path: "/threat-sources?name=test-feed", summary: "按唯一 name 删除威胁源。" }
     ]
   },
@@ -1553,7 +1568,9 @@ const apiDocsZh: ApiDocSection[] = [
   "comment": "protect https"
 }`
       },
+      { method: "POST", path: "/dynamic-rate-limits/batch", summary: "批量新增自定义限流；请求体为 {\"items\":[...]}，每项格式同 POST /dynamic-rate-limits。" },
       { method: "DELETE", path: "/dynamic-rate-limits/{id}", summary: "按 id 删除自定义限流。" },
+      { method: "DELETE", path: "/dynamic-rate-limits/batch", summary: "按 id 批量删除自定义限流；请求体为 {\"ids\":[1,2]}。" },
       { method: "DELETE", path: "/dynamic-rate-limits?enabled=true&priority=10&protocol=tcp&port=443&packets_per_second=1000&burst=2000", summary: "按完整限流配置删除；六个字段必填。没有存储端口的限流请按 id 删除。" }
     ]
   },
@@ -1572,7 +1589,9 @@ const apiDocsZh: ApiDocSection[] = [
   "comment": "private network"
 }`
       },
+      { method: "POST", path: "/trusted-cidrs/batch", summary: "批量新增或更新白名单；请求体为 {\"items\":[...]}，每项格式同 POST /trusted-cidrs。" },
       { method: "DELETE", path: "/trusted-cidrs/{id}", summary: "按 id 删除白名单。" },
+      { method: "DELETE", path: "/trusted-cidrs/batch", summary: "按 id 批量删除白名单；请求体为 {\"ids\":[1,2]}。" },
       { method: "DELETE", path: "/trusted-cidrs?cidr=10.0.0.0/8", summary: "按唯一 cidr 删除白名单。" }
     ]
   },
@@ -1643,7 +1662,9 @@ const apiDocsEn: ApiDocSection[] = [
   -H "content-type: application/json" \\
   -d '{"priority":10,"action":"deny","cidr":"203.0.113.0/24","protocol":"tcp","port":443}'`
       },
+      { method: "POST", path: "/rules/batch", summary: "Create firewall rules in one request; body is {\"items\":[...]} and each item matches POST /rules." },
       { method: "DELETE", path: "/rules/{id}", summary: "Delete a firewall rule by id." },
+      { method: "DELETE", path: "/rules/batch", summary: "Delete firewall rules by id in one request; body is {\"ids\":[1,2]}." },
       {
         method: "DELETE",
         path: "/rules?action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10",
@@ -1666,7 +1687,9 @@ const apiDocsEn: ApiDocSection[] = [
   "action": "allow"
 }`
       },
+      { method: "POST", path: "/geo-countries/batch", summary: "Create country rules in one request; body is {\"items\":[...]} and each item matches POST /geo-countries." },
       { method: "DELETE", path: "/geo-countries/{id}", summary: "Delete a country rule by id." },
+      { method: "DELETE", path: "/geo-countries/batch", summary: "Delete country rules by id in one request; body is {\"ids\":[1,2]}." },
       { method: "DELETE", path: "/geo-countries?country=CN&action=deny&enabled=true", summary: "Delete a country rule by country, action, and enabled; all three fields are required." }
     ]
   },
@@ -1691,7 +1714,9 @@ const apiDocsEn: ApiDocSection[] = [
   -H "content-type: application/json" \\
   -d '{"ip":"203.0.113.10","duration_seconds":300}'`
       },
-      { method: "DELETE", path: "/temp-bans/{id}", summary: "Delete a temporary ban and trigger a new policy version." }
+      { method: "POST", path: "/temp-bans/batch", summary: "Create temporary bans in one request; body is {\"items\":[...]} and each item matches POST /temp-bans." },
+      { method: "DELETE", path: "/temp-bans/{id}", summary: "Delete a temporary ban and trigger a new policy version." },
+      { method: "DELETE", path: "/temp-bans/batch", summary: "Delete temporary bans by id in one request; body is {\"ids\":[1,2]}." }
     ]
   },
   {
@@ -1699,6 +1724,7 @@ const apiDocsEn: ApiDocSection[] = [
     description: "Threat feeds compile into deny prefix rules. Built-ins include ipsum and spamhaus-drop.",
     endpoints: [
       { method: "GET", path: "/threat-sources?page=1&page_size=20&name=test-feed&format=cidr&enabled=true", summary: "List threat sources, optionally filtered by name, url, format, enabled, and min_score with AND semantics." },
+      { method: "POST", path: "/threat-sources/refresh", summary: "Start an async refresh for enabled threat feeds; repeated calls within 5 minutes return the previous result." },
       {
         method: "POST",
         path: "/threat-sources",
@@ -1710,7 +1736,9 @@ const apiDocsEn: ApiDocSection[] = [
   "min_score": 3
 }`
       },
+      { method: "POST", path: "/threat-sources/batch", summary: "Create threat sources in one request; body is {\"items\":[...]} and each item matches POST /threat-sources." },
       { method: "DELETE", path: "/threat-sources/{id}", summary: "Delete a threat source by id." },
+      { method: "DELETE", path: "/threat-sources/batch", summary: "Delete threat sources by id in one request; body is {\"ids\":[1,2]}." },
       { method: "DELETE", path: "/threat-sources?name=test-feed", summary: "Delete a threat source by its unique name." }
     ]
   },
@@ -1754,7 +1782,9 @@ const apiDocsEn: ApiDocSection[] = [
   "comment": "protect https"
 }`
       },
+      { method: "POST", path: "/dynamic-rate-limits/batch", summary: "Create custom rate limits in one request; body is {\"items\":[...]} and each item matches POST /dynamic-rate-limits." },
       { method: "DELETE", path: "/dynamic-rate-limits/{id}", summary: "Delete a custom rate limit by id." },
+      { method: "DELETE", path: "/dynamic-rate-limits/batch", summary: "Delete custom rate limits by id in one request; body is {\"ids\":[1,2]}." },
       { method: "DELETE", path: "/dynamic-rate-limits?enabled=true&priority=10&protocol=tcp&port=443&packets_per_second=1000&burst=2000", summary: "Delete by the complete rate-limit configuration; all six fields are required. Use id for limits without a stored port." }
     ]
   },
@@ -1773,7 +1803,9 @@ const apiDocsEn: ApiDocSection[] = [
   "comment": "private network"
 }`
       },
+      { method: "POST", path: "/trusted-cidrs/batch", summary: "Create or update whitelist entries in one request; body is {\"items\":[...]} and each item matches POST /trusted-cidrs." },
       { method: "DELETE", path: "/trusted-cidrs/{id}", summary: "Delete a whitelist entry by id." },
+      { method: "DELETE", path: "/trusted-cidrs/batch", summary: "Delete whitelist entries by id in one request; body is {\"ids\":[1,2]}." },
       { method: "DELETE", path: "/trusted-cidrs?cidr=10.0.0.0/8", summary: "Delete a whitelist entry by its unique cidr." }
     ]
   },
@@ -1957,6 +1989,49 @@ function countryRefreshNotice(result: GeoRefreshResponse) {
     return `Checked ${result.checked_country_count} countries; no upstream changes`;
   }
   return `Updated ${result.changed_country_count}/${result.checked_country_count} countries and fetched ${result.prefix_count} CIDRs`;
+}
+
+function threatRefreshNotice(result: ThreatRefreshResponse) {
+  if (language.value === "zh") {
+    if (result.running && result.cached) {
+      return "威胁源刷新正在后台执行，当前显示上一次刷新结果";
+    }
+    if (result.running) {
+      return "威胁源刷新已在后台启动";
+    }
+    if (result.refresh_status === "rate_limited" && result.cached) {
+      return "威胁源刷新处于限流窗口内，已返回上一次刷新结果";
+    }
+    if (result.refresh_status === "rate_limited") {
+      return "威胁源刷新处于限流窗口内，暂无上一次刷新结果";
+    }
+    if (result.refresh_status === "empty") {
+      return "没有启用的威胁源需要刷新";
+    }
+    if (result.changed_source_count === 0) {
+      return `已检查 ${result.enabled_source_count} 个威胁源，远端未更新`;
+    }
+    return `已更新 ${result.changed_source_count}/${result.enabled_source_count} 个威胁源，解析 ${result.prefix_count} 条前缀`;
+  }
+  if (result.running && result.cached) {
+    return "Threat feed refresh is running in the background; showing the previous result";
+  }
+  if (result.running) {
+    return "Threat feed refresh started in the background";
+  }
+  if (result.refresh_status === "rate_limited" && result.cached) {
+    return "Threat feed refresh is rate limited; showing the previous result";
+  }
+  if (result.refresh_status === "rate_limited") {
+    return "Threat feed refresh is rate limited; no previous result is available yet";
+  }
+  if (result.refresh_status === "empty") {
+    return "No enabled threat feeds need refresh";
+  }
+  if (result.changed_source_count === 0) {
+    return `Checked ${result.enabled_source_count} threat feeds; no upstream changes`;
+  }
+  return `Updated ${result.changed_source_count}/${result.enabled_source_count} threat feeds and parsed ${result.prefix_count} prefixes`;
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
@@ -2703,6 +2778,14 @@ async function refreshGeoCountries() {
   });
   await refreshAll();
   showNotice(countryRefreshNotice(result.data));
+}
+
+async function refreshThreatSources() {
+  const result = await api<Versioned<ThreatRefreshResponse>>("threat-sources/refresh", {
+    method: "POST"
+  });
+  await refreshAll();
+  showNotice(threatRefreshNotice(result.data));
 }
 
 async function lookupGeoIp() {

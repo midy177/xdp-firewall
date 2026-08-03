@@ -37,21 +37,34 @@ Useful endpoints:
 - `POST /policy/bump-version`
 - `GET /rules?page=1&page_size=20&action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10`
 - `POST /rules`
+- `POST /rules/batch`
 - `DELETE /rules/{id}`
+- `DELETE /rules/batch`
 - `DELETE /rules?action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10`
 - `GET /geo-countries?page=1&page_size=20&country=CN&action=deny&enabled=true`
 - `POST /geo-countries`
+- `POST /geo-countries/batch`
+- `DELETE /geo-countries/batch`
 - `DELETE /geo-countries?country=CN&action=deny&enabled=true`
 - `POST /geo-countries/refresh`
 - `GET /geo/lookup?ip=8.8.8.8`
 - `GET /temp-bans?page=1&page_size=20&ip=203.0.113.10&protocol=tcp&port=443`
 - `POST /temp-bans`
+- `POST /temp-bans/batch`
+- `DELETE /temp-bans/batch`
 - `GET /threat-sources?page=1&page_size=20&name=test-feed&format=cidr&enabled=true`
+- `POST /threat-sources/refresh`
 - `POST /threat-sources`
+- `POST /threat-sources/batch`
+- `DELETE /threat-sources/batch`
 - `DELETE /threat-sources?name=test-feed`
 - `GET /dynamic-rate-limits?page=1&page_size=20&enabled=true&priority=10&protocol=tcp&port=443&packets_per_second=1000&burst=2000`
+- `POST /dynamic-rate-limits/batch`
+- `DELETE /dynamic-rate-limits/batch`
 - `DELETE /dynamic-rate-limits?enabled=true&priority=10&protocol=tcp&port=443&packets_per_second=1000&burst=2000`
 - `GET /trusted-cidrs?page=1&page_size=20&cidr=10.0.0.0/8&enabled=true`
+- `POST /trusted-cidrs/batch`
+- `DELETE /trusted-cidrs/batch`
 - `DELETE /trusted-cidrs?cidr=10.0.0.0/8`
 - `GET /nodes?page=1&page_size=20`
 
@@ -67,6 +80,8 @@ curl -X POST http://127.0.0.1:8080/rules \
 Every mutating endpoint increments the policy version so the xDS control plane can push a fresh snapshot to running agents.
 
 List endpoints return `items`, `total`, `page`, `page_size`, and `total_pages`. The default page size is `20`; the maximum is `500`.
+
+Batch create endpoints use `{"items":[...]}` and accept the same item shape as the single-row `POST` endpoint. Batch delete endpoints use `{"ids":[1,2]}`. Batch requests are limited to 500 entries, run in a single transaction, and bump the policy version once after the whole batch succeeds.
 
 `GET /rules` supports optional filters for `action`, `cidr`, `protocol`, `port`, and `priority`; omit all filters to page through all rules. Filters are combined with AND semantics. `DELETE /rules` deletes by the complete rule tuple and requires all five fields: `action`, `cidr`, `protocol`, `port`, and `priority`. Use `DELETE /rules/{id}` for rules that do not have a stored port. `protocol=any` also matches older rules whose protocol field is unset.
 
@@ -96,6 +111,7 @@ The frontend source is Vue 3. `frontend/package.json` aliases Vite to Rolldown V
 - `firewall_dynamic_rate_limits`: custom dynamic defense rate limits by protocol and/or destination port.
 - `firewall_trusted_cidrs`: highest-priority source CIDR whitelist.
 - `firewall_threat_sources`: threat-intelligence feed definitions.
+- `firewall_threat_source_states`: last-seen threat feed fingerprints used by automatic refresh.
 - `firewall_nodes`: distributed node heartbeat and last applied version.
 
 Built-in threat sources:
@@ -104,6 +120,8 @@ Built-in threat sources:
 - `spamhaus-drop`: `https://www.spamhaus.org/drop/drop.txt`, format `spamhaus_drop`.
 
 Threat feeds are fetched with a timeout, no redirects, and a 16 MiB response limit. Text formats (`cidr`, `ips`, and `ipsum`) are parsed line-by-line from the HTTP response. `spamhaus_drop` keeps the existing JSON-compatible parser and may buffer the response body within the same 16 MiB cap. Only built-in feed hosts are allowed by default; add comma-separated custom hosts with `XDP_FIREWALL_ALLOWED_THREAT_HOSTS` before enabling custom feed URLs.
+
+The xDS control plane automatically checks enabled threat feeds every 86400 seconds, using the same automatic refresh interval as country IP lists. Each check normalizes the fetched prefixes and compares a stable fingerprint with `firewall_threat_source_states`; the policy version is bumped only when at least one enabled feed changes, so agents refetch and apply the updated threat intelligence without unnecessary policy churn.
 
 ## XDP Object
 
@@ -145,7 +163,9 @@ The same whitelist can be managed through:
 
 - `GET /trusted-cidrs`
 - `POST /trusted-cidrs`
+- `POST /trusted-cidrs/batch`
 - `DELETE /trusted-cidrs/{id}`
+- `DELETE /trusted-cidrs/batch`
 
 ## Kubernetes Runtime Discovery
 
@@ -217,7 +237,9 @@ Temporary bans block one source IP, optionally scoped by protocol and destinatio
 
 - `GET /temp-bans?page=1&page_size=20`
 - `POST /temp-bans`
+- `POST /temp-bans/batch`
 - `DELETE /temp-bans/{id}`
+- `DELETE /temp-bans/batch`
 
 Example:
 
@@ -243,7 +265,9 @@ Whitelist entries are evaluated before dynamic defense, so matching sources are 
 - `PUT /dynamic-defense`
 - `GET /dynamic-rate-limits?page=1&page_size=20`
 - `POST /dynamic-rate-limits`
+- `POST /dynamic-rate-limits/batch`
 - `DELETE /dynamic-rate-limits/{id}`
+- `DELETE /dynamic-rate-limits/batch`
 
 Custom dynamic rate limits are enabled rows with `priority`, `protocol`, optional `port`, `packets_per_second`, `burst`, and optional `comment`. Lower numeric priority is higher priority when multiple rows compile to the same effective key. A row with `protocol=any` and `port=443` rate-limits traffic to destination port 443 for protocols that expose a destination port; `protocol=tcp` with no port rate-limits all TCP traffic per source IP. Custom limits run before the global `ip_rate_limit` and `flood` checks.
 

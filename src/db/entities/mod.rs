@@ -9,4 +9,5 @@ pub mod node;
 pub mod policy_version;
 pub mod temp_ban;
 pub mod threat_source;
+pub mod threat_source_state;
 pub mod trusted_cidr;

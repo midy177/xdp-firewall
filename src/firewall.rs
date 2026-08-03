@@ -1,7 +1,7 @@
 use crate::cli::{SeedExampleArgs, ShowPolicyArgs};
 use crate::db::entities::{
     dynamic_defense, dynamic_rate_limit, firewall_rule, geo_country_policy, policy_version,
-    temp_ban, threat_source, trusted_cidr,
+    temp_ban, threat_source, threat_source_state, trusted_cidr,
 };
 use crate::{geo, threat};
 use anyhow::{Context, Result, bail};
@@ -482,6 +482,10 @@ pub async fn seed_example_policy(db: &DatabaseConnection, args: SeedExampleArgs)
         .await?;
     threat_source::Entity::delete_many()
         .filter(threat_source::Column::PolicyName.eq(policy_name))
+        .exec(db)
+        .await?;
+    threat_source_state::Entity::delete_many()
+        .filter(threat_source_state::Column::PolicyName.eq(policy_name))
         .exec(db)
         .await?;
     let now = chrono::Utc::now().naive_utc();
