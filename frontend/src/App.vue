@@ -887,7 +887,7 @@
             <tr v-for="event in filteredDropEvents" :key="event.local_id">
               <td>{{ formatLocalTime(event.time) }}</td>
               <td class="clip">{{ event.node_id }}</td>
-              <td><Badge :tone="dropReasonTone(event.reason)">{{ dropReasonDisplay(event) }}</Badge></td>
+              <td><Badge :tone="dropReasonTone(event.reason)">{{ dropReasonLabel(event.reason) }}</Badge></td>
               <td>{{ event.src }}</td>
               <td>{{ event.proto }}</td>
               <td>{{ event.dport || '*' }}</td>
@@ -1018,7 +1018,7 @@ type DynamicDefense = {
   flood_block_seconds?: number | null;
 };
 type NodeState = { node_id: string; interface_name: string; last_applied_version: number; status: string; last_seen_at: string; error?: string };
-type DropEvent = { local_id: number; node_id: string; interface_name: string; time: string; event_time_ns: number; cpu: number; reason: string; src: string; family: number; proto: string; dport: number; country?: string; action: string; threat_source?: string };
+type DropEvent = { local_id: number; node_id: string; interface_name: string; time: string; event_time_ns: number; cpu: number; reason: string; src: string; family: number; proto: string; dport: number; country?: string; action: string };
 type Snapshot = { version: number };
 type Page<T> = { items: T[]; total: number; page: number; page_size: number; total_pages: number };
 type PageState = { page: number; total_pages: number; total: number };
@@ -2372,13 +2372,6 @@ function dropReasonLabel(reason: string): string {
     parse_error: "Parse error"
   };
   return (language.value === "zh" ? zh : en)[reason] ?? reason;
-}
-
-function dropReasonDisplay(event: DropEvent): string {
-  if (event.reason === "threat_intel" && event.threat_source) {
-    return `${dropReasonLabel(event.reason)}: ${event.threat_source}`;
-  }
-  return dropReasonLabel(event.reason);
 }
 
 function dropReasonTone(reason: string): "red" | "amber" | "green" | "neutral" {

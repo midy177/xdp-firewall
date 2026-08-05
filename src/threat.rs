@@ -9,7 +9,7 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::time::Duration;
 use tracing::warn;
@@ -40,13 +40,13 @@ pub const BUILTIN_THREAT_SOURCES: &[BuiltinThreatSource] = &[
         name: "spamhaus-drop",
         url: "https://www.spamhaus.org/drop/drop.txt",
         format: "spamhaus_drop",
-        min_score: None,
+        min_score: Some(3),
     },
     BuiltinThreatSource {
         name: "voipbl",
-        url: "https://voipbl.org/update/?wc[]=CA&dm=bl",
+        url: "http://www.voipbl.org/update/",
         format: "voipbl",
-        min_score: None,
+        min_score: Some(3),
     },
 ];
 
@@ -73,13 +73,6 @@ pub struct ThreatSource {
 pub struct ThreatPrefix {
     pub addr: IpAddr,
     pub prefix: u8,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NamedThreatPrefix {
-    pub addr: IpAddr,
-    pub prefix: u8,
-    pub source_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,20 +118,19 @@ impl TryFrom<threat_source::Model> for ThreatSource {
     }
 }
 
-pub async fn fetch_threat_prefixes(sources: &[ThreatSource]) -> Result<Vec<ThreatPrefix>> {
-    Ok(fetch_named_threat_prefixes(sources)
-        .await?
-        .into_iter()
-        .map(|prefix| ThreatPrefix {
-            addr: prefix.addr,
-            prefix: prefix.prefix,
-        })
-        .collect())
+impl ThreatFormat {
+    fn label(&self) -> &'static str {
+        match self {
+            ThreatFormat::Cidr => "cidr",
+            ThreatFormat::Ips => "ips",
+            ThreatFormat::Ipsum => "ipsum",
+            ThreatFormat::Voipbl => "voipbl",
+            ThreatFormat::SpamhausDrop => "spamhaus_drop",
+        }
+    }
 }
 
-pub async fn fetch_named_threat_prefixes(
-    sources: &[ThreatSource],
-) -> Result<Vec<NamedThreatPrefix>> {
+pub async fn fetch_threat_prefixes(sources: &[ThreatSource]) -> Result<Vec<ThreatPrefix>> {
     let mut prefixes = Vec::new();
     let client = reqwest::Client::builder()
         .timeout(THREAT_HTTP_TIMEOUT)
@@ -146,18 +138,9 @@ pub async fn fetch_named_threat_prefixes(
         .build()
         .context("failed to build threat HTTP client")?;
     for source in sources {
-        prefixes.extend(
-            fetch_threat_source_prefixes(&client, source)
-                .await?
-                .into_iter()
-                .map(|prefix| NamedThreatPrefix {
-                    addr: prefix.addr,
-                    prefix: prefix.prefix,
-                    source_name: source.name.clone(),
-                }),
-        );
+        prefixes.extend(fetch_threat_source_prefixes(&client, source).await?);
     }
-    Ok(normalize_named_prefixes(prefixes))
+    Ok(normalize_prefixes(prefixes))
 }
 
 pub async fn refresh_enabled_threat_sources(
@@ -412,16 +395,22 @@ async fn fetch_threat_source_prefixes(
         .error_for_status()
         .with_context(|| format!("threat source {} returned HTTP error", source.name))?;
     match &source.format {
-        ThreatFormat::Cidr | ThreatFormat::Ips | ThreatFormat::Voipbl => {
+        ThreatFormat::Cidr | ThreatFormat::Ips => {
             read_limited_lines(response, MAX_THREAT_BODY_BYTES, |line| {
-                parse_line_prefix(line)
+                parse_lenient_line_prefix(line, source.format.label())
+            })
+            .await
+        }
+        ThreatFormat::Voipbl => {
+            read_limited_lines(response, MAX_THREAT_BODY_BYTES, |line| {
+                parse_lenient_line_prefix(line, source.format.label())
             })
             .await
         }
         ThreatFormat::Ipsum => {
             let min_score = source.min_score.unwrap_or(1);
             read_limited_lines(response, MAX_THREAT_BODY_BYTES, |line| {
-                parse_ipsum_line(line, min_score)
+                parse_lenient_ipsum_line(line, min_score)
             })
             .await
         }
@@ -535,21 +524,17 @@ fn allowed_threat_hosts() -> HashSet<String> {
     hosts
 }
 
-fn parse_line_prefixes(body: &str) -> Result<Vec<ThreatPrefix>> {
-    let mut prefixes = Vec::new();
-    for line in body.lines() {
-        if let Some(prefix) = parse_line_prefix(line)? {
-            prefixes.push(prefix);
-        }
-    }
-    Ok(prefixes)
-}
-
-fn parse_line_prefix(line: &str) -> Result<Option<ThreatPrefix>> {
+fn parse_lenient_line_prefix(line: &str, format: &str) -> Result<Option<ThreatPrefix>> {
     let Some(token) = first_prefix_token(line) else {
         return Ok(None);
     };
-    Ok(Some(parse_prefix(token)?))
+    match parse_prefix(token) {
+        Ok(prefix) => Ok(Some(prefix)),
+        Err(err) => {
+            warn!(format, line = line.trim(), error = %err, "skipping invalid threat line");
+            Ok(None)
+        }
+    }
 }
 
 fn parse_ipsum_line(line: &str, min_score: u32) -> Result<Option<ThreatPrefix>> {
@@ -568,6 +553,16 @@ fn parse_ipsum_line(line: &str, min_score: u32) -> Result<Option<ThreatPrefix>> 
     Ok(None)
 }
 
+fn parse_lenient_ipsum_line(line: &str, min_score: u32) -> Result<Option<ThreatPrefix>> {
+    match parse_ipsum_line(line, min_score) {
+        Ok(prefix) => Ok(prefix),
+        Err(err) => {
+            warn!(format = "ipsum", line = line.trim(), error = %err, "skipping invalid threat line");
+            Ok(None)
+        }
+    }
+}
+
 fn parse_spamhaus_drop(body: &str) -> Result<Vec<ThreatPrefix>> {
     if let Ok(value) = serde_json::from_str::<Value>(body) {
         let mut prefixes = Vec::new();
@@ -576,7 +571,13 @@ fn parse_spamhaus_drop(body: &str) -> Result<Vec<ThreatPrefix>> {
             return Ok(prefixes);
         }
     }
-    parse_line_prefixes(body)
+    let mut prefixes = Vec::new();
+    for line in body.lines() {
+        if let Some(prefix) = parse_lenient_line_prefix(line, "spamhaus_drop")? {
+            prefixes.push(prefix);
+        }
+    }
+    Ok(prefixes)
 }
 
 fn collect_json_cidrs(value: &Value, prefixes: &mut Vec<ThreatPrefix>) -> Result<()> {
@@ -588,7 +589,12 @@ fn collect_json_cidrs(value: &Value, prefixes: &mut Vec<ThreatPrefix>) -> Result
         }
         Value::Object(map) => {
             if let Some(Value::String(cidr)) = map.get("cidr").or_else(|| map.get("prefix")) {
-                prefixes.push(parse_prefix(cidr)?);
+                match parse_prefix(cidr) {
+                    Ok(prefix) => prefixes.push(prefix),
+                    Err(err) => {
+                        warn!(format = "spamhaus_drop", cidr, error = %err, "skipping invalid threat CIDR");
+                    }
+                }
             }
         }
         _ => {}
@@ -637,28 +643,6 @@ fn normalize_prefixes(prefixes: Vec<ThreatPrefix>) -> Vec<ThreatPrefix> {
             normalized.push(prefix);
         }
     }
-    normalized.sort_by_key(|prefix| (prefix.addr.is_ipv6(), prefix.addr, prefix.prefix));
-    normalized
-}
-
-fn normalize_named_prefixes(prefixes: Vec<NamedThreatPrefix>) -> Vec<NamedThreatPrefix> {
-    let mut names_by_prefix = HashMap::<ThreatPrefix, String>::new();
-    for prefix in prefixes {
-        names_by_prefix
-            .entry(ThreatPrefix {
-                addr: prefix.addr,
-                prefix: prefix.prefix,
-            })
-            .or_insert(prefix.source_name);
-    }
-    let mut normalized = names_by_prefix
-        .into_iter()
-        .map(|(prefix, source_name)| NamedThreatPrefix {
-            addr: prefix.addr,
-            prefix: prefix.prefix,
-            source_name,
-        })
-        .collect::<Vec<_>>();
     normalized.sort_by_key(|prefix| (prefix.addr.is_ipv6(), prefix.addr, prefix.prefix));
     normalized
 }
@@ -719,7 +703,7 @@ mod tests {
         assert_eq!(BUILTIN_THREAT_SOURCES[2].format, "voipbl");
         assert_eq!(
             BUILTIN_THREAT_SOURCES[2].url,
-            "https://voipbl.org/update/?wc[]=CA&dm=bl"
+            "http://www.voipbl.org/update/"
         );
     }
 
@@ -732,19 +716,65 @@ mod tests {
 
     #[test]
     fn accepts_voipbl_source_url_by_default() {
-        validate_source_url("https://voipbl.org/update/?wc[]=CA&dm=bl").unwrap();
+        validate_source_url("http://www.voipbl.org/update/").unwrap();
     }
 
     #[test]
     fn parses_voipbl_cidr_lines() {
-        let prefixes = parse_line_prefixes(
-            "# TOTAL NETBLOCK: 2\n\
+        let mut prefixes = Vec::new();
+        for line in "# TOTAL NETBLOCK: 2\n\
              23.16.0.0/15\n\
-             23.29.192.0/19\n",
-        )
-        .unwrap();
+             137.184.10/32\n\
+             23.29.192.0/19\n"
+            .lines()
+        {
+            if let Some(prefix) = parse_lenient_line_prefix(line, "voipbl").unwrap() {
+                prefixes.push(prefix);
+            }
+        }
         assert_eq!(prefixes.len(), 2);
         assert_eq!(prefixes[0].prefix, 15);
+    }
+
+    #[test]
+    fn lenient_line_formats_skip_invalid_cidrs() {
+        assert!(
+            parse_lenient_line_prefix("137.184.10/32", "cidr")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_lenient_line_prefix("198.51.100.0/24", "cidr")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn lenient_ipsum_skips_invalid_scored_ip() {
+        assert!(
+            parse_lenient_ipsum_line("137.184.10 5", 3)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_lenient_ipsum_line("198.51.100.1 5", 3)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn spamhaus_drop_skips_invalid_json_cidrs() {
+        let prefixes = parse_spamhaus_drop(
+            r#"[
+                {"cidr":"137.184.10/32"},
+                {"cidr":"198.51.100.0/24"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(prefixes.len(), 1);
+        assert_eq!(prefixes[0].prefix, 24);
     }
 
     #[test]

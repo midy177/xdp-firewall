@@ -2,7 +2,7 @@
 # Use with:
 # docker compose --env-file deploy/docker-compose/compose-env -f deploy/docker-compose/compose.sqlite.yml up -d
 
-XDP_FIREWALL_IMAGE=1228022817/xdp-firewall:0.1.0
+XDP_FIREWALL_IMAGE=1228022817/xdp-firewall:0.1.9
 
 # Required. Change both tokens before exposing the service.
 XDP_FIREWALL_API_TOKEN=change-this-api-token

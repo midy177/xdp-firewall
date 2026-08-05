@@ -11,10 +11,7 @@ use sea_orm::{
     sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashSet,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-};
+use std::{collections::HashSet, net::IpAddr};
 use tracing::info;
 
 pub const DEFAULT_POLICY_NAME: &str = "edge";
@@ -155,7 +152,7 @@ pub struct XdpTrustedPrefix {
     pub prefix: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XdpPrefixRule {
     pub addr: IpAddr,
     pub prefix: u8,
@@ -164,7 +161,6 @@ pub struct XdpPrefixRule {
     pub protocol: L4Protocol,
     pub port: u16,
     pub source: XdpRuleSource,
-    pub threat_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,7 +379,7 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let threat_prefixes = threat::fetch_named_threat_prefixes(&snapshot.threat_sources)
+    let threat_prefixes = threat::fetch_threat_prefixes(&snapshot.threat_sources)
         .await?
         .into_iter()
         .map(|prefix| XdpPrefixRule {
@@ -394,7 +390,6 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
             protocol: L4Protocol::Any,
             port: 0,
             source: XdpRuleSource::ThreatIntel,
-            threat_source: Some(prefix.source_name),
         })
         .collect();
     let trusted_prefixes = snapshot
@@ -424,7 +419,6 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
                 protocol: rule.protocol,
                 port: rule.port.unwrap_or(0),
                 source: XdpRuleSource::FirewallRule,
-                threat_source: None,
             }
         })
         .collect();
@@ -484,95 +478,6 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
         geo_prefixes,
         threat_prefixes,
     })
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ThreatSourceMatcher {
-    v4: Vec<ThreatSourcePrefixV4>,
-    v6: Vec<ThreatSourcePrefixV6>,
-}
-
-#[derive(Debug, Clone)]
-struct ThreatSourcePrefixV4 {
-    network: u32,
-    prefix: u8,
-    source_name: String,
-}
-
-#[derive(Debug, Clone)]
-struct ThreatSourcePrefixV6 {
-    network: u128,
-    prefix: u8,
-    source_name: String,
-}
-
-impl ThreatSourceMatcher {
-    pub fn from_policy(policy: &CompiledPolicy) -> Self {
-        let mut matcher = Self::default();
-        for prefix in &policy.threat_prefixes {
-            let Some(source_name) = prefix.threat_source.clone() else {
-                continue;
-            };
-            match prefix.addr {
-                IpAddr::V4(addr) => matcher.v4.push(ThreatSourcePrefixV4 {
-                    network: ipv4_network(addr, prefix.prefix),
-                    prefix: prefix.prefix,
-                    source_name,
-                }),
-                IpAddr::V6(addr) => matcher.v6.push(ThreatSourcePrefixV6 {
-                    network: ipv6_network(addr, prefix.prefix),
-                    prefix: prefix.prefix,
-                    source_name,
-                }),
-            }
-        }
-        matcher
-            .v4
-            .sort_by(|left, right| right.prefix.cmp(&left.prefix));
-        matcher
-            .v6
-            .sort_by(|left, right| right.prefix.cmp(&left.prefix));
-        matcher
-    }
-
-    pub fn source_for(&self, addr: IpAddr) -> Option<&str> {
-        match addr {
-            IpAddr::V4(addr) => self
-                .v4
-                .iter()
-                .find(|prefix| ipv4_network(addr, prefix.prefix) == prefix.network)
-                .map(|prefix| prefix.source_name.as_str()),
-            IpAddr::V6(addr) => self
-                .v6
-                .iter()
-                .find(|prefix| ipv6_network(addr, prefix.prefix) == prefix.network)
-                .map(|prefix| prefix.source_name.as_str()),
-        }
-    }
-}
-
-fn ipv4_network(addr: Ipv4Addr, prefix: u8) -> u32 {
-    u32::from(addr) & ipv4_mask(prefix)
-}
-
-fn ipv4_mask(prefix: u8) -> u32 {
-    if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - u32::from(prefix))
-    }
-}
-
-fn ipv6_network(addr: Ipv6Addr, prefix: u8) -> u128 {
-    u128::from(addr) & ipv6_mask(prefix)
-}
-
-fn ipv6_mask(prefix: u8) -> u128 {
-    if prefix == 0 {
-        0
-    } else {
-        u128::MAX << (128 - u32::from(prefix))
-    }
 }
 
 pub async fn seed_example_policy(db: &DatabaseConnection, args: SeedExampleArgs) -> Result<()> {
@@ -1090,53 +995,6 @@ mod tests {
         };
 
         assert!(validate_dynamic_rate_limit_policy(&policy).is_ok());
-    }
-
-    #[test]
-    fn threat_source_matcher_uses_longest_prefix() {
-        let policy = CompiledPolicy {
-            version: 1,
-            trusted_prefixes: Vec::new(),
-            rules: Vec::new(),
-            country_rules: Vec::new(),
-            temp_bans: Vec::new(),
-            dynamic_defense: XdpDynamicDefense::default(),
-            dynamic_rate_limits: Vec::new(),
-            geo_prefixes: Vec::new(),
-            threat_prefixes: vec![
-                XdpPrefixRule {
-                    addr: "203.0.113.0".parse().unwrap(),
-                    prefix: 24,
-                    priority: i32::MIN,
-                    action: RuleAction::Deny,
-                    protocol: L4Protocol::Any,
-                    port: 0,
-                    source: XdpRuleSource::ThreatIntel,
-                    threat_source: Some("broad-feed".to_string()),
-                },
-                XdpPrefixRule {
-                    addr: "203.0.113.128".parse().unwrap(),
-                    prefix: 25,
-                    priority: i32::MIN,
-                    action: RuleAction::Deny,
-                    protocol: L4Protocol::Any,
-                    port: 0,
-                    source: XdpRuleSource::ThreatIntel,
-                    threat_source: Some("specific-feed".to_string()),
-                },
-            ],
-        };
-
-        let matcher = ThreatSourceMatcher::from_policy(&policy);
-        assert_eq!(
-            matcher.source_for("203.0.113.200".parse().unwrap()),
-            Some("specific-feed")
-        );
-        assert_eq!(
-            matcher.source_for("203.0.113.20".parse().unwrap()),
-            Some("broad-feed")
-        );
-        assert_eq!(matcher.source_for("198.51.100.1".parse().unwrap()), None);
     }
 
     #[tokio::test]

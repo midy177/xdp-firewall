@@ -24,7 +24,7 @@ spec:
         - operator: Exists
       containers:
         - name: agent
-          image: xdp-firewall:0.1.0
+          image: xdp-firewall:0.1.9
           imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true

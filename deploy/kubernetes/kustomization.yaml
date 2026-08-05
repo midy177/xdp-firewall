@@ -11,4 +11,4 @@ resources:
 images:
   - name: xdp-firewall
     newName: 1228022817/xdp-firewall
-    newTag: 0.1.0
+    newTag: 0.1.9

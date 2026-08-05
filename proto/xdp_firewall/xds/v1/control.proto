@@ -82,7 +82,6 @@ message DropEvent {
   uint32 dport = 10;
   string country = 11;
   string action = 12;
-  string threat_source = 13;
 }
 
 message DropEventResponse {

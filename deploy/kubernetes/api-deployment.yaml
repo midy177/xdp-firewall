@@ -21,7 +21,7 @@ spec:
       serviceAccountName: xdp-firewall-api
       containers:
         - name: api
-          image: xdp-firewall:0.1.0
+          image: xdp-firewall:0.1.9
           imagePullPolicy: IfNotPresent
           env:
             - name: DATABASE_URL

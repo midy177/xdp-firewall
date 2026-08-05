@@ -252,8 +252,6 @@ pub struct DropEventLine {
     pub dport: u16,
     pub country: Option<String>,
     pub action: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub threat_source: Option<String>,
 }
 
 pub struct DropEventReader {
@@ -279,7 +277,7 @@ impl DropEventLine {
     pub fn to_line(&self) -> String {
         let country = self.country.as_deref().unwrap_or("-");
         format!(
-            "time={} event_time_ns={} cpu={} reason={} src={} family={} proto={} dport={} country={} action={}{}",
+            "time={} event_time_ns={} cpu={} reason={} src={} family={} proto={} dport={} country={} action={}",
             self.time,
             self.event_time_ns,
             self.cpu,
@@ -289,11 +287,7 @@ impl DropEventLine {
             self.proto,
             self.dport,
             country,
-            self.action,
-            self.threat_source
-                .as_deref()
-                .map(|source| format!(" threat_source={source}"))
-                .unwrap_or_default()
+            self.action
         )
     }
 }
@@ -329,7 +323,6 @@ pub fn parse_drop_event(cpu: u32, bytes: &[u8]) -> Option<DropEventLine> {
         dport,
         country: decode_country(country),
         action: action_label(action),
-        threat_source: None,
     })
 }
 
