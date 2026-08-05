@@ -17,9 +17,11 @@ use tracing::warn;
 const ALLOWED_THREAT_HOSTS_ENV: &str = "XDP_FIREWALL_ALLOWED_THREAT_HOSTS";
 const MAX_THREAT_BODY_BYTES: usize = 16 * 1024 * 1024;
 const THREAT_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+const THREAT_HTTP_MAX_REDIRECTS: usize = 3;
 const REFRESH_LOCK_POLICY_NAME: &str = "__threat_refresh_lock__";
 const REFRESH_LOCK_SOURCE_NAME: &str = firewall::DEFAULT_POLICY_NAME;
 const REFRESH_LOCK_STALE_SECONDS: i64 = 900;
+const DEFAULT_ALLOWED_THREAT_HOSTS: &[&str] = &["voipbl.org", "www.voipbl.org"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinThreatSource {
@@ -44,7 +46,7 @@ pub const BUILTIN_THREAT_SOURCES: &[BuiltinThreatSource] = &[
     },
     BuiltinThreatSource {
         name: "voipbl",
-        url: "http://www.voipbl.org/update/",
+        url: "https://voipbl.org/update/",
         format: "voipbl",
         min_score: Some(3),
     },
@@ -132,11 +134,7 @@ impl ThreatFormat {
 
 pub async fn fetch_threat_prefixes(sources: &[ThreatSource]) -> Result<Vec<ThreatPrefix>> {
     let mut prefixes = Vec::new();
-    let client = reqwest::Client::builder()
-        .timeout(THREAT_HTTP_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("failed to build threat HTTP client")?;
+    let client = threat_http_client()?;
     for source in sources {
         prefixes.extend(fetch_threat_source_prefixes(&client, source).await?);
     }
@@ -175,11 +173,7 @@ pub async fn refresh_enabled_threat_sources(
         .into_iter()
         .map(|row| (row.source_name.clone(), row))
         .collect::<std::collections::HashMap<_, _>>();
-    let client = reqwest::Client::builder()
-        .timeout(THREAT_HTTP_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("failed to build threat HTTP client")?;
+    let client = threat_http_client()?;
     let mut states = Vec::with_capacity(sources.len());
     let mut changed_source_count = 0_u64;
     let mut prefix_count = 0_usize;
@@ -422,9 +416,39 @@ async fn fetch_threat_source_prefixes(
     .with_context(|| format!("failed to read threat source {}", source.name))
 }
 
+fn threat_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(THREAT_HTTP_TIMEOUT)
+        .redirect(threat_redirect_policy())
+        .build()
+        .context("failed to build threat HTTP client")
+}
+
+fn threat_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > THREAT_HTTP_MAX_REDIRECTS {
+            return attempt.error(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "too many threat source redirects",
+            ));
+        }
+        if let Err(err) = validate_source_url_parts(attempt.url()) {
+            return attempt.error(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("threat source redirect target is not allowed: {err}"),
+            ));
+        }
+        attempt.follow()
+    })
+}
+
 pub fn validate_source_url(value: &str) -> Result<()> {
     let url = reqwest::Url::parse(value)
         .with_context(|| format!("invalid threat source URL '{value}'"))?;
+    validate_source_url_parts(&url)
+}
+
+fn validate_source_url_parts(url: &reqwest::Url) -> Result<()> {
     match url.scheme() {
         "http" | "https" => {}
         _ => bail!("threat source URL must use http or https"),
@@ -512,6 +536,11 @@ fn allowed_threat_hosts() -> HashSet<String> {
         .filter_map(|source| reqwest::Url::parse(source.url).ok())
         .filter_map(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
         .collect::<HashSet<_>>();
+    hosts.extend(
+        DEFAULT_ALLOWED_THREAT_HOSTS
+            .iter()
+            .map(|host| host.to_ascii_lowercase()),
+    );
     if let Ok(configured) = std::env::var(ALLOWED_THREAT_HOSTS_ENV) {
         hosts.extend(
             configured
@@ -701,10 +730,7 @@ mod tests {
         assert_eq!(BUILTIN_THREAT_SOURCES[0].min_score, Some(3));
         assert_eq!(BUILTIN_THREAT_SOURCES[1].format, "spamhaus_drop");
         assert_eq!(BUILTIN_THREAT_SOURCES[2].format, "voipbl");
-        assert_eq!(
-            BUILTIN_THREAT_SOURCES[2].url,
-            "http://www.voipbl.org/update/"
-        );
+        assert_eq!(BUILTIN_THREAT_SOURCES[2].url, "https://voipbl.org/update/");
     }
 
     #[test]
@@ -716,7 +742,66 @@ mod tests {
 
     #[test]
     fn accepts_voipbl_source_url_by_default() {
+        validate_source_url("https://voipbl.org/update/").unwrap();
         validate_source_url("http://www.voipbl.org/update/").unwrap();
+    }
+
+    #[tokio::test]
+    async fn follows_allowed_307_threat_source_redirects() {
+        use axum::{
+            Router,
+            http::{StatusCode, header},
+            routing::get,
+        };
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let location = format!("http://voipbl.org:{port}/feed");
+        let app = Router::new()
+            .route(
+                "/start",
+                get(move || async move {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(header::LOCATION, location)],
+                    )
+                }),
+            )
+            .route("/feed", get(|| async { "198.51.100.0/24\n" }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(THREAT_HTTP_TIMEOUT)
+            .redirect(threat_redirect_policy())
+            .resolve("voipbl.org", SocketAddr::from(([127, 0, 0, 1], port)))
+            .build()
+            .unwrap();
+        let prefixes = fetch_threat_source_prefixes(
+            &client,
+            &ThreatSource {
+                name: "voipbl".to_string(),
+                url: format!("http://voipbl.org:{port}/start"),
+                format: ThreatFormat::Voipbl,
+                min_score: Some(3),
+            },
+        )
+        .await
+        .unwrap();
+
+        server.abort();
+        assert_eq!(prefixes.len(), 1);
+        assert_eq!(
+            prefixes[0],
+            ThreatPrefix {
+                addr: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)),
+                prefix: 24,
+            }
+        );
     }
 
     #[test]

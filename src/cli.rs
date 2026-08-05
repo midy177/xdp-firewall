@@ -281,6 +281,13 @@ pub struct AgentArgs {
         default_value_t = DEFAULT_TEMP_BAN_MAP_ENTRIES
     )]
     pub temp_ban_map_entries: u32,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_AUTO_RESIZE_MAPS",
+        hide = true,
+        default_value_t = true
+    )]
+    pub auto_resize_maps: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -406,6 +413,13 @@ pub struct SyncOnceArgs {
         default_value_t = DEFAULT_TEMP_BAN_MAP_ENTRIES
     )]
     pub temp_ban_map_entries: u32,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_AUTO_RESIZE_MAPS",
+        hide = true,
+        default_value_t = true
+    )]
+    pub auto_resize_maps: bool,
 }
 
 #[derive(Debug, Args, Clone)]

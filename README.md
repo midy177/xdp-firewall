@@ -118,9 +118,9 @@ Built-in threat sources:
 
 - `ipsum`: `https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt`, format `ipsum`, minimum score `3`.
 - `spamhaus-drop`: `https://www.spamhaus.org/drop/drop.txt`, format `spamhaus_drop`.
-- `voipbl`: `http://www.voipbl.org/update/`, format `voipbl`.
+- `voipbl`: `https://voipbl.org/update/`, format `voipbl`.
 
-Threat feeds are fetched with a timeout, no redirects, and a 16 MiB response limit. Text formats (`cidr`, `ips`, `ipsum`, and `voipbl`) are parsed line-by-line from the HTTP response; invalid IP/CIDR lines are skipped with a warning. `voipbl` ignores comment lines and compiles each valid IP/CIDR line as a deny prefix rule. `spamhaus_drop` keeps the existing JSON-compatible parser and may buffer the response body within the same 16 MiB cap; invalid JSON CIDR entries are skipped. Built-in feed hosts are allowed by default; add comma-separated custom hosts with `XDP_FIREWALL_ALLOWED_THREAT_HOSTS` before enabling other custom feed URLs.
+Threat feeds are fetched with a timeout, up to 3 redirects to allowed hosts, and a 16 MiB response limit. Text formats (`cidr`, `ips`, `ipsum`, and `voipbl`) are parsed line-by-line from the HTTP response; invalid IP/CIDR lines are skipped with a warning. `voipbl` ignores comment lines and compiles each valid IP/CIDR line as a deny prefix rule. `spamhaus_drop` keeps the existing JSON-compatible parser and may buffer the response body within the same 16 MiB cap; invalid JSON CIDR entries are skipped. Built-in feed hosts are allowed by default; add comma-separated custom hosts with `XDP_FIREWALL_ALLOWED_THREAT_HOSTS` before enabling other custom feed URLs.
 
 The xDS control plane automatically checks enabled threat feeds every 86400 seconds, using the same automatic refresh interval as country IP lists. Each check normalizes the fetched prefixes and compares a stable fingerprint with `firewall_threat_source_states`; the policy version is bumped only when at least one enabled feed changes, so agents refetch and apply the updated threat intelligence without unnecessary policy churn.
 
@@ -412,8 +412,9 @@ The BPF object has conservative built-in defaults, and the agent can override ma
 - `--rate-map-entries` / `XDP_FIREWALL_RATE_MAP_ENTRIES`, default `1048576`.
 - `--custom-rate-limit-map-entries` / `XDP_FIREWALL_CUSTOM_RATE_LIMIT_MAP_ENTRIES`, default `4096`.
 - `--temp-ban-map-entries` / `XDP_FIREWALL_TEMP_BAN_MAP_ENTRIES`, default `4096`.
+- `--auto-resize-maps` / `XDP_FIREWALL_AUTO_RESIZE_MAPS`, default `true`.
 
-When dispatcher mode reuses existing pinned maps, the kernel keeps the old map capacities. The agent reads the real pinned-map capacities after attach and validates future policy updates against those real values, not just the requested CLI/env values. To increase capacity for an existing dispatcher deployment, run an explicit unload with `--remove-pins` during a controlled maintenance window so the next attach can create fresh maps.
+When dispatcher mode reuses existing pinned maps, the kernel keeps the old map capacities. The agent reads the real pinned-map capacities after attach and validates future policy updates against those real values, not just the requested CLI/env values. If `XDP_FIREWALL_AUTO_RESIZE_MAPS` is enabled, a policy that exceeds the current `rule_cidrs`, `geo_cidrs`, `trusted_cidrs`, `country_rules`, `custom_rate_limits`, or `temp_bans` capacity automatically unloads XDP, removes pinned maps, recreates them at `max(required, current * 2)` rounded up to a power of two, and reapplies the same policy. This causes a brief XDP reload window. Disable auto resize and run an explicit unload with `--remove-pins` during a controlled maintenance window if capacity changes must be manually scheduled.
 
 Default capacity and approximate key/value payload:
 
@@ -433,7 +434,7 @@ The payload estimates count only the BPF key/value structs. Actual kernel memory
 
 `rule_cidrs`, `geo_cidrs`, and `trusted_cidrs` are LPM trie maps with `BPF_F_NO_PREALLOC`, so they grow with inserted prefixes instead of allocating the full capacity at startup. `temp_bans` and `custom_rate_limits` are small hash maps for configured exact-match keys. `rate_buckets` is the main memory driver because it can hold up to `XDP_FIREWALL_RATE_MAP_ENTRIES` source-IP state entries for dynamic defense.
 
-Default Docker Compose deployments do not set these variables. Keep the defaults unless an agent reports a map capacity error or the deployment has a measured memory target that requires explicit sizing. These sizes are chosen at XDP load time; changing them requires restarting the agent so the eBPF maps are recreated with the new capacity.
+Default Docker Compose deployments do not set explicit map entry values. Keep the defaults unless an agent reports a map capacity error or the deployment has a measured memory target that requires explicit sizing. These sizes are chosen at XDP load time; changing them for an existing pinned-map deployment requires map recreation, either through automatic resize or an explicit unload with pin removal.
 
 ## Packaging
 

@@ -311,17 +311,19 @@ stateDiagram-v2
 
 - `ipsum`
 - `spamhaus-drop`
-- `voipbl`: `http://www.voipbl.org/update/`，按一行一个 IP/CIDR 解析，忽略注释行。
+- `voipbl`: `https://voipbl.org/update/`，按一行一个 IP/CIDR 解析，忽略注释行。
 
 安全约束：
 
 - 拒绝带 URL credentials 的源。
-- 禁止重定向。
+- 最多跟随 3 次重定向，且重定向目标仍必须是允许的 host。
 - 设置请求超时。
 - 设置响应大小上限。
 - 默认只允许内置 host，额外 host 必须显式配置。
 
 威胁情报最终会编译成 deny 前缀规则，和普通规则一起进入 XDP LPM trie，但在重复 key 场景下威胁情报 deny 优先。
+
+agent 默认开启 `XDP_FIREWALL_AUTO_RESIZE_MAPS`。当策略需要的规则、地理、可信前缀、国家规则、自定义限速或临时封禁条目数超过当前 pinned map 容量时，agent 会卸载 XDP、删除 pinned maps、按 `max(required, current * 2)` 向上取整重建 map，并重新应用同一策略；容量足够时先写入新 key/value，再清理不属于新策略的旧 key。
 
 ## xDS 控制面
 

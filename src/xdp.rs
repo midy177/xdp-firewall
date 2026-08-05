@@ -62,6 +62,7 @@ pub struct XdpAttachOptions {
     pub mode: XdpAttachMode,
     pub strategy: XdpAttachStrategy,
     pub allow_replace: bool,
+    pub auto_resize_maps: bool,
     pub run_priority: i32,
     pub loader_path: String,
     pub bpftool_path: String,
@@ -73,6 +74,7 @@ impl Default for XdpAttachOptions {
             mode: XdpAttachMode::Auto,
             strategy: XdpAttachStrategy::Direct,
             allow_replace: false,
+            auto_resize_maps: true,
             run_priority: 10,
             loader_path: "xdp-loader".to_string(),
             bpftool_path: "bpftool".to_string(),
@@ -80,7 +82,7 @@ impl Default for XdpAttachOptions {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XdpMapSizes {
     pub rule_entries: u32,
     pub geo_entries: u32,
@@ -416,6 +418,96 @@ fn country_key(country: u16) -> u32 {
     u32::from(country)
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn validate_map_capacity(required: XdpMapSizes, configured: XdpMapSizes) -> Result<()> {
+    ensure_capacity("rule_cidrs", required.rule_entries, configured.rule_entries)?;
+    ensure_capacity(
+        "trusted_cidrs",
+        required.trusted_entries,
+        configured.trusted_entries,
+    )?;
+    ensure_capacity("geo_cidrs", required.geo_entries, configured.geo_entries)?;
+    ensure_capacity(
+        "country_rules",
+        required.country_entries,
+        configured.country_entries,
+    )?;
+    ensure_capacity(
+        "custom_rate_limits",
+        required.custom_rate_limit_entries,
+        configured.custom_rate_limit_entries,
+    )?;
+    ensure_capacity(
+        "temp_bans",
+        required.temp_ban_entries,
+        configured.temp_ban_entries,
+    )?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn resized_map_sizes(current: XdpMapSizes, required: XdpMapSizes) -> Result<Option<XdpMapSizes>> {
+    let resized = XdpMapSizes {
+        rule_entries: expanded_capacity("rule_cidrs", current.rule_entries, required.rule_entries)?,
+        geo_entries: expanded_capacity("geo_cidrs", current.geo_entries, required.geo_entries)?,
+        trusted_entries: expanded_capacity(
+            "trusted_cidrs",
+            current.trusted_entries,
+            required.trusted_entries,
+        )?,
+        country_entries: expanded_capacity(
+            "country_rules",
+            current.country_entries,
+            required.country_entries,
+        )?,
+        rate_entries: current.rate_entries,
+        custom_rate_limit_entries: expanded_capacity(
+            "custom_rate_limits",
+            current.custom_rate_limit_entries,
+            required.custom_rate_limit_entries,
+        )?,
+        temp_ban_entries: expanded_capacity(
+            "temp_bans",
+            current.temp_ban_entries,
+            required.temp_ban_entries,
+        )?,
+    };
+    Ok((resized != current).then_some(resized))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn expanded_capacity(map: &str, current: u32, required: u32) -> Result<u32> {
+    use anyhow::Context as _;
+
+    if required <= current {
+        return Ok(current);
+    }
+    let doubled = u64::from(current)
+        .checked_mul(2)
+        .with_context(|| format!("{map} capacity overflowed while resizing"))?;
+    let target = doubled.max(u64::from(required)).max(1);
+    let rounded = target
+        .checked_next_power_of_two()
+        .with_context(|| format!("{map} capacity overflowed while rounding resize target"))?;
+    u32::try_from(rounded)
+        .with_context(|| format!("{map} resized capacity {rounded} exceeds u32 max"))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn ensure_capacity(map: &str, needed: u32, configured: u32) -> Result<()> {
+    if needed > configured {
+        bail!("{map} needs {needed} entries but map capacity is {configured}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn usize_to_u32(map: &str, value: usize) -> Result<u32> {
+    use anyhow::Context as _;
+
+    u32::try_from(value).with_context(|| format!("{map} entry count {value} exceeds u32 max"))
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
@@ -435,6 +527,9 @@ mod linux {
 
     pub struct LinuxXdpManager {
         interface: String,
+        object_path: String,
+        program_name: String,
+        attach_options: XdpAttachOptions,
         _direct_netlink_link: Option<DirectNetlinkLink>,
         _ebpf: Ebpf,
         rule_cidrs: LpmTrie<MapData, RuleData, RuleValue>,
@@ -447,12 +542,6 @@ mod linux {
         drop_config: AyaArray<MapData, DropConfigValue>,
         stats: PerCpuArray<MapData, u64>,
         _drop_events: PerfEventArray<MapData>,
-        rule_keys: Vec<RuleKey>,
-        geo_keys: Vec<GeoKey>,
-        trusted_keys: Vec<TrustedKey>,
-        country_keys: Vec<u32>,
-        custom_rate_keys: Vec<CustomRateKey>,
-        temp_ban_keys: Vec<TempBanKey>,
         map_sizes: XdpMapSizes,
     }
 
@@ -712,6 +801,7 @@ mod linux {
                 mode: args.xdp_mode,
                 strategy: XdpAttachStrategy::Dispatcher,
                 allow_replace: false,
+                auto_resize_maps: true,
                 run_priority: args.xdp_run_priority,
                 loader_path: args.xdp_loader_path,
                 bpftool_path: args.bpftool_path,
@@ -803,6 +893,9 @@ mod linux {
 
                 Ok(Self {
                     interface: interface.to_string(),
+                    object_path: object_path.to_string(),
+                    program_name: program_name.to_string(),
+                    attach_options: attach_options.clone(),
                     _direct_netlink_link: direct_netlink_link,
                     _ebpf: ebpf,
                     rule_cidrs: maps.rule_cidrs,
@@ -815,12 +908,6 @@ mod linux {
                     drop_config: maps.drop_config,
                     stats: maps.stats,
                     _drop_events: maps.drop_events,
-                    rule_keys: Vec::new(),
-                    geo_keys: Vec::new(),
-                    trusted_keys: Vec::new(),
-                    country_keys: Vec::new(),
-                    custom_rate_keys: Vec::new(),
-                    temp_ban_keys: Vec::new(),
                     map_sizes: actual_map_sizes,
                 })
             })();
@@ -843,19 +930,31 @@ mod linux {
         }
 
         pub fn apply(&mut self, policy: &CompiledPolicy) -> Result<()> {
-            self.validate_policy_capacity(policy)?;
-            let mut new_rule_keys = Vec::new();
+            let required = self.required_policy_map_sizes(policy)?;
+            if let Some(resized) = resized_map_sizes(self.map_sizes, required)? {
+                if !self.attach_options.auto_resize_maps {
+                    validate_map_capacity(required, self.map_sizes)?;
+                }
+                self.resize_maps(resized, required)?;
+            }
+            self.apply_to_current_maps(policy)
+        }
+
+        fn apply_to_current_maps(&mut self, policy: &CompiledPolicy) -> Result<()> {
+            let required = self.required_policy_map_sizes(policy)?;
+            validate_map_capacity(required, self.map_sizes)?;
             let mut new_rule_ids = HashSet::new();
-            let mut new_geo_keys = Vec::new();
+            let mut new_rules = Vec::new();
             let mut new_geo_ids = HashSet::new();
-            let mut new_trusted_keys = Vec::new();
+            let mut new_geo_prefixes = Vec::new();
             let mut new_trusted_ids = HashSet::new();
-            let mut new_country_keys = Vec::new();
+            let mut new_trusted_keys = Vec::new();
             let mut new_country_ids = HashSet::new();
-            let mut new_custom_rate_keys = Vec::new();
+            let mut new_country_rules = Vec::new();
             let mut new_custom_rate_ids = HashSet::new();
-            let mut new_temp_ban_keys = Vec::new();
+            let mut new_custom_rate_limits = Vec::new();
             let mut new_temp_ban_ids = HashSet::new();
+            let mut new_temp_bans = Vec::new();
 
             self.put_dynamic_defense(&policy.dynamic_defense)?;
             let monotonic_now_ns = monotonic_now_ns()?;
@@ -867,8 +966,7 @@ mod linux {
                 let key = temp_ban_key(ban.addr, ban.protocol, ban.port);
                 let id = temp_ban_key_id(&key);
                 if new_temp_ban_ids.insert(id) {
-                    self.put_temp_ban_key(&key, ban, wall_now, monotonic_now_ns)?;
-                    new_temp_ban_keys.push(key);
+                    new_temp_bans.push((key, ban));
                 } else {
                     warn!(
                         addr = %ban.addr,
@@ -882,8 +980,7 @@ mod linux {
                 let key = custom_rate_key(limit.protocol, limit.port);
                 let id = custom_rate_key_id(&key);
                 if new_custom_rate_ids.insert(id) {
-                    self.put_custom_rate_key(&key, limit)?;
-                    new_custom_rate_keys.push(key);
+                    new_custom_rate_limits.push((key, limit));
                 } else {
                     warn!(
                         protocol = ?limit.protocol,
@@ -896,7 +993,6 @@ mod linux {
                 let key = trusted_key(prefix.addr, prefix.prefix);
                 let id = trusted_key_id(&key);
                 if new_trusted_ids.insert(id) {
-                    self.put_trusted_key(&key)?;
                     new_trusted_keys.push(key);
                 }
             }
@@ -914,8 +1010,7 @@ mod linux {
                 let key = rule_key(rule.addr, rule.prefix, rule.protocol, rule.port);
                 let id = rule_key_id(&key);
                 if new_rule_ids.insert(id) {
-                    self.put_rule_key(&key, rule)?;
-                    new_rule_keys.push(key);
+                    new_rules.push((key, rule));
                 } else {
                     warn!(
                         addr = %rule.addr,
@@ -931,16 +1026,32 @@ mod linux {
                 let key = geo_key(prefix.addr, prefix.prefix);
                 let id = geo_key_id(&key);
                 if new_geo_ids.insert(id) {
-                    self.put_geo_key(&key, prefix)?;
-                    new_geo_keys.push(key);
+                    new_geo_prefixes.push((key, prefix));
                 }
             }
             for country in &policy.country_rules {
                 let key = country_key(country.country);
                 if new_country_ids.insert(key) {
-                    self.put_country_key(key, country)?;
-                    new_country_keys.push(key);
+                    new_country_rules.push((key, country));
                 }
+            }
+            for (key, ban) in &new_temp_bans {
+                self.put_temp_ban_key(key, ban, wall_now, monotonic_now_ns)?;
+            }
+            for (key, limit) in &new_custom_rate_limits {
+                self.put_custom_rate_key(key, limit)?;
+            }
+            for key in &new_trusted_keys {
+                self.put_trusted_key(key)?;
+            }
+            for (key, rule) in &new_rules {
+                self.put_rule_key(key, rule)?;
+            }
+            for (key, prefix) in &new_geo_prefixes {
+                self.put_geo_key(key, prefix)?;
+            }
+            for (key, country) in &new_country_rules {
+                self.put_country_key(*key, country)?;
             }
             self.remove_stale_policy_keys(
                 &new_rule_ids,
@@ -950,12 +1061,6 @@ mod linux {
                 &new_custom_rate_ids,
                 &new_temp_ban_ids,
             )?;
-            self.rule_keys = new_rule_keys;
-            self.geo_keys = new_geo_keys;
-            self.trusted_keys = new_trusted_keys;
-            self.country_keys = new_country_keys;
-            self.custom_rate_keys = new_custom_rate_keys;
-            self.temp_ban_keys = new_temp_ban_keys;
             Ok(())
         }
 
@@ -1003,7 +1108,7 @@ mod linux {
             Ok(())
         }
 
-        fn validate_policy_capacity(&self, policy: &CompiledPolicy) -> Result<()> {
+        fn required_policy_map_sizes(&self, policy: &CompiledPolicy) -> Result<XdpMapSizes> {
             let rule_entries = policy
                 .rules
                 .len()
@@ -1016,33 +1121,71 @@ mod linux {
                 .collect::<HashSet<_>>()
                 .len();
 
-            ensure_capacity("rule_cidrs", rule_entries, self.map_sizes.rule_entries)?;
-            ensure_capacity(
-                "trusted_cidrs",
-                policy.trusted_prefixes.len(),
-                self.map_sizes.trusted_entries,
+            Ok(XdpMapSizes {
+                rule_entries: usize_to_u32("rule_cidrs", rule_entries)?,
+                geo_entries: usize_to_u32("geo_cidrs", policy.geo_prefixes.len())?,
+                trusted_entries: usize_to_u32("trusted_cidrs", policy.trusted_prefixes.len())?,
+                country_entries: usize_to_u32("country_rules", country_entries)?,
+                rate_entries: self.map_sizes.rate_entries,
+                custom_rate_limit_entries: usize_to_u32(
+                    "custom_rate_limits",
+                    policy.dynamic_rate_limits.len(),
+                )?,
+                temp_ban_entries: usize_to_u32("temp_bans", policy.temp_bans.len())?,
+            })
+        }
+
+        fn resize_maps(&mut self, resized: XdpMapSizes, required: XdpMapSizes) -> Result<()> {
+            warn!(
+                interface = %self.interface,
+                program = %self.program_name,
+                old_rule_entries = self.map_sizes.rule_entries,
+                new_rule_entries = resized.rule_entries,
+                required_rule_entries = required.rule_entries,
+                old_geo_entries = self.map_sizes.geo_entries,
+                new_geo_entries = resized.geo_entries,
+                required_geo_entries = required.geo_entries,
+                old_trusted_entries = self.map_sizes.trusted_entries,
+                new_trusted_entries = resized.trusted_entries,
+                required_trusted_entries = required.trusted_entries,
+                old_country_entries = self.map_sizes.country_entries,
+                new_country_entries = resized.country_entries,
+                required_country_entries = required.country_entries,
+                old_custom_rate_limit_entries = self.map_sizes.custom_rate_limit_entries,
+                new_custom_rate_limit_entries = resized.custom_rate_limit_entries,
+                required_custom_rate_limit_entries = required.custom_rate_limit_entries,
+                old_temp_ban_entries = self.map_sizes.temp_ban_entries,
+                new_temp_ban_entries = resized.temp_ban_entries,
+                required_temp_ban_entries = required.temp_ban_entries,
+                "resizing XDP maps because policy exceeds current map capacity; XDP enforcement will be briefly reloaded"
+            );
+            self.detach_and_remove_pinned_maps_for_resize()?;
+            let replacement = Self::attach(
+                &self.interface,
+                &self.object_path,
+                &self.program_name,
+                resized,
+                self.attach_options.clone(),
             )?;
-            ensure_capacity(
-                "geo_cidrs",
-                policy.geo_prefixes.len(),
-                self.map_sizes.geo_entries,
-            )?;
-            ensure_capacity(
-                "country_rules",
-                country_entries,
-                self.map_sizes.country_entries,
-            )?;
-            ensure_capacity(
-                "custom_rate_limits",
-                policy.dynamic_rate_limits.len(),
-                self.map_sizes.custom_rate_limit_entries,
-            )?;
-            ensure_capacity(
-                "temp_bans",
-                policy.temp_bans.len(),
-                self.map_sizes.temp_ban_entries,
-            )?;
+            *self = replacement;
             Ok(())
+        }
+
+        fn detach_and_remove_pinned_maps_for_resize(&mut self) -> Result<()> {
+            match self.attach_options.strategy {
+                XdpAttachStrategy::Direct => {
+                    drop(self._direct_netlink_link.take());
+                }
+                XdpAttachStrategy::Dispatcher => {
+                    unload_dispatcher_programs_by_name(
+                        &self.attach_options.loader_path,
+                        &self.interface,
+                        &self.program_name,
+                        true,
+                    )?;
+                }
+            }
+            remove_map_pin_dir(&self.interface)
         }
 
         fn put_trusted_key(&mut self, key: &TrustedKey) -> Result<()> {
@@ -1137,32 +1280,62 @@ mod linux {
             new_custom_rate_ids: &HashSet<(u8, u16)>,
             new_temp_ban_ids: &HashSet<(u8, u8, u16, [u8; 16])>,
         ) -> Result<()> {
-            for key in self.rule_keys.drain(..) {
+            let rule_keys = self
+                .rule_cidrs
+                .keys()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("failed to list rule_cidrs keys")?;
+            for key in rule_keys {
                 if !new_rule_ids.contains(&rule_key_id(&key)) {
                     self.rule_cidrs.remove(&key)?;
                 }
             }
-            for key in self.geo_keys.drain(..) {
+            let geo_keys = self
+                .geo_cidrs
+                .keys()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("failed to list geo_cidrs keys")?;
+            for key in geo_keys {
                 if !new_geo_ids.contains(&geo_key_id(&key)) {
                     self.geo_cidrs.remove(&key)?;
                 }
             }
-            for key in self.trusted_keys.drain(..) {
+            let trusted_keys = self
+                .trusted_cidrs
+                .keys()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("failed to list trusted_cidrs keys")?;
+            for key in trusted_keys {
                 if !new_trusted_ids.contains(&trusted_key_id(&key)) {
                     self.trusted_cidrs.remove(&key)?;
                 }
             }
-            for key in self.country_keys.drain(..) {
+            let country_keys = self
+                .country_rules
+                .keys()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("failed to list country_rules keys")?;
+            for key in country_keys {
                 if !new_country_ids.contains(&key) {
                     self.country_rules.remove(&key)?;
                 }
             }
-            for key in self.custom_rate_keys.drain(..) {
+            let custom_rate_keys = self
+                .custom_rate_limits
+                .keys()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("failed to list custom_rate_limits keys")?;
+            for key in custom_rate_keys {
                 if !new_custom_rate_ids.contains(&custom_rate_key_id(&key)) {
                     self.custom_rate_limits.remove(&key)?;
                 }
             }
-            for key in self.temp_ban_keys.drain(..) {
+            let temp_ban_keys = self
+                .temp_bans
+                .keys()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("failed to list temp_bans keys")?;
+            for key in temp_ban_keys {
                 if !new_temp_ban_ids.contains(&temp_ban_key_id(&key)) {
                     self.temp_bans.remove(&key)?;
                 }
@@ -2448,13 +2621,6 @@ mod linux {
         bytes
     }
 
-    fn ensure_capacity(map: &str, needed: usize, configured: u32) -> Result<()> {
-        if needed > configured as usize {
-            bail!("{map} needs {needed} entries but map capacity is {configured}");
-        }
-        Ok(())
-    }
-
     fn monotonic_now_ns() -> Result<u64> {
         let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
         let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, ts.as_mut_ptr()) };
@@ -2485,5 +2651,60 @@ mod tests {
         for value in ["", " ", ".", ".."] {
             assert!(sanitize_pin_component(value).is_err());
         }
+    }
+
+    #[test]
+    fn resized_map_sizes_doubles_and_rounds_changed_maps() {
+        let current = XdpMapSizes {
+            rule_entries: 4,
+            geo_entries: 8,
+            trusted_entries: 16,
+            country_entries: 676,
+            rate_entries: 1024,
+            custom_rate_limit_entries: 32,
+            temp_ban_entries: 64,
+        };
+        let required = XdpMapSizes {
+            rule_entries: 5,
+            geo_entries: 8,
+            trusted_entries: 40,
+            country_entries: 677,
+            rate_entries: 999_999,
+            custom_rate_limit_entries: 100,
+            temp_ban_entries: 64,
+        };
+
+        let resized = resized_map_sizes(current, required).unwrap().unwrap();
+        assert_eq!(resized.rule_entries, 8);
+        assert_eq!(resized.geo_entries, 8);
+        assert_eq!(resized.trusted_entries, 64);
+        assert_eq!(resized.country_entries, 2048);
+        assert_eq!(resized.rate_entries, 1024);
+        assert_eq!(resized.custom_rate_limit_entries, 128);
+        assert_eq!(resized.temp_ban_entries, 64);
+    }
+
+    #[test]
+    fn resized_map_sizes_returns_none_when_current_capacity_is_enough() {
+        let current = XdpMapSizes::default();
+        let mut required = current;
+        required.rate_entries = 1;
+
+        assert_eq!(resized_map_sizes(current, required).unwrap(), None);
+    }
+
+    #[test]
+    fn validate_map_capacity_reports_capacity_shortfall() {
+        let current = XdpMapSizes {
+            rule_entries: 1,
+            ..XdpMapSizes::default()
+        };
+        let required = XdpMapSizes {
+            rule_entries: 2,
+            ..current
+        };
+
+        let err = validate_map_capacity(required, current).unwrap_err();
+        assert!(err.to_string().contains("rule_cidrs needs 2 entries"));
     }
 }

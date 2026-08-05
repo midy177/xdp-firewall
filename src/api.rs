@@ -1417,7 +1417,7 @@ async fn delete_threat_sources_batch(
         .exec(&txn)
         .await?;
     ensure_all_ids_deleted(deleted.rows_affected, ids.len(), "threat source not found")?;
-    delete_threat_source_states_by_name(&txn, names.into_iter()).await?;
+    delete_threat_source_states_by_name(&txn, names).await?;
     let version =
         db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
     txn.commit().await?;

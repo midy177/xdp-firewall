@@ -154,12 +154,12 @@
   - `ipsum`
   - `spamhaus-drop`
   - `voipbl`
-- Added `voipbl` threat source format support for CIDR-line feeds such as `http://www.voipbl.org/update/`.
+- Added `voipbl` threat source format support for CIDR-line feeds such as `https://voipbl.org/update/`.
 - Added threat source safety checks:
   - no URL credentials
   - allowed hosts
   - timeout
-  - no redirects
+  - limited redirects to allowed hosts
   - response size limit
 - Added redaction for node error messages exposed through the API.
 - Fixed BPF rule lookup so `protocol=any` with a specific port can match.
@@ -167,6 +167,7 @@
 - Added IPv4 IHL lower-bound validation.
 - Added validation for non-negative numeric API fields.
 - Added policy apply capacity checks for configured map sizes.
+- Added default-enabled XDP map auto-resize for policy maps when current pinned-map capacity is too small.
 - Added BPF `defense_policy` array map for global dynamic defense config.
 - Added BPF rate bucket key separation for global ip/flood buckets.
 - Added BPF flood drop stat index.
