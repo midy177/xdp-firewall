@@ -153,6 +153,8 @@
 - Added built-in threat intelligence sources matching the sigproxy defaults:
   - `ipsum`
   - `spamhaus-drop`
+  - `voipbl`
+- Added `voipbl` threat source format support for CIDR-line feeds such as `https://voipbl.org/update/?wc[]=CA&dm=bl`.
 - Added threat source safety checks:
   - no URL credentials
   - allowed hosts

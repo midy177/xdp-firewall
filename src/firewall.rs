@@ -11,7 +11,10 @@ use sea_orm::{
     sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, net::IpAddr};
+use std::{
+    collections::HashSet,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
 use tracing::info;
 
 pub const DEFAULT_POLICY_NAME: &str = "edge";
@@ -152,7 +155,7 @@ pub struct XdpTrustedPrefix {
     pub prefix: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XdpPrefixRule {
     pub addr: IpAddr,
     pub prefix: u8,
@@ -161,6 +164,7 @@ pub struct XdpPrefixRule {
     pub protocol: L4Protocol,
     pub port: u16,
     pub source: XdpRuleSource,
+    pub threat_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,15 +338,26 @@ pub async fn ensure_builtin_policy(db: &DatabaseConnection, policy_name: &str) -
         .await?
         .is_some()
     {
+        let inserted = insert_builtin_threat_sources(db, policy_name).await?;
+        if inserted > 0 {
+            let version = crate::db::next_policy_version(db, policy_name).await?;
+            info!(
+                policy = %policy_name,
+                version,
+                inserted_builtin_threat_sources = inserted,
+                "added missing built-in threat intelligence sources"
+            );
+        }
         return Ok(());
     }
 
     insert_default_dynamic_defense(db, policy_name).await?;
-    insert_builtin_threat_sources(db, policy_name).await?;
+    let inserted = insert_builtin_threat_sources(db, policy_name).await?;
     let version = crate::db::next_policy_version(db, policy_name).await?;
     info!(
         policy = %policy_name,
         version,
+        inserted_builtin_threat_sources = inserted,
         "initialized policy with built-in threat intelligence"
     );
     Ok(())
@@ -368,7 +383,7 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let threat_prefixes = threat::fetch_threat_prefixes(&snapshot.threat_sources)
+    let threat_prefixes = threat::fetch_named_threat_prefixes(&snapshot.threat_sources)
         .await?
         .into_iter()
         .map(|prefix| XdpPrefixRule {
@@ -379,6 +394,7 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
             protocol: L4Protocol::Any,
             port: 0,
             source: XdpRuleSource::ThreatIntel,
+            threat_source: Some(prefix.source_name),
         })
         .collect();
     let trusted_prefixes = snapshot
@@ -408,6 +424,7 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
                 protocol: rule.protocol,
                 port: rule.port.unwrap_or(0),
                 source: XdpRuleSource::FirewallRule,
+                threat_source: None,
             }
         })
         .collect();
@@ -467,6 +484,95 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
         geo_prefixes,
         threat_prefixes,
     })
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ThreatSourceMatcher {
+    v4: Vec<ThreatSourcePrefixV4>,
+    v6: Vec<ThreatSourcePrefixV6>,
+}
+
+#[derive(Debug, Clone)]
+struct ThreatSourcePrefixV4 {
+    network: u32,
+    prefix: u8,
+    source_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct ThreatSourcePrefixV6 {
+    network: u128,
+    prefix: u8,
+    source_name: String,
+}
+
+impl ThreatSourceMatcher {
+    pub fn from_policy(policy: &CompiledPolicy) -> Self {
+        let mut matcher = Self::default();
+        for prefix in &policy.threat_prefixes {
+            let Some(source_name) = prefix.threat_source.clone() else {
+                continue;
+            };
+            match prefix.addr {
+                IpAddr::V4(addr) => matcher.v4.push(ThreatSourcePrefixV4 {
+                    network: ipv4_network(addr, prefix.prefix),
+                    prefix: prefix.prefix,
+                    source_name,
+                }),
+                IpAddr::V6(addr) => matcher.v6.push(ThreatSourcePrefixV6 {
+                    network: ipv6_network(addr, prefix.prefix),
+                    prefix: prefix.prefix,
+                    source_name,
+                }),
+            }
+        }
+        matcher
+            .v4
+            .sort_by(|left, right| right.prefix.cmp(&left.prefix));
+        matcher
+            .v6
+            .sort_by(|left, right| right.prefix.cmp(&left.prefix));
+        matcher
+    }
+
+    pub fn source_for(&self, addr: IpAddr) -> Option<&str> {
+        match addr {
+            IpAddr::V4(addr) => self
+                .v4
+                .iter()
+                .find(|prefix| ipv4_network(addr, prefix.prefix) == prefix.network)
+                .map(|prefix| prefix.source_name.as_str()),
+            IpAddr::V6(addr) => self
+                .v6
+                .iter()
+                .find(|prefix| ipv6_network(addr, prefix.prefix) == prefix.network)
+                .map(|prefix| prefix.source_name.as_str()),
+        }
+    }
+}
+
+fn ipv4_network(addr: Ipv4Addr, prefix: u8) -> u32 {
+    u32::from(addr) & ipv4_mask(prefix)
+}
+
+fn ipv4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    }
+}
+
+fn ipv6_network(addr: Ipv6Addr, prefix: u8) -> u128 {
+    u128::from(addr) & ipv6_mask(prefix)
+}
+
+fn ipv6_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - u32::from(prefix))
+    }
 }
 
 pub async fn seed_example_policy(db: &DatabaseConnection, args: SeedExampleArgs) -> Result<()> {
@@ -865,9 +971,20 @@ fn require_positive_dynamic_value(name: &str, value: Option<u32>) -> Result<()> 
     }
 }
 
-async fn insert_builtin_threat_sources(db: &DatabaseConnection, policy_name: &str) -> Result<()> {
+async fn insert_builtin_threat_sources(db: &DatabaseConnection, policy_name: &str) -> Result<u64> {
     let now = chrono::Utc::now().naive_utc();
+    let existing_names = threat_source::Entity::find()
+        .filter(threat_source::Column::PolicyName.eq(policy_name))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|source| source.name)
+        .collect::<HashSet<_>>();
+    let mut inserted = 0_u64;
     for source in threat::BUILTIN_THREAT_SOURCES {
+        if existing_names.contains(source.name) {
+            continue;
+        }
         let model = threat_source::ActiveModel {
             policy_name: Set(policy_name.to_string()),
             enabled: Set(true),
@@ -889,8 +1006,9 @@ async fn insert_builtin_threat_sources(db: &DatabaseConnection, policy_name: &st
             )
             .exec_without_returning(db)
             .await?;
+        inserted += 1;
     }
-    Ok(())
+    Ok(inserted)
 }
 
 fn parse_action(value: &str) -> Result<RuleAction> {
@@ -972,6 +1090,118 @@ mod tests {
         };
 
         assert!(validate_dynamic_rate_limit_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn threat_source_matcher_uses_longest_prefix() {
+        let policy = CompiledPolicy {
+            version: 1,
+            trusted_prefixes: Vec::new(),
+            rules: Vec::new(),
+            country_rules: Vec::new(),
+            temp_bans: Vec::new(),
+            dynamic_defense: XdpDynamicDefense::default(),
+            dynamic_rate_limits: Vec::new(),
+            geo_prefixes: Vec::new(),
+            threat_prefixes: vec![
+                XdpPrefixRule {
+                    addr: "203.0.113.0".parse().unwrap(),
+                    prefix: 24,
+                    priority: i32::MIN,
+                    action: RuleAction::Deny,
+                    protocol: L4Protocol::Any,
+                    port: 0,
+                    source: XdpRuleSource::ThreatIntel,
+                    threat_source: Some("broad-feed".to_string()),
+                },
+                XdpPrefixRule {
+                    addr: "203.0.113.128".parse().unwrap(),
+                    prefix: 25,
+                    priority: i32::MIN,
+                    action: RuleAction::Deny,
+                    protocol: L4Protocol::Any,
+                    port: 0,
+                    source: XdpRuleSource::ThreatIntel,
+                    threat_source: Some("specific-feed".to_string()),
+                },
+            ],
+        };
+
+        let matcher = ThreatSourceMatcher::from_policy(&policy);
+        assert_eq!(
+            matcher.source_for("203.0.113.200".parse().unwrap()),
+            Some("specific-feed")
+        );
+        assert_eq!(
+            matcher.source_for("203.0.113.20".parse().unwrap()),
+            Some("broad-feed")
+        );
+        assert_eq!(matcher.source_for("198.51.100.1".parse().unwrap()), None);
+    }
+
+    #[tokio::test]
+    async fn ensure_builtin_policy_adds_missing_builtin_sources_for_existing_policy() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.sqlx_logging(false);
+        let db = Database::connect(options).await.unwrap();
+        crate::db::migrate(&db).await.unwrap();
+        let now = chrono::Utc::now().naive_utc();
+
+        policy_version::ActiveModel {
+            policy_name: Set(DEFAULT_POLICY_NAME.to_string()),
+            version: Set(7),
+            updated_at: Set(now),
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        for source in &threat::BUILTIN_THREAT_SOURCES[..2] {
+            threat_source::ActiveModel {
+                policy_name: Set(DEFAULT_POLICY_NAME.to_string()),
+                enabled: Set(true),
+                name: Set(source.name.to_string()),
+                url: Set(source.url.to_string()),
+                format: Set(source.format.to_string()),
+                min_score: Set(source.min_score),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+
+        ensure_builtin_policy(&db, DEFAULT_POLICY_NAME)
+            .await
+            .unwrap();
+
+        let sources = threat_source::Entity::find()
+            .filter(threat_source::Column::PolicyName.eq(DEFAULT_POLICY_NAME))
+            .all(&db)
+            .await
+            .unwrap();
+        assert_eq!(sources.len(), threat::BUILTIN_THREAT_SOURCES.len());
+        assert!(sources.iter().any(|source| source.name == "voipbl"));
+
+        let version = policy_version::Entity::find_by_id(DEFAULT_POLICY_NAME.to_string())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .version;
+        assert_eq!(version, 8);
+
+        ensure_builtin_policy(&db, DEFAULT_POLICY_NAME)
+            .await
+            .unwrap();
+        let version = policy_version::Entity::find_by_id(DEFAULT_POLICY_NAME.to_string())
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .version;
+        assert_eq!(version, 8);
     }
 
     #[test]

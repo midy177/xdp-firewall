@@ -2580,8 +2580,9 @@ fn normalize_threat_format(value: &str) -> Result<String> {
         "cidr" => Ok("cidr".to_string()),
         "ips" => Ok("ips".to_string()),
         "ipsum" => Ok("ipsum".to_string()),
+        "voipbl" | "voipbl_cidr" | "voipbl-cidr" => Ok("voipbl".to_string()),
         "spamhaus_drop" | "spamhaus-drop" => Ok("spamhaus_drop".to_string()),
-        _ => bail!("threat format must be cidr, ips, ipsum, or spamhaus_drop"),
+        _ => bail!("threat format must be cidr, ips, ipsum, voipbl, or spamhaus_drop"),
     }
 }
 

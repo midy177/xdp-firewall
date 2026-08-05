@@ -3,8 +3,12 @@ use crate::{firewall, monitor, xdp, xds};
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use std::net::IpAddr;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use tokio::time::{Duration, interval};
 use tracing::{debug, error, info, warn};
+
+type SharedThreatMatcher = Arc<RwLock<firewall::ThreatSourceMatcher>>;
 
 pub async fn sync_once(args: SyncOnceArgs) -> Result<()> {
     let node_id = resolve_node_id(args.node_id.as_deref())?;
@@ -41,14 +45,20 @@ pub async fn sync_once(args: SyncOnceArgs) -> Result<()> {
     let applied = apply_latest(&mut xdp, snapshot, &args.control_url, version).await?;
     let (status, error) = sync_once_status();
     client
-        .report_heartbeat(&node_id, &interface, applied, status, error.as_deref())
+        .report_heartbeat(
+            &node_id,
+            &interface,
+            applied.version,
+            status,
+            error.as_deref(),
+        )
         .await?;
     info!(
         node_id = %node_id,
         policy,
         interface = %interface,
         xds_version = version,
-        version = applied,
+        version = applied.version,
         "policy synced once"
     );
     Ok(())
@@ -105,6 +115,7 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
         .report_heartbeat(&node_id, &interface, 0, "starting", None)
         .await?;
     let mut drop_monitor: Option<tokio::task::JoinHandle<()>> = None;
+    let threat_matcher = Arc::new(RwLock::new(firewall::ThreatSourceMatcher::default()));
 
     loop {
         let mut stream = match client
@@ -159,6 +170,7 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
                             reconcile_drop_monitor(
                                 &mut xdp,
                                 &mut drop_monitor,
+                                threat_matcher.clone(),
                                 drop_monitor_enabled,
                                 &args,
                                 &node_id,
@@ -167,7 +179,8 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
                             if let Some(snapshot) = snapshot {
                                 match apply_latest(&mut xdp, snapshot, &args.control_url, version).await {
                                     Ok(applied) => {
-                                        applied_version = applied;
+                                        applied_version = applied.version;
+                                        *threat_matcher.write().await = applied.threat_matcher;
                                         log_xdp_stats(&xdp);
                                         client.report_heartbeat(&node_id, &interface, applied_version, "ok", None).await?;
                                     }
@@ -217,6 +230,7 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
 fn reconcile_drop_monitor(
     xdp: &mut xdp::XdpManager,
     handle: &mut Option<tokio::task::JoinHandle<()>>,
+    threat_matcher: SharedThreatMatcher,
     enabled: bool,
     args: &AgentArgs,
     node_id: &str,
@@ -262,7 +276,12 @@ fn reconcile_drop_monitor(
                             }
                         };
                         if let Err(err) = client
-                            .report_drop_events(node_id.clone(), interface.clone(), events)
+                            .report_drop_events(
+                                node_id.clone(),
+                                interface.clone(),
+                                events,
+                                threat_matcher.clone(),
+                            )
                             .await
                         {
                             error!(error = %err, "failed to report xDS drop events; reconnecting");
@@ -410,12 +429,13 @@ async fn apply_latest(
     mut snapshot: firewall::PolicySnapshot,
     control_url: &str,
     expected_version: i64,
-) -> Result<i64> {
+) -> Result<AppliedPolicy> {
     let policy = firewall::DEFAULT_POLICY_NAME;
     add_control_plane_trusted_cidrs(&mut snapshot, control_url)?;
     log_policy_snapshot_summary(policy, expected_version, &snapshot);
     let compiled = firewall::compile_policy(&snapshot).await?;
     log_compiled_policy_summary(policy, expected_version, &compiled);
+    let threat_matcher = firewall::ThreatSourceMatcher::from_policy(&compiled);
     xdp.apply(&compiled)?;
     info!(
         policy,
@@ -423,7 +443,15 @@ async fn apply_latest(
         applied_version = compiled.version,
         "applied firewall policy"
     );
-    Ok(compiled.version)
+    Ok(AppliedPolicy {
+        version: compiled.version,
+        threat_matcher,
+    })
+}
+
+struct AppliedPolicy {
+    version: i64,
+    threat_matcher: firewall::ThreatSourceMatcher,
 }
 
 fn log_policy_snapshot_summary(

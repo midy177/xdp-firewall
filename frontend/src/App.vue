@@ -458,6 +458,7 @@
               <option value="cidr">cidr</option>
               <option value="ips">ips</option>
               <option value="ipsum">ipsum</option>
+              <option value="voipbl">voipbl</option>
               <option value="spamhaus_drop">spamhaus_drop</option>
             </Select>
           </label>
@@ -483,6 +484,7 @@
               <option value="cidr">cidr</option>
               <option value="ips">ips</option>
               <option value="ipsum">ipsum</option>
+              <option value="voipbl">voipbl</option>
               <option value="spamhaus_drop">spamhaus_drop</option>
             </Select>
           </label>
@@ -885,7 +887,7 @@
             <tr v-for="event in filteredDropEvents" :key="event.local_id">
               <td>{{ formatLocalTime(event.time) }}</td>
               <td class="clip">{{ event.node_id }}</td>
-              <td><Badge :tone="dropReasonTone(event.reason)">{{ dropReasonLabel(event.reason) }}</Badge></td>
+              <td><Badge :tone="dropReasonTone(event.reason)">{{ dropReasonDisplay(event) }}</Badge></td>
               <td>{{ event.src }}</td>
               <td>{{ event.proto }}</td>
               <td>{{ event.dport || '*' }}</td>
@@ -1016,7 +1018,7 @@ type DynamicDefense = {
   flood_block_seconds?: number | null;
 };
 type NodeState = { node_id: string; interface_name: string; last_applied_version: number; status: string; last_seen_at: string; error?: string };
-type DropEvent = { local_id: number; node_id: string; interface_name: string; time: string; event_time_ns: number; cpu: number; reason: string; src: string; family: number; proto: string; dport: number; country?: string; action: string };
+type DropEvent = { local_id: number; node_id: string; interface_name: string; time: string; event_time_ns: number; cpu: number; reason: string; src: string; family: number; proto: string; dport: number; country?: string; action: string; threat_source?: string };
 type Snapshot = { version: number };
 type Page<T> = { items: T[]; total: number; page: number; page_size: number; total_pages: number };
 type PageState = { page: number; total_pages: number; total: number };
@@ -1114,7 +1116,7 @@ const dynamicDefense = reactive<DynamicDefense>({
 
 const actions = new Set(["allow", "deny"]);
 const protocols = new Set(["any", "tcp", "udp", "icmp"]);
-const threatFormats = new Set(["cidr", "ips", "ipsum", "spamhaus_drop"]);
+const threatFormats = new Set(["cidr", "ips", "ipsum", "voipbl", "spamhaus_drop"]);
 const pageSize = 20;
 const authHeader = "Authorization";
 const apiTokenHeader = "X-API-Token";
@@ -1507,7 +1509,7 @@ const apiDocsZh: ApiDocSection[] = [
   },
   {
     title: "威胁情报",
-    description: "威胁源会被编译为拒绝前缀规则。内置 ipsum 和 spamhaus-drop。",
+    description: "威胁源会被编译为拒绝前缀规则。内置 ipsum、spamhaus-drop 和 voipbl。",
     endpoints: [
       { method: "GET", path: "/threat-sources?page=1&page_size=20&name=test-feed&format=cidr&enabled=true", summary: "分页列出威胁源，可按 name、url、format、enabled、min_score 过滤，条件按 AND 匹配。" },
       { method: "POST", path: "/threat-sources/refresh", summary: "异步刷新启用的威胁源；5 分钟内重复调用直接返回上一次刷新结果。" },
@@ -1721,7 +1723,7 @@ const apiDocsEn: ApiDocSection[] = [
   },
   {
     title: "Threat Intelligence",
-    description: "Threat feeds compile into deny prefix rules. Built-ins include ipsum and spamhaus-drop.",
+    description: "Threat feeds compile into deny prefix rules. Built-ins include ipsum, spamhaus-drop, and voipbl.",
     endpoints: [
       { method: "GET", path: "/threat-sources?page=1&page_size=20&name=test-feed&format=cidr&enabled=true", summary: "List threat sources, optionally filtered by name, url, format, enabled, and min_score with AND semantics." },
       { method: "POST", path: "/threat-sources/refresh", summary: "Start an async refresh for enabled threat feeds; repeated calls within 5 minutes return the previous result." },
@@ -2370,6 +2372,13 @@ function dropReasonLabel(reason: string): string {
     parse_error: "Parse error"
   };
   return (language.value === "zh" ? zh : en)[reason] ?? reason;
+}
+
+function dropReasonDisplay(event: DropEvent): string {
+  if (event.reason === "threat_intel" && event.threat_source) {
+    return `${dropReasonLabel(event.reason)}: ${event.threat_source}`;
+  }
+  return dropReasonLabel(event.reason);
 }
 
 function dropReasonTone(reason: string): "red" | "amber" | "green" | "neutral" {

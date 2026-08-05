@@ -17,7 +17,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataMap;
 use tonic::transport::{Channel, Server};
@@ -123,6 +123,8 @@ pub struct DropEventView {
     pub dport: u32,
     pub country: Option<String>,
     pub action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threat_source: Option<String>,
 }
 
 #[derive(Clone)]
@@ -945,10 +947,18 @@ impl XdsClient {
         node_id: String,
         interface_name: String,
         mut events: monitor::DropEventReader,
+        threat_matcher: Arc<RwLock<firewall::ThreatSourceMatcher>>,
     ) -> Result<()> {
         let (tx, rx) = mpsc::channel(1024);
         let forwarder = tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
+            while let Some(mut event) = events.recv().await {
+                if event.reason == "threat_intel" {
+                    event.threat_source = threat_matcher
+                        .read()
+                        .await
+                        .source_for(event.src)
+                        .map(ToOwned::to_owned);
+                }
                 if tx
                     .send(DropEvent {
                         node_id: node_id.clone(),
@@ -963,6 +973,7 @@ impl XdsClient {
                         dport: u32::from(event.dport),
                         country: event.country.unwrap_or_default(),
                         action: event.action.to_string(),
+                        threat_source: event.threat_source.unwrap_or_default(),
                     })
                     .await
                     .is_err()
@@ -1258,6 +1269,8 @@ impl FirewallXds for XdsService {
                         .ok()
                         .and_then(|ip| geo_lookup.lookup_country(ip))
                 });
+            let threat_source = event.threat_source.trim();
+            let threat_source = (!threat_source.is_empty()).then(|| threat_source.to_string());
             self.drop_events.publish(DropEventView {
                 node_id: event.node_id,
                 interface_name: event.interface_name,
@@ -1271,6 +1284,7 @@ impl FirewallXds for XdsService {
                 dport: event.dport,
                 country,
                 action: event.action,
+                threat_source,
             });
             accepted += 1;
         }

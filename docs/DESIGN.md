@@ -311,6 +311,7 @@ stateDiagram-v2
 
 - `ipsum`
 - `spamhaus-drop`
+- `voipbl`: `https://voipbl.org/update/?wc[]=CA&dm=bl`，按一行一个 IP/CIDR 解析，忽略注释行。
 
 安全约束：
 

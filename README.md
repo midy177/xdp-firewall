@@ -2,7 +2,7 @@
 
 Distributed XDP firewall control plane written in Rust.
 
-Each server runs the same agent. A single firewall policy is stored in SQLite, PostgreSQL, or MySQL with SeaORM. The API control-plane process writes configuration to the database and exposes both the Axum HTTP API/UI and a gRPC xDS stream; agents subscribe to xDS and apply the latest policy to local XDP maps through Aya. SQLite is intended for a single-server deployment; PostgreSQL/MySQL are the distributed configuration source for multiple servers. The policy is initialized with built-in threat intelligence feeds for `ipsum` and `spamhaus-drop`.
+Each server runs the same agent. A single firewall policy is stored in SQLite, PostgreSQL, or MySQL with SeaORM. The API control-plane process writes configuration to the database and exposes both the Axum HTTP API/UI and a gRPC xDS stream; agents subscribe to xDS and apply the latest policy to local XDP maps through Aya. SQLite is intended for a single-server deployment; PostgreSQL/MySQL are the distributed configuration source for multiple servers. The policy is initialized with built-in threat intelligence feeds for `ipsum`, `spamhaus-drop`, and `voipbl`.
 
 ## Quick Start
 
@@ -118,8 +118,9 @@ Built-in threat sources:
 
 - `ipsum`: `https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt`, format `ipsum`, minimum score `3`.
 - `spamhaus-drop`: `https://www.spamhaus.org/drop/drop.txt`, format `spamhaus_drop`.
+- `voipbl`: `https://voipbl.org/update/?wc[]=CA&dm=bl`, format `voipbl`.
 
-Threat feeds are fetched with a timeout, no redirects, and a 16 MiB response limit. Text formats (`cidr`, `ips`, and `ipsum`) are parsed line-by-line from the HTTP response. `spamhaus_drop` keeps the existing JSON-compatible parser and may buffer the response body within the same 16 MiB cap. Only built-in feed hosts are allowed by default; add comma-separated custom hosts with `XDP_FIREWALL_ALLOWED_THREAT_HOSTS` before enabling custom feed URLs.
+Threat feeds are fetched with a timeout, no redirects, and a 16 MiB response limit. Text formats (`cidr`, `ips`, `ipsum`, and `voipbl`) are parsed line-by-line from the HTTP response. `voipbl` ignores comment lines and compiles each IP/CIDR line as a deny prefix rule. `spamhaus_drop` keeps the existing JSON-compatible parser and may buffer the response body within the same 16 MiB cap. Built-in feed hosts are allowed by default; add comma-separated custom hosts with `XDP_FIREWALL_ALLOWED_THREAT_HOSTS` before enabling other custom feed URLs.
 
 The xDS control plane automatically checks enabled threat feeds every 86400 seconds, using the same automatic refresh interval as country IP lists. Each check normalizes the fetched prefixes and compares a stable fingerprint with `firewall_threat_source_states`; the policy version is bumped only when at least one enabled feed changes, so agents refetch and apply the updated threat intelligence without unnecessary policy churn.
 
@@ -322,6 +323,8 @@ Counters:
 These counters show which class is dropping traffic. Use realtime drop events when you need source IP and packet metadata.
 
 The embedded frontend has a realtime Drop page. Press Start to subscribe to all nodes, or select one node to subscribe only to that agent. The API tells agents through xDS to enable Drop monitoring only while a matching frontend subscriber is connected. When the last matching subscriber disconnects, xDS pushes the disabled state and agents stop reading the perf event buffer. The events are kept in memory and are not persisted to the database.
+
+For `threat_intel` drops, agents enrich the event with `threat_source` when the source IP matches a compiled threat feed prefix, so the frontend can show the feed name next to the drop reason.
 
 The HTTP stream also supports node filtering directly:
 
