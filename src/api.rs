@@ -159,6 +159,7 @@ struct PaginationQuery {
 struct RuleQuery {
     page: Option<u64>,
     page_size: Option<u64>,
+    rule_key: Option<String>,
     action: Option<String>,
     cidr: Option<String>,
     protocol: Option<String>,
@@ -168,11 +169,12 @@ struct RuleQuery {
 
 #[derive(Debug, Deserialize)]
 struct RuleMatchQuery {
-    action: String,
-    cidr: String,
-    protocol: String,
-    port: i32,
-    priority: i32,
+    rule_key: Option<String>,
+    action: Option<String>,
+    cidr: Option<String>,
+    protocol: Option<String>,
+    port: Option<i32>,
+    priority: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,6 +297,7 @@ struct NodeResponse {
 
 #[derive(Debug, Deserialize)]
 struct CreateRuleRequest {
+    rule_key: Option<String>,
     enabled: Option<bool>,
     priority: i32,
     action: String,
@@ -711,7 +714,10 @@ async fn create_rule(
     State(state): State<ApiState>,
     Json(request): Json<CreateRuleRequest>,
 ) -> ApiResult<(StatusCode, Json<Versioned<firewall_rule::Model>>)> {
-    let row = rule_active_model(request)?.insert(&state.db).await?;
+    let row = rule_active_model(request)?
+        .insert(&state.db)
+        .await
+        .map_err(rule_insert_error)?;
     let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
     Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
 }
@@ -729,7 +735,7 @@ async fn create_rules(
     let txn = state.db.begin().await?;
     let mut rows = Vec::with_capacity(models.len());
     for model in models {
-        rows.push(model.insert(&txn).await?);
+        rows.push(model.insert(&txn).await.map_err(rule_insert_error)?);
     }
     let version =
         db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
@@ -745,6 +751,7 @@ async fn create_rules(
 
 fn rule_active_model(request: CreateRuleRequest) -> ApiResult<firewall_rule::ActiveModel> {
     validate_action(&request.action)?;
+    let rule_key = normalize_rule_key(request.rule_key)?;
     let cidr = normalize_cidr(&request.cidr)?;
     let protocol = request
         .protocol
@@ -754,6 +761,7 @@ fn rule_active_model(request: CreateRuleRequest) -> ApiResult<firewall_rule::Act
     let port = validate_port(protocol.as_deref(), request.port)?;
     Ok(firewall_rule::ActiveModel {
         policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+        rule_key: Set(rule_key),
         enabled: Set(request.enabled.unwrap_or(true)),
         priority: Set(request.priority),
         action: Set(normalize_action(&request.action)?),
@@ -2182,6 +2190,9 @@ impl RuleQuery {
         if let Some(action) = self.action.as_deref() {
             select = select.filter(firewall_rule::Column::Action.eq(normalize_action(action)?));
         }
+        if let Some(rule_key) = normalize_rule_key(self.rule_key)? {
+            select = select.filter(firewall_rule::Column::RuleKey.eq(rule_key));
+        }
         if let Some(cidr) = self.cidr.as_deref() {
             select = select.filter(firewall_rule::Column::Cidr.eq(normalize_cidr(cidr)?));
         }
@@ -2212,15 +2223,38 @@ impl RuleMatchQuery {
         self,
         mut delete: sea_orm::DeleteMany<firewall_rule::Entity>,
     ) -> ApiResult<sea_orm::DeleteMany<firewall_rule::Entity>> {
-        let action = normalize_action(&self.action)?;
-        let cidr = normalize_cidr(&self.cidr)?;
-        let protocol = normalize_protocol(&self.protocol)?;
-        let port = validate_port(Some(&protocol), Some(self.port))?
+        delete = delete.filter(firewall_rule::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME));
+
+        if let Some(rule_key) = normalize_rule_key(self.rule_key)? {
+            return Ok(delete.filter(firewall_rule::Column::RuleKey.eq(rule_key)));
+        }
+
+        let priority = self
+            .priority
+            .ok_or_else(|| ApiError::bad_request("rule_key or priority is required"))?;
+        let action = normalize_action(
+            self.action
+                .as_deref()
+                .ok_or_else(|| ApiError::bad_request("rule_key or action is required"))?,
+        )?;
+        let cidr = normalize_cidr(
+            self.cidr
+                .as_deref()
+                .ok_or_else(|| ApiError::bad_request("rule_key or cidr is required"))?,
+        )?;
+        let protocol = normalize_protocol(
+            self.protocol
+                .as_deref()
+                .ok_or_else(|| ApiError::bad_request("rule_key or protocol is required"))?,
+        )?;
+        let port_value = self
+            .port
+            .ok_or_else(|| ApiError::bad_request("rule_key or port is required"))?;
+        let port = validate_port(Some(&protocol), Some(port_value))?
             .expect("required port is always present");
 
         delete = delete
-            .filter(firewall_rule::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
-            .filter(firewall_rule::Column::Priority.eq(self.priority))
+            .filter(firewall_rule::Column::Priority.eq(priority))
             .filter(firewall_rule::Column::Action.eq(action))
             .filter(firewall_rule::Column::Cidr.eq(cidr));
 
@@ -2440,6 +2474,37 @@ fn normalize_cidr(value: &str) -> Result<String> {
         ipnet::IpNet::V4(net) => format!("{}/{}", net.network(), net.prefix_len()),
         ipnet::IpNet::V6(net) => format!("{}/{}", net.network(), net.prefix_len()),
     })
+}
+
+fn normalize_rule_key(value: Option<String>) -> Result<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.len() > 128 {
+        bail!("rule_key must contain at most 128 characters");
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        bail!("rule_key may only contain letters, numbers, '.', '_', '-', and ':'");
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn rule_insert_error(value: sea_orm::DbErr) -> ApiError {
+    let message = value.to_string();
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("rule_key")
+        || normalized.contains("idx_firewall_rules_policy_name_rule_key")
+    {
+        return ApiError::conflict("firewall rule_key already exists");
+    }
+    ApiError::from(value)
 }
 
 fn normalize_ip(value: &str) -> Result<String> {
@@ -2914,6 +2979,78 @@ mod tests {
         )
         .await;
         assert!(range_error.contains("port must be between 1 and 65535"));
+    }
+
+    #[tokio::test]
+    async fn rule_key_is_optional_unique_and_deletable() {
+        let (app, _db) = test_router().await;
+        let created = response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules",
+                json!({
+                    "rule_key": "edge-web-deny",
+                    "priority": 10,
+                    "action": "deny",
+                    "cidr": "203.0.113.0/24",
+                    "protocol": "tcp",
+                    "port": 443
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(created["data"]["rule_key"], "edge-web-deny");
+
+        let duplicate_error = response_error(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules",
+                json!({
+                    "rule_key": "edge-web-deny",
+                    "priority": 20,
+                    "action": "allow",
+                    "cidr": "198.51.100.0/24",
+                    "protocol": "udp",
+                    "port": 53
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(duplicate_error.contains("rule_key already exists"));
+
+        for _ in 0..2 {
+            response_json(
+                send_json(
+                    &app,
+                    Method::POST,
+                    "/rules",
+                    json!({
+                        "priority": 30,
+                        "action": "deny",
+                        "cidr": "192.0.2.0/24",
+                        "protocol": "any",
+                        "port": 80
+                    }),
+                )
+                .await,
+            )
+            .await;
+        }
+
+        let page =
+            response_json(send_empty(&app, Method::GET, "/rules?rule_key=edge-web-deny").await)
+                .await;
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["items"][0]["rule_key"], "edge-web-deny");
+
+        let deleted =
+            response_json(send_empty(&app, Method::DELETE, "/rules?rule_key=edge-web-deny").await)
+                .await;
+        assert_eq!(deleted["data"]["deleted"], 1);
     }
 
     #[tokio::test]

@@ -93,6 +93,10 @@
         </div>
         <div class="form-grid rule-form">
           <label class="field">
+            <span>{{ t("ruleKey") }}</span>
+            <Input v-model="ruleForm.rule_key" aria-label="Rule key" placeholder="edge-web-deny" />
+          </label>
+          <label class="field">
             <span>{{ t("priority") }}</span>
             <Input v-model.number="ruleForm.priority" type="number" aria-label="Priority" />
           </label>
@@ -143,6 +147,10 @@
         </div>
         <div class="form-grid rule-filter-form">
           <label class="field">
+            <span>{{ t("ruleKey") }}</span>
+            <Input v-model="ruleFilters.rule_key" aria-label="Rule key filter" placeholder="edge-web-deny" />
+          </label>
+          <label class="field">
             <span>{{ t("action") }}</span>
             <Select v-model="ruleFilters.action" aria-label="Rule action filter">
               <option value="all">{{ t("allActions") }}</option>
@@ -180,6 +188,7 @@
         <table>
           <thead>
             <tr>
+              <th>{{ t("ruleKey") }}</th>
               <th>{{ t("priority") }}</th>
               <th>{{ t("action") }}</th>
               <th>CIDR</th>
@@ -190,9 +199,10 @@
           </thead>
           <tbody>
             <tr v-if="!loading && rules.length === 0">
-              <td colspan="6" class="empty">{{ t("emptyRules") }}</td>
+              <td colspan="7" class="empty">{{ t("emptyRules") }}</td>
             </tr>
             <tr v-for="rule in rules" :key="rule.id">
+              <td>{{ rule.rule_key ?? "-" }}</td>
               <td>
                 <div class="priority-cell">
                   <span>{{ rule.priority }}</span>
@@ -1002,7 +1012,7 @@ import Button from "./components/ui/Button.vue";
 import Input from "./components/ui/Input.vue";
 import Select from "./components/ui/Select.vue";
 
-type Rule = { id: number; priority: number; action: string; cidr: string; protocol?: string; port?: number };
+type Rule = { id: number; rule_key?: string | null; priority: number; action: string; cidr: string; protocol?: string | null; port?: number | null };
 type GeoCountry = { id: number; country: string; action: string; packets_per_second?: number; burst?: number };
 type ThreatSource = { id: number; name: string; url: string; format: string; min_score?: number };
 type TrustedCidr = { id: number; cidr: string; enabled: boolean; comment?: string };
@@ -1091,8 +1101,8 @@ const dynamicRatePage = reactive<PageState>({ page: 1, total_pages: 0, total: 0 
 const tempBanPage = reactive<PageState>({ page: 1, total_pages: 0, total: 0 });
 const nodePage = reactive<PageState>({ page: 1, total_pages: 0, total: 0 });
 
-const ruleForm = reactive({ priority: 10, action: "deny", cidr: "203.0.113.0/24", protocol: "any", port: "" });
-const ruleFilters = reactive({ action: "all", cidr: "", protocol: "all", port: "", priority: "" });
+const ruleForm = reactive({ rule_key: "", priority: 10, action: "deny", cidr: "203.0.113.0/24", protocol: "any", port: "" });
+const ruleFilters = reactive({ rule_key: "", action: "all", cidr: "", protocol: "all", port: "", priority: "" });
 const geoForm = reactive({ country: "CN", action: "allow" });
 const geoFilters = reactive({ country: "all", action: "all", enabled: "all" });
 const geoLookupForm = reactive({ ip: "8.8.8.8" });
@@ -1195,6 +1205,7 @@ const messages = {
     policy: "策略",
     port: "端口",
     priority: "优先级",
+    ruleKey: "规则键",
     priorityCountries: "国家规则",
     priorityCountriesDetail: "再按国家代码执行允许或拒绝",
     priorityTempBans: "临时封禁",
@@ -1319,6 +1330,7 @@ const messages = {
     policy: "Policy",
     port: "Port",
     priority: "Priority",
+    ruleKey: "Rule key",
     priorityCountries: "Country rules",
     priorityCountriesDetail: "Then apply country-code allow or deny decisions",
     priorityTempBans: "Temporary bans",
@@ -1446,14 +1458,15 @@ const apiDocsZh: ApiDocSection[] = [
     endpoints: [
       {
         method: "GET",
-        path: "/rules?page=1&page_size=20&action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10",
-        summary: "分页列出普通防火墙规则，可按 action、cidr、protocol、port、priority 过滤；过滤条件按 AND 匹配。"
+        path: "/rules?page=1&page_size=20&rule_key=edge-web-deny&action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10",
+        summary: "分页列出普通防火墙规则，可按 rule_key、action、cidr、protocol、port、priority 过滤；过滤条件按 AND 匹配。"
       },
       {
         method: "POST",
         path: "/rules",
         summary: "新增普通规则。",
         body: `{
+  "rule_key": "edge-web-deny",
   "priority": 10,
   "action": "deny",
   "cidr": "203.0.113.0/24",
@@ -1464,7 +1477,7 @@ const apiDocsZh: ApiDocSection[] = [
         curl: `curl -X POST "$BASE/rules" \\
   -H "X-API-Token: $TOKEN" \\
   -H "content-type: application/json" \\
-  -d '{"priority":10,"action":"deny","cidr":"203.0.113.0/24","protocol":"tcp","port":443}'`
+  -d '{"rule_key":"edge-web-deny","priority":10,"action":"deny","cidr":"203.0.113.0/24","protocol":"tcp","port":443}'`
       },
       { method: "POST", path: "/rules/batch", summary: "批量新增普通规则；请求体为 {\"items\":[...]}，每项格式同 POST /rules。" },
       { method: "DELETE", path: "/rules/{id}", summary: "按 id 删除普通规则。" },
@@ -1472,7 +1485,7 @@ const apiDocsZh: ApiDocSection[] = [
       {
         method: "DELETE",
         path: "/rules?action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10",
-        summary: "按 action、cidr、protocol、port、priority 五元组删除普通规则，五个字段都必填并按 AND 匹配。"
+        summary: "按 action、cidr、protocol、port、priority 五元组删除普通规则，五个字段都必填并按 AND 匹配；也可以用 /rules?rule_key=edge-web-deny 按唯一规则键删除。"
       }
     ]
   },
@@ -1672,14 +1685,15 @@ const apiDocsEn: ApiDocSection[] = [
     endpoints: [
       {
         method: "GET",
-        path: "/rules?page=1&page_size=20&action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10",
-        summary: "List firewall rules, optionally filtered by action, cidr, protocol, port, and priority with AND semantics."
+        path: "/rules?page=1&page_size=20&rule_key=edge-web-deny&action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10",
+        summary: "List firewall rules, optionally filtered by rule_key, action, cidr, protocol, port, and priority with AND semantics."
       },
       {
         method: "POST",
         path: "/rules",
         summary: "Create a firewall rule.",
         body: `{
+  "rule_key": "edge-web-deny",
   "priority": 10,
   "action": "deny",
   "cidr": "203.0.113.0/24",
@@ -1690,7 +1704,7 @@ const apiDocsEn: ApiDocSection[] = [
         curl: `curl -X POST "$BASE/rules" \\
   -H "X-API-Token: $TOKEN" \\
   -H "content-type: application/json" \\
-  -d '{"priority":10,"action":"deny","cidr":"203.0.113.0/24","protocol":"tcp","port":443}'`
+  -d '{"rule_key":"edge-web-deny","priority":10,"action":"deny","cidr":"203.0.113.0/24","protocol":"tcp","port":443}'`
       },
       { method: "POST", path: "/rules/batch", summary: "Create firewall rules in one request; body is {\"items\":[...]} and each item matches POST /rules." },
       { method: "DELETE", path: "/rules/{id}", summary: "Delete a firewall rule by id." },
@@ -1698,7 +1712,7 @@ const apiDocsEn: ApiDocSection[] = [
       {
         method: "DELETE",
         path: "/rules?action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10",
-        summary: "Delete firewall rules by action, cidr, protocol, port, and priority; all five fields are required and matched with AND semantics."
+        summary: "Delete firewall rules by action, cidr, protocol, port, and priority; all five fields are required and matched with AND semantics. Use /rules?rule_key=edge-web-deny to delete by unique rule key."
       }
     ]
   },
@@ -2263,6 +2277,9 @@ function pageQuery(page: number): string {
 
 function rulePageQuery(page: number): string {
   const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+  if (ruleFilters.rule_key.trim()) {
+    params.set("rule_key", ruleFilters.rule_key.trim());
+  }
   if (ruleFilters.action !== "all") {
     params.set("action", ruleFilters.action);
   }
@@ -2539,7 +2556,7 @@ async function loadRules(page = rulePage.page) {
 }
 
 const hasRuleFilters = computed(() => {
-  return ruleFilters.action !== "all" || ruleFilters.protocol !== "all" || Boolean(ruleFilters.cidr.trim() || ruleFilters.port.trim() || ruleFilters.priority.trim());
+  return ruleFilters.action !== "all" || ruleFilters.protocol !== "all" || Boolean(ruleFilters.rule_key.trim() || ruleFilters.cidr.trim() || ruleFilters.port.trim() || ruleFilters.priority.trim());
 });
 
 async function queryRules() {
@@ -2547,6 +2564,7 @@ async function queryRules() {
 }
 
 async function clearRuleFilters() {
+  ruleFilters.rule_key = "";
   ruleFilters.action = "all";
   ruleFilters.cidr = "";
   ruleFilters.protocol = "all";
@@ -2934,6 +2952,7 @@ function validateRuleForm() {
     throwValidation(v("icmpPort"));
   }
   return {
+    ...(ruleForm.rule_key.trim() ? { rule_key: ruleForm.rule_key.trim() } : {}),
     priority,
     action,
     cidr,

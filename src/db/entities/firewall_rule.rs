@@ -8,6 +8,7 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub policy_name: String,
+    pub rule_key: Option<String>,
     pub enabled: bool,
     pub priority: i32,
     pub action: String,

@@ -182,7 +182,7 @@ flowchart TB
 持久化表：
 
 - `firewall_policy_versions`：策略版本。
-- `firewall_rules`：普通 CIDR allow/deny 规则。
+- `firewall_rules`：普通 CIDR allow/deny 规则，可选 `rule_key` 作为手动配置的唯一管理键。
 - `firewall_geo_country_policies`：国家 allow/deny 规则。
 - `firewall_geo_country_catalog`：从 IPdeny `/ipblocks/` 页面发现并持久化的国家列表，包含国家短码、完整名称、下载 URL 和上游更新时间。
 - `firewall_geo_ip_list_states`：每个国家 IP 列表的远端更新时间、检查时间和前缀数量。

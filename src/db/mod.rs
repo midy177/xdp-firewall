@@ -96,6 +96,7 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
         schema.create_table_from_entity(entities::firewall_rule::Entity),
     )
     .await?;
+    ensure_firewall_rule_key_column(db).await?;
     create_table(
         db,
         schema.create_table_from_entity(entities::geo_country_policy::Entity),
@@ -144,6 +145,18 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
     create_table(
         db,
         schema.create_table_from_entity(entities::temp_ban::Entity),
+    )
+    .await?;
+    create_index(
+        db,
+        Index::create()
+            .if_not_exists()
+            .name("idx_firewall_rules_policy_name_rule_key")
+            .table(entities::firewall_rule::Entity.table_ref())
+            .col(entities::firewall_rule::Column::PolicyName)
+            .col(entities::firewall_rule::Column::RuleKey)
+            .unique()
+            .to_owned(),
     )
     .await?;
     create_index(
@@ -273,6 +286,49 @@ async fn create_index(
 ) -> Result<()> {
     db.execute(&stmt).await?;
     Ok(())
+}
+
+async fn ensure_firewall_rule_key_column(db: &DatabaseConnection) -> Result<()> {
+    if column_exists(db, "firewall_rules", "rule_key").await? {
+        return Ok(());
+    }
+
+    let backend = db.get_database_backend();
+    let sql = match backend {
+        DbBackend::Postgres => "ALTER TABLE firewall_rules ADD COLUMN rule_key VARCHAR(128)",
+        DbBackend::MySql => "ALTER TABLE firewall_rules ADD COLUMN rule_key VARCHAR(128)",
+        DbBackend::Sqlite => "ALTER TABLE firewall_rules ADD COLUMN rule_key TEXT",
+        _ => bail!("unsupported database backend for firewall rule migration"),
+    };
+    db.execute_raw(raw_sql(backend, sql)).await?;
+    Ok(())
+}
+
+async fn column_exists(db: &DatabaseConnection, table: &str, column: &str) -> Result<bool> {
+    let backend = db.get_database_backend();
+    let sql = match backend {
+        DbBackend::Postgres => format!(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = '{table}' AND column_name = '{column}'"
+        ),
+        DbBackend::MySql => format!(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema = database() AND table_name = '{table}' AND column_name = '{column}'"
+        ),
+        DbBackend::Sqlite => format!("PRAGMA table_info('{table}')"),
+        _ => bail!("unsupported database backend for schema inspection"),
+    };
+
+    if backend != DbBackend::Sqlite {
+        return Ok(db.query_one_raw(raw_sql(backend, sql)).await?.is_some());
+    }
+
+    Ok(db
+        .query_all_raw(raw_sql(backend, sql))
+        .await?
+        .into_iter()
+        .map(|row| row.try_get::<String>("", "name"))
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|name| name == column))
 }
 
 pub async fn next_policy_version(db: &DatabaseConnection, policy_name: &str) -> Result<i64> {

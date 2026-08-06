@@ -35,11 +35,12 @@ Useful endpoints:
 - `GET /policy/version`
 - `POST /policy/seed-example`
 - `POST /policy/bump-version`
-- `GET /rules?page=1&page_size=20&action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10`
+- `GET /rules?page=1&page_size=20&rule_key=edge-web-deny&action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10`
 - `POST /rules`
 - `POST /rules/batch`
 - `DELETE /rules/{id}`
 - `DELETE /rules/batch`
+- `DELETE /rules?rule_key=edge-web-deny`
 - `DELETE /rules?action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10`
 - `GET /geo-countries?page=1&page_size=20&country=CN&action=deny&enabled=true`
 - `POST /geo-countries`
@@ -86,7 +87,7 @@ Example:
 curl -X POST http://127.0.0.1:8080/rules \
   -H "authorization: Bearer $XDP_FIREWALL_API_TOKEN" \
   -H 'content-type: application/json' \
-  -d '{"priority":10,"action":"deny","cidr":"203.0.113.0/24","protocol":"any"}'
+  -d '{"rule_key":"edge-web-deny","priority":10,"action":"deny","cidr":"203.0.113.0/24","protocol":"any"}'
 ```
 
 Every mutating endpoint that immediately changes the active firewall policy increments the policy version so the xDS control plane can push a fresh snapshot to running agents. Creating threat-intelligence sources is materialized by an asynchronous refresh; the policy version is incremented after the refreshed prefixes are persisted.
@@ -97,7 +98,7 @@ Batch create endpoints use `{"items":[...]}` and accept the same item shape as t
 
 Most write endpoints return `{"version":...,"data":...}`. `POST /policy/seed-example` returns the policy snapshot directly. Error responses use `{"error":"..."}`. `enabled` defaults to `true` for configuration resources when omitted. `action` accepts `allow` and `deny`; `drop` is accepted and normalized to `deny`. `protocol` accepts `any`, `tcp`, `udp`, and `icmp`; `port` must be 1-65535 and cannot be set for `icmp`.
 
-`GET /rules` supports optional filters for `action`, `cidr`, `protocol`, `port`, and `priority`; omit all filters to page through all rules. Filters are combined with AND semantics. `DELETE /rules` deletes by the complete rule tuple and requires all five fields: `action`, `cidr`, `protocol`, `port`, and `priority`. Use `DELETE /rules/{id}` for rules that do not have a stored port. `protocol=any` also matches older rules whose protocol field is unset.
+`GET /rules` supports optional filters for `rule_key`, `action`, `cidr`, `protocol`, `port`, and `priority`; omit all filters to page through all rules. Filters are combined with AND semantics. `rule_key` is optional on create; when present it must be unique within the policy and duplicate creates return a conflict instead of updating the existing rule. `DELETE /rules` deletes by `rule_key` when supplied, otherwise by the complete rule tuple and requires all five fields: `action`, `cidr`, `protocol`, `port`, and `priority`. Use `DELETE /rules/{id}` for rules that do not have a `rule_key` or stored port. `protocol=any` also matches older rules whose protocol field is unset.
 
 `GET /geo-countries`, `GET /temp-bans`, `GET /threat-sources`, `GET /dynamic-rate-limits`, and `GET /trusted-cidrs` also support optional field filters combined with AND semantics. Temporary bans support `ip`, `protocol`, and `port` filters and should still be deleted by ID. Their collection DELETE endpoints require the identifying fields: country rules require `country`, `action`, and `enabled`; threat sources require the unique `name`; dynamic rate limits require `enabled`, `priority`, `protocol`, `port`, `packets_per_second`, and `burst`; trusted CIDRs require the unique `cidr`. Use the existing ID DELETE endpoints for configurations whose identifying fields are not stable or unique. Dynamic rate limits without a stored port must also be deleted by ID.
 
@@ -120,7 +121,7 @@ The frontend source is Vue 3. `frontend/package.json` aliases Vite to Rolldown V
 ## Data Model
 
 - `firewall_policy_versions`: monotonically increasing version for the single firewall policy.
-- `firewall_rules`: static allow/deny CIDR rules, optional protocol and port match.
+- `firewall_rules`: static allow/deny CIDR rules, optional unique `rule_key`, protocol, and port match.
 - `firewall_geo_country_policies`: per-country allow/deny policy.
 - `firewall_temp_bans`: temporary source-IP bans with optional protocol and destination-port match.
 - `firewall_dynamic_defense`: global `ip_rate_limit` and `flood` policy.
