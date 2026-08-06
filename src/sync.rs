@@ -442,6 +442,7 @@ fn log_policy_snapshot_summary(
         trusted_cidrs = snapshot.trusted_cidrs.len(),
         temp_bans = snapshot.temp_bans.len(),
         threat_sources = snapshot.threat_sources.len(),
+        threat_prefixes = snapshot.threat_prefixes.len(),
         dynamic_rate_limits = snapshot.dynamic_rate_limits.len(),
         dynamic_defense_enabled = dynamic.enabled,
         ip_rate_limit_enabled = dynamic.ip_rate_limit_enabled,

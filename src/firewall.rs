@@ -1,7 +1,7 @@
 use crate::cli::{SeedExampleArgs, ShowPolicyArgs};
 use crate::db::entities::{
     dynamic_defense, dynamic_rate_limit, firewall_rule, geo_country_policy, policy_version,
-    temp_ban, threat_source, threat_source_state, trusted_cidr,
+    temp_ban, threat_prefix, threat_source, threat_source_state, trusted_cidr,
 };
 use crate::{geo, threat};
 use anyhow::{Context, Result, bail};
@@ -127,6 +127,8 @@ pub struct PolicySnapshot {
     pub dynamic_rate_limits: Vec<DynamicRateLimitPolicy>,
     pub trusted_cidrs: Vec<TrustedCidrPolicy>,
     pub threat_sources: Vec<threat::ThreatSource>,
+    #[serde(default)]
+    pub threat_prefixes: Vec<threat::ThreatPrefix>,
 }
 
 fn default_policy_name() -> String {
@@ -277,6 +279,12 @@ async fn load_policy_with_geo_prefixes(
         .into_iter()
         .map(threat::ThreatSource::try_from)
         .collect::<Result<Vec<_>>>()?;
+    let threat_source_names = threat_sources
+        .iter()
+        .map(|source| source.name.clone())
+        .collect::<Vec<_>>();
+    let threat_prefixes =
+        threat::load_persisted_threat_prefixes(db, policy_name, &threat_source_names).await?;
 
     let dynamic_defense = dynamic_defense::Entity::find_by_id(policy_name.to_string())
         .one(db)
@@ -325,6 +333,7 @@ async fn load_policy_with_geo_prefixes(
         dynamic_rate_limits,
         trusted_cidrs,
         threat_sources,
+        threat_prefixes,
     })
 }
 
@@ -379,9 +388,9 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let threat_prefixes = threat::fetch_threat_prefixes(&snapshot.threat_sources)
-        .await?
-        .into_iter()
+    let threat_prefixes = snapshot
+        .threat_prefixes
+        .iter()
         .map(|prefix| XdpPrefixRule {
             addr: prefix.addr,
             prefix: prefix.prefix,
@@ -497,6 +506,10 @@ pub async fn seed_example_policy(db: &DatabaseConnection, args: SeedExampleArgs)
         .await?;
     threat_source_state::Entity::delete_many()
         .filter(threat_source_state::Column::PolicyName.eq(policy_name))
+        .exec(db)
+        .await?;
+    threat_prefix::Entity::delete_many()
+        .filter(threat_prefix::Column::PolicyName.eq(policy_name))
         .exec(db)
         .await?;
     let now = chrono::Utc::now().naive_utc();
@@ -1116,5 +1129,50 @@ mod tests {
             .unwrap();
         assert_eq!(slim.geo_countries.len(), 1);
         assert!(slim.geo_prefixes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_policy_uses_persisted_threat_prefixes() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.sqlx_logging(false);
+        let db = Database::connect(options).await.unwrap();
+        crate::db::migrate(&db).await.unwrap();
+        let now = chrono::Utc::now().naive_utc();
+
+        threat_source::ActiveModel {
+            policy_name: Set(DEFAULT_POLICY_NAME.to_string()),
+            enabled: Set(true),
+            name: Set("test-feed".to_string()),
+            url: Set(
+                "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt".to_string(),
+            ),
+            format: Set("ipsum".to_string()),
+            min_score: Set(Some(3)),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        threat_prefix::ActiveModel {
+            policy_name: Set(DEFAULT_POLICY_NAME.to_string()),
+            source_name: Set("test-feed".to_string()),
+            cidrs_json: Set(r#"["198.51.100.0/24","203.0.113.10/32"]"#.to_string()),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let snapshot = load_policy(&db, DEFAULT_POLICY_NAME).await.unwrap();
+        assert_eq!(snapshot.threat_sources.len(), 1);
+        assert_eq!(snapshot.threat_prefixes.len(), 2);
+
+        let compiled = compile_policy(&snapshot).await.unwrap();
+        assert_eq!(compiled.threat_prefixes.len(), 2);
+        assert!(compiled.threat_prefixes.iter().all(|rule| {
+            rule.action == RuleAction::Deny && rule.source == XdpRuleSource::ThreatIntel
+        }));
     }
 }

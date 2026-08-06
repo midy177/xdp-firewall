@@ -28,6 +28,8 @@ const TEMP_BAN_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(86_400);
 const GEO_IP_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 const THREAT_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(300);
+const THREAT_MISSING_PREFIX_POLL_INTERVAL: Duration = Duration::from_secs(1_800);
+const XDS_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 const K8S_WATCH_TIMEOUT: Duration = Duration::from_secs(300);
 const K8S_WATCH_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const K8S_WATCH_CHANGE_DEBOUNCE: Duration = Duration::from_secs(1);
@@ -68,6 +70,7 @@ struct XdsService {
     runtime_trusted_cidrs: RuntimeTrustedCidrs,
     temp_ban_cleanup: TempBanCleanup,
     geo_lookup: geo::GeoIpLookup,
+    threat_lookup: threat::ThreatIntelLookup,
 }
 
 #[derive(Clone)]
@@ -100,6 +103,7 @@ struct GeoIpRefreshState {
 struct ThreatSourceRefresh {
     state: Arc<StdMutex<ThreatSourceRefreshState>>,
     interval: Duration,
+    threat_lookup: threat::ThreatIntelLookup,
 }
 
 #[derive(Default)]
@@ -122,6 +126,7 @@ pub struct DropEventView {
     pub proto: String,
     pub dport: u32,
     pub country: Option<String>,
+    pub threat_source: Option<String>,
     pub action: String,
 }
 
@@ -360,13 +365,14 @@ impl GeoIpRefresh {
 }
 
 impl ThreatSourceRefresh {
-    fn new(interval: Duration) -> Self {
+    fn new(interval: Duration, threat_lookup: threat::ThreatIntelLookup) -> Self {
         Self {
             state: Arc::new(StdMutex::new(ThreatSourceRefreshState {
                 last_success: Some(Instant::now()),
                 ..Default::default()
             })),
             interval,
+            threat_lookup,
         }
     }
 
@@ -440,6 +446,7 @@ impl ThreatSourceRefresh {
                 }
                 if report.refreshed {
                     let version = latest_version(db).await?;
+                    self.threat_lookup.spawn_rebuild(db.clone());
                     info!(
                         enabled_threat_sources = report.enabled_source_count,
                         version, "refreshed threat intelligence sources during xDS push tick"
@@ -768,22 +775,35 @@ pub async fn serve(
         k8s_discovery_enabled = runtime_trusted_cidrs.k8s_discovery.is_some(),
         k8s_watch_timeout_seconds = K8S_WATCH_TIMEOUT.as_secs(),
         auto_refresh_interval_seconds = AUTO_REFRESH_INTERVAL.as_secs(),
+        threat_missing_prefix_poll_interval_seconds = THREAT_MISSING_PREFIX_POLL_INTERVAL.as_secs(),
         "xDS gRPC server listening"
     );
     let geo_ip_refresh = GeoIpRefresh::new(AUTO_REFRESH_INTERVAL, geo_lookup.clone());
     spawn_geo_refresh_loop(db.clone(), geo_ip_refresh.clone(), AUTO_REFRESH_INTERVAL);
-    let threat_source_refresh = ThreatSourceRefresh::new(AUTO_REFRESH_INTERVAL);
-    spawn_threat_refresh_loop(db.clone(), threat_source_refresh, AUTO_REFRESH_INTERVAL);
+    let threat_lookup = threat::ThreatIntelLookup::default();
+    threat_lookup.spawn_rebuild(db.clone());
+    let threat_source_refresh =
+        ThreatSourceRefresh::new(AUTO_REFRESH_INTERVAL, threat_lookup.clone());
+    spawn_threat_refresh_loop(
+        db.clone(),
+        threat_source_refresh,
+        THREAT_MISSING_PREFIX_POLL_INTERVAL,
+    );
     Server::builder()
-        .add_service(FirewallXdsServer::new(XdsService {
-            db,
-            agent_token,
-            push_interval,
-            drop_events,
-            runtime_trusted_cidrs,
-            temp_ban_cleanup: TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL),
-            geo_lookup,
-        }))
+        .add_service(
+            FirewallXdsServer::new(XdsService {
+                db,
+                agent_token,
+                push_interval,
+                drop_events,
+                runtime_trusted_cidrs,
+                temp_ban_cleanup: TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL),
+                geo_lookup,
+                threat_lookup,
+            })
+            .max_decoding_message_size(XDS_MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(XDS_MAX_MESSAGE_SIZE),
+        )
         .serve(bind)
         .await
         .context("xDS gRPC server failed")
@@ -823,9 +843,9 @@ impl XdsClient {
     pub async fn connect(config: XdsClientConfig) -> Result<Self> {
         let inner = FirewallXdsClient::connect(config.control_url.clone())
             .await
-            .with_context(|| {
-                format!("failed to connect xDS control plane {}", config.control_url)
-            })?;
+            .with_context(|| format!("failed to connect xDS control plane {}", config.control_url))?
+            .max_decoding_message_size(XDS_MAX_MESSAGE_SIZE)
+            .max_encoding_message_size(XDS_MAX_MESSAGE_SIZE);
         Ok(Self {
             inner,
             agent_token: config.agent_token.filter(|token| !token.trim().is_empty()),
@@ -1247,17 +1267,21 @@ impl FirewallXds for XdsService {
         }
         let mut stream = request.into_inner();
         let geo_lookup = self.geo_lookup.clone();
+        let threat_lookup = self.threat_lookup.clone();
         let mut accepted = 0_u64;
         while let Some(event) = stream.message().await? {
+            let src_ip = event.src.parse().ok();
             let country = (!event.country.trim().is_empty())
                 .then(|| event.country.trim().to_ascii_uppercase())
-                .or_else(|| {
-                    event
-                        .src
-                        .parse()
-                        .ok()
-                        .and_then(|ip| geo_lookup.lookup_country(ip))
-                });
+                .or_else(|| src_ip.and_then(|ip| geo_lookup.lookup_country(ip)));
+            let threat_source = if event.reason == "threat_intel" {
+                match src_ip {
+                    Some(ip) => threat_lookup.lookup_source(&self.db, ip).await,
+                    None => None,
+                }
+            } else {
+                None
+            };
             self.drop_events.publish(DropEventView {
                 node_id: event.node_id,
                 interface_name: event.interface_name,
@@ -1270,6 +1294,7 @@ impl FirewallXds for XdsService {
                 proto: event.proto,
                 dport: event.dport,
                 country,
+                threat_source,
                 action: event.action,
             });
             accepted += 1;
@@ -1675,6 +1700,7 @@ mod tests {
             runtime_trusted_cidrs: RuntimeTrustedCidrs::new(Vec::new(), None),
             temp_ban_cleanup: TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL),
             geo_lookup: geo::GeoIpLookup::default(),
+            threat_lookup: threat::ThreatIntelLookup::default(),
         }
     }
 

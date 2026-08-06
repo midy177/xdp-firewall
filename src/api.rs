@@ -1206,7 +1206,10 @@ async fn create_threat_source(
     let row = threat_source_active_model(request)?
         .insert(&state.db)
         .await?;
-    let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
+    if row.enabled {
+        spawn_threat_refresh(state.db.clone());
+    }
+    let version = current_policy_version(&state.db).await?;
     Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
 }
 
@@ -1225,9 +1228,11 @@ async fn create_threat_sources(
     for model in models {
         rows.push(model.insert(&txn).await?);
     }
-    let version =
-        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
     txn.commit().await?;
+    if rows.iter().any(|row| row.enabled) {
+        spawn_threat_refresh(state.db.clone());
+    }
+    let version = current_policy_version(&state.db).await?;
     Ok((
         StatusCode::CREATED,
         Json(Versioned {
@@ -1258,9 +1263,14 @@ fn threat_source_active_model(
 async fn refresh_threat_sources(
     State(state): State<ApiState>,
 ) -> ApiResult<Json<Versioned<threat::ThreatRefreshReport>>> {
+    let refresh_interval = if threat::enabled_threat_source_states_missing(&state.db).await? {
+        Duration::ZERO
+    } else {
+        GEO_REFRESH_RATE_LIMIT
+    };
     match state
         .threat_refresh_limiter
-        .start_or_cached(GEO_REFRESH_RATE_LIMIT)
+        .start_or_cached(refresh_interval)
     {
         ThreatRefreshDecision::Start { permit, previous } => {
             let db = state.db.clone();
@@ -1344,6 +1354,47 @@ async fn refresh_threat_sources(
             }))
         }
     }
+}
+
+const QUEUED_THREAT_REFRESH_RETRY_DELAY: Duration = Duration::from_secs(5);
+const QUEUED_THREAT_REFRESH_MAX_ATTEMPTS: usize = 12;
+
+fn spawn_threat_refresh(db: DatabaseConnection) {
+    tokio::spawn(async move {
+        for attempt in 1..=QUEUED_THREAT_REFRESH_MAX_ATTEMPTS {
+            match run_threat_refresh(db.clone()).await {
+                Ok(result) if result.report.running => {
+                    if attempt == QUEUED_THREAT_REFRESH_MAX_ATTEMPTS {
+                        warn!(
+                            attempts = attempt,
+                            "queued threat intelligence refresh is still running elsewhere"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(QUEUED_THREAT_REFRESH_RETRY_DELAY).await;
+                }
+                Ok(result) => {
+                    info!(
+                        version = result.version,
+                        enabled_threat_sources = result.report.enabled_source_count,
+                        changed_threat_sources = result.report.changed_source_count,
+                        prefixes = result.report.prefix_count,
+                        attempts = attempt,
+                        "queued threat intelligence refresh completed"
+                    );
+                    break;
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        attempts = attempt,
+                        "queued threat intelligence refresh failed"
+                    );
+                    break;
+                }
+            }
+        }
+    });
 }
 
 async fn run_threat_refresh(db: DatabaseConnection) -> Result<CachedThreatRefresh> {
@@ -1442,9 +1493,10 @@ where
     }
     threat_source_state::Entity::delete_many()
         .filter(threat_source_state::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
-        .filter(threat_source_state::Column::SourceName.is_in(names))
+        .filter(threat_source_state::Column::SourceName.is_in(names.iter().copied()))
         .exec(db)
         .await?;
+    threat::delete_persisted_threat_prefixes_by_name(db, names.iter().copied()).await?;
     Ok(())
 }
 
@@ -3085,6 +3137,30 @@ mod tests {
         assert_eq!(second["data"]["running"], true);
     }
 
+    #[test]
+    fn threat_refresh_limiter_can_be_bypassed_for_missing_prefixes() {
+        let limiter = ThreatRefreshLimiter::default();
+        let ThreatRefreshDecision::Start { permit, .. } =
+            limiter.start_or_cached(GEO_REFRESH_RATE_LIMIT)
+        else {
+            panic!("initial threat refresh should start");
+        };
+        permit.finish_success(CachedThreatRefresh {
+            version: 1,
+            report: threat::ThreatRefreshReport::empty("unchanged"),
+        });
+        drop(permit);
+
+        assert!(matches!(
+            limiter.start_or_cached(GEO_REFRESH_RATE_LIMIT),
+            ThreatRefreshDecision::RateLimited(_)
+        ));
+        assert!(matches!(
+            limiter.start_or_cached(Duration::ZERO),
+            ThreatRefreshDecision::Start { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn batch_create_and_delete_support_config_resources() {
         let (app, _db) = test_router().await;
@@ -3164,7 +3240,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(threats["version"], 3);
+        assert_eq!(threats["version"], 2);
         assert_eq!(threats["data"].as_array().unwrap().len(), 2);
 
         let limits = response_json(
@@ -3195,7 +3271,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(limits["version"], 4);
+        assert_eq!(limits["version"], 3);
         assert_eq!(limits["data"].as_array().unwrap().len(), 2);
 
         let bans = response_json(
@@ -3222,7 +3298,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(bans["version"], 5);
+        assert_eq!(bans["version"], 4);
         assert_eq!(bans["data"].as_array().unwrap().len(), 2);
 
         let trusted = response_json(
@@ -3240,7 +3316,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(trusted["version"], 6);
+        assert_eq!(trusted["version"], 5);
         assert_eq!(trusted["data"].as_array().unwrap().len(), 2);
         assert_eq!(trusted["data"][0]["cidr"], "10.0.0.0/8");
 
@@ -3254,7 +3330,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(delete_rules["version"], 7);
+        assert_eq!(delete_rules["version"], 6);
         assert_eq!(delete_rules["data"]["deleted"], 2);
 
         let delete_countries = response_json(
@@ -3315,7 +3391,7 @@ mod tests {
             .await,
         )
         .await;
-        assert_eq!(delete_trusted["version"], 12);
+        assert_eq!(delete_trusted["version"], 11);
         assert_eq!(delete_trusted["data"]["deleted"], 2);
 
         let empty_batch_error = response_error(

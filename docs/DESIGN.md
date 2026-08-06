@@ -192,6 +192,8 @@ flowchart TB
 - `firewall_temp_bans`：临时源 IP 封禁。
 - `firewall_trusted_cidrs`：数据库管理的白名单。
 - `firewall_threat_sources`：威胁情报源配置。
+- `firewall_threat_source_states`：威胁情报源的最近指纹、检查时间和前缀数量。
+- `firewall_threat_prefixes`：已下载并持久化的威胁 CIDR 列表，每个威胁源一行，CIDR 以 JSON 数组保存，agent 不直接访问威胁情报源。
 - `firewall_nodes`：节点心跳和已应用版本。
 
 运行时注入项：

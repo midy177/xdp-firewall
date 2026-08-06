@@ -1,23 +1,32 @@
 use crate::db;
-use crate::db::entities::{threat_source, threat_source_state};
+use crate::db::entities::{policy_version, threat_prefix, threat_source, threat_source_state};
 use crate::firewall;
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
+use maxminddb::{Mmap, Reader, path};
+use mmdb_writer::Value as MmdbValue;
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set, TransactionTrait,
-    sea_query::OnConflict,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    QueryOrder, Set, TransactionTrait, sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    fs,
+    io::Write,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 use tracing::warn;
 
 const ALLOWED_THREAT_HOSTS_ENV: &str = "XDP_FIREWALL_ALLOWED_THREAT_HOSTS";
 const MAX_THREAT_BODY_BYTES: usize = 16 * 1024 * 1024;
 const THREAT_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const THREAT_HTTP_MAX_REDIRECTS: usize = 3;
+const THREAT_LOOKUP_VERSION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const REFRESH_LOCK_POLICY_NAME: &str = "__threat_refresh_lock__";
 const REFRESH_LOCK_SOURCE_NAME: &str = firewall::DEFAULT_POLICY_NAME;
 const REFRESH_LOCK_STALE_SECONDS: i64 = 900;
@@ -71,7 +80,7 @@ pub struct ThreatSource {
     pub min_score: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ThreatPrefix {
     pub addr: IpAddr,
     pub prefix: u8,
@@ -88,6 +97,24 @@ pub struct ThreatRefreshReport {
     pub cached: bool,
     #[serde(default)]
     pub running: bool,
+}
+
+#[derive(Clone, Default)]
+pub struct ThreatIntelLookup {
+    state: Arc<RwLock<ThreatIntelLookupState>>,
+}
+
+#[derive(Default)]
+struct ThreatIntelLookupState {
+    version: Option<i64>,
+    last_checked: Option<Instant>,
+    rebuild_running: bool,
+    database: Option<ThreatIntelDatabase>,
+}
+
+struct ThreatIntelDatabase {
+    reader: Reader<Mmap>,
+    path: PathBuf,
 }
 
 impl ThreatRefreshReport {
@@ -173,8 +200,16 @@ pub async fn refresh_enabled_threat_sources(
         .into_iter()
         .map(|row| (row.source_name.clone(), row))
         .collect::<std::collections::HashMap<_, _>>();
+    let existing_prefix_sources = threat_prefix::Entity::find()
+        .filter(threat_prefix::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|row| row.source_name)
+        .collect::<HashSet<_>>();
     let client = threat_http_client()?;
     let mut states = Vec::with_capacity(sources.len());
+    let mut prefixes_by_source = Vec::with_capacity(sources.len());
     let mut changed_source_count = 0_u64;
     let mut prefix_count = 0_usize;
     let now = chrono::Utc::now().naive_utc();
@@ -185,7 +220,8 @@ pub async fn refresh_enabled_threat_sources(
         prefix_count += prefixes.len();
         let changed = existing
             .get(&source.name)
-            .is_none_or(|state| state.fingerprint != fingerprint);
+            .is_none_or(|state| state.fingerprint != fingerprint)
+            || !existing_prefix_sources.contains(&source.name);
         if changed {
             changed_source_count += 1;
         }
@@ -208,8 +244,19 @@ pub async fn refresh_enabled_threat_sources(
             updated_at: Set(now),
             ..Default::default()
         });
+        prefixes_by_source.push((source.name.clone(), prefixes));
     }
     let txn = db.begin().await?;
+    for (source_name, prefixes) in prefixes_by_source {
+        persist_threat_source_prefixes(
+            &txn,
+            firewall::DEFAULT_POLICY_NAME,
+            &source_name,
+            &prefixes,
+            now,
+        )
+        .await?;
+    }
     for state in states {
         threat_source_state::Entity::insert(state)
             .on_conflict(
@@ -246,6 +293,242 @@ pub async fn refresh_enabled_threat_sources(
         cached: false,
         running: false,
     })
+}
+
+pub async fn load_persisted_threat_prefixes(
+    db: &DatabaseConnection,
+    policy_name: &str,
+    source_names: &[String],
+) -> Result<Vec<ThreatPrefix>> {
+    if source_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = threat_prefix::Entity::find()
+        .filter(threat_prefix::Column::PolicyName.eq(policy_name))
+        .filter(threat_prefix::Column::SourceName.is_in(source_names.iter().cloned()))
+        .order_by_asc(threat_prefix::Column::SourceName)
+        .all(db)
+        .await?;
+    let mut prefixes = Vec::new();
+    for row in rows {
+        prefixes.extend(persisted_prefixes(&row)?);
+    }
+    Ok(normalize_prefixes(prefixes))
+}
+
+impl ThreatIntelLookup {
+    pub async fn lookup_source(&self, db: &DatabaseConnection, ip: IpAddr) -> Option<String> {
+        let now = Instant::now();
+        let should_check_version = {
+            let state = self
+                .state
+                .read()
+                .expect("threat intel lookup lock poisoned");
+            state.last_checked.is_none_or(|last| {
+                now.saturating_duration_since(last) >= THREAT_LOOKUP_VERSION_CHECK_INTERVAL
+            })
+        };
+        if should_check_version {
+            if let Ok(version) = current_policy_version(db).await {
+                self.queue_rebuild_for_version(db.clone(), version, Some(now));
+            }
+        };
+
+        let state = self
+            .state
+            .read()
+            .expect("threat intel lookup lock poisoned");
+        let database = state.database.as_ref()?;
+        let result = database.reader.lookup(ip).ok()?;
+        result
+            .decode_path::<String>(&path!["source"])
+            .ok()
+            .flatten()
+    }
+
+    pub fn spawn_rebuild(&self, db: DatabaseConnection) {
+        let started = {
+            let mut state = self
+                .state
+                .write()
+                .expect("threat intel lookup lock poisoned");
+            if state.rebuild_running {
+                false
+            } else {
+                state.rebuild_running = true;
+                state.database = None;
+                true
+            }
+        };
+        if !started {
+            return;
+        }
+        let lookup = self.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let version = current_policy_version(&db).await?;
+                lookup.rebuild_from_db(&db, version).await
+            }
+            .await;
+            lookup.finish_background_rebuild(result);
+        });
+    }
+
+    fn queue_rebuild_for_version(
+        &self,
+        db: DatabaseConnection,
+        version: i64,
+        checked_at: Option<Instant>,
+    ) {
+        let should_spawn = {
+            let mut state = self
+                .state
+                .write()
+                .expect("threat intel lookup lock poisoned");
+            if let Some(checked_at) = checked_at {
+                state.last_checked = Some(checked_at);
+            }
+            if state.version == Some(version) || state.rebuild_running {
+                false
+            } else {
+                state.rebuild_running = true;
+                state.database = None;
+                true
+            }
+        };
+        if !should_spawn {
+            return;
+        }
+        let lookup = self.clone();
+        tokio::spawn(async move {
+            let result = lookup.rebuild_from_db(&db, version).await;
+            lookup.finish_background_rebuild(result);
+        });
+    }
+
+    fn finish_background_rebuild(&self, result: Result<usize>) {
+        let mut state = self
+            .state
+            .write()
+            .expect("threat intel lookup lock poisoned");
+        state.rebuild_running = false;
+        if let Err(err) = result {
+            warn!(error = %err, "failed to rebuild threat intelligence lookup database");
+        }
+    }
+
+    pub async fn rebuild_from_db(&self, db: &DatabaseConnection, version: i64) -> Result<usize> {
+        let enabled_source_names = threat_source::Entity::find()
+            .filter(threat_source::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+            .filter(threat_source::Column::Enabled.eq(true))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|row| row.name)
+            .collect::<HashSet<_>>();
+        if enabled_source_names.is_empty() {
+            let mut state = self
+                .state
+                .write()
+                .expect("threat intel lookup lock poisoned");
+            state.version = Some(version);
+            state.database = None;
+            return Ok(0);
+        }
+        let rows = threat_prefix::Entity::find()
+            .filter(threat_prefix::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+            .filter(threat_prefix::Column::SourceName.is_in(enabled_source_names))
+            .order_by_asc(threat_prefix::Column::SourceName)
+            .all(db)
+            .await?;
+        let mut sources_by_cidr = BTreeMap::<String, BTreeSet<String>>::new();
+        for row in rows {
+            for prefix in persisted_prefixes(&row)? {
+                sources_by_cidr
+                    .entry(prefix_to_cidr(&prefix))
+                    .or_default()
+                    .insert(row.source_name.clone());
+            }
+        }
+
+        if sources_by_cidr.is_empty() {
+            let mut state = self
+                .state
+                .write()
+                .expect("threat intel lookup lock poisoned");
+            state.version = Some(version);
+            state.database = None;
+            return Ok(0);
+        }
+
+        let mut writer = mmdb_writer::Writer::builder("XDP-Firewall-Threat-Intel").build();
+        let mut count = 0_usize;
+        for (cidr, sources) in sources_by_cidr {
+            let net = cidr
+                .parse::<IpNet>()
+                .with_context(|| format!("invalid persisted threat CIDR '{cidr}'"))?;
+            let source = sources.into_iter().collect::<Vec<_>>().join(",");
+            writer.insert_value(net, threat_source_value(&source))?;
+            count += 1;
+        }
+
+        let path = threat_intel_temp_path();
+        {
+            let file = fs::File::create(&path).with_context(|| {
+                format!("failed to create temporary threat MMDB {}", path.display())
+            })?;
+            let mut file = std::io::BufWriter::new(file);
+            writer.write_to(&mut file).with_context(|| {
+                format!("failed to write temporary threat MMDB {}", path.display())
+            })?;
+            file.flush().with_context(|| {
+                format!("failed to flush temporary threat MMDB {}", path.display())
+            })?;
+        }
+        drop(writer);
+
+        // SAFETY: the generated file path is unique and is not modified after this mmap is opened.
+        let reader = unsafe { Reader::open_mmap(&path) }
+            .with_context(|| format!("failed to mmap temporary threat MMDB {}", path.display()))?;
+        let mut state = self
+            .state
+            .write()
+            .expect("threat intel lookup lock poisoned");
+        state.version = Some(version);
+        state.database = Some(ThreatIntelDatabase { reader, path });
+        Ok(count)
+    }
+}
+
+impl Drop for ThreatIntelDatabase {
+    fn drop(&mut self) {
+        if let Err(err) = fs::remove_file(&self.path) {
+            warn!(
+                path = %self.path.display(),
+                error = %err,
+                "failed to remove temporary threat MMDB"
+            );
+        }
+    }
+}
+
+pub async fn delete_persisted_threat_prefixes_by_name<'a, I>(
+    db: &impl ConnectionTrait,
+    names: I,
+) -> Result<()>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let names = names.into_iter().collect::<Vec<_>>();
+    if names.is_empty() {
+        return Ok(());
+    }
+    threat_prefix::Entity::delete_many()
+        .filter(threat_prefix::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(threat_prefix::Column::SourceName.is_in(names))
+        .exec(db)
+        .await?;
+    Ok(())
 }
 
 struct ThreatRefreshDbLock {
@@ -364,11 +647,20 @@ pub async fn enabled_threat_source_states_missing(db: &DatabaseConnection) -> Re
     for source in sources {
         let has_state = threat_source_state::Entity::find()
             .filter(threat_source_state::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
-            .filter(threat_source_state::Column::SourceName.eq(source.name))
+            .filter(threat_source_state::Column::SourceName.eq(source.name.clone()))
             .one(db)
             .await?
             .is_some();
         if !has_state {
+            return Ok(true);
+        }
+        let has_prefixes = threat_prefix::Entity::find()
+            .filter(threat_prefix::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+            .filter(threat_prefix::Column::SourceName.eq(source.name))
+            .one(db)
+            .await?
+            .is_some();
+        if !has_prefixes {
             return Ok(true);
         }
     }
@@ -695,6 +987,74 @@ fn threat_prefix_fingerprint(prefixes: &[ThreatPrefix]) -> String {
     format!("{hash:016x}")
 }
 
+async fn persist_threat_source_prefixes(
+    db: &impl ConnectionTrait,
+    policy_name: &str,
+    source_name: &str,
+    prefixes: &[ThreatPrefix],
+    now: chrono::NaiveDateTime,
+) -> Result<()> {
+    let cidrs_json = cidrs_json_from_prefixes(prefixes);
+    threat_prefix::Entity::delete_many()
+        .filter(threat_prefix::Column::PolicyName.eq(policy_name))
+        .filter(threat_prefix::Column::SourceName.eq(source_name))
+        .exec(db)
+        .await?;
+    threat_prefix::ActiveModel {
+        policy_name: Set(policy_name.to_string()),
+        source_name: Set(source_name.to_string()),
+        cidrs_json: Set(cidrs_json),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(db)
+    .await?;
+    Ok(())
+}
+
+fn cidrs_json_from_prefixes(prefixes: &[ThreatPrefix]) -> String {
+    let cidrs = prefixes.iter().map(prefix_to_cidr).collect::<Vec<_>>();
+    serde_json::to_string(&cidrs).expect("threat CIDR list should serialize")
+}
+
+fn persisted_prefixes(row: &threat_prefix::Model) -> Result<Vec<ThreatPrefix>> {
+    let cidrs = serde_json::from_str::<Vec<String>>(&row.cidrs_json)
+        .with_context(|| format!("invalid persisted threat CIDR list for {}", row.source_name))?;
+    cidrs
+        .iter()
+        .map(|cidr| parse_prefix(cidr))
+        .collect::<Result<Vec<_>>>()
+}
+
+fn prefix_to_cidr(prefix: &ThreatPrefix) -> String {
+    match prefix.addr {
+        IpAddr::V4(addr) => format!("{addr}/{}", prefix.prefix),
+        IpAddr::V6(addr) => format!("{addr}/{}", prefix.prefix),
+    }
+}
+
+async fn current_policy_version(db: &DatabaseConnection) -> Result<i64> {
+    Ok(policy_version::Entity::find()
+        .filter(policy_version::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .one(db)
+        .await?
+        .map_or(0, |row| row.version))
+}
+
+fn threat_source_value(source: &str) -> MmdbValue {
+    MmdbValue::map([("source", MmdbValue::from(source))])
+}
+
+fn threat_intel_temp_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "xdp-firewall-threat-{}-{}.mmdb",
+        std::process::id(),
+        chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_micros() * 1_000)
+    ))
+}
+
 fn parse_format(value: &str) -> Result<ThreatFormat> {
     match value.to_ascii_lowercase().as_str() {
         "cidr" => Ok(ThreatFormat::Cidr),
@@ -926,6 +1286,138 @@ mod tests {
         .insert(&db)
         .await
         .unwrap();
+        assert!(enabled_threat_source_states_missing(&db).await.unwrap());
+
+        threat_prefix::ActiveModel {
+            policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+            source_name: Set("test-feed".to_string()),
+            cidrs_json: Set(r#"["198.51.100.0/24"]"#.to_string()),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
         assert!(!enabled_threat_source_states_missing(&db).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn threat_intel_lookup_rebuilds_from_persisted_prefixes() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.sqlx_logging(false);
+        let db = Database::connect(options).await.unwrap();
+        crate::db::migrate(&db).await.unwrap();
+        let now = chrono::Utc::now().naive_utc();
+
+        for name in ["feed-a", "feed-b"] {
+            threat_source::ActiveModel {
+                policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+                enabled: Set(true),
+                name: Set(name.to_string()),
+                url: Set(format!("https://example.com/{name}.txt")),
+                format: Set("cidr".to_string()),
+                min_score: Set(None),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+        threat_prefix::ActiveModel {
+            policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+            source_name: Set("feed-a".to_string()),
+            cidrs_json: Set(r#"["198.51.100.0/24"]"#.to_string()),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        threat_prefix::ActiveModel {
+            policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+            source_name: Set("feed-b".to_string()),
+            cidrs_json: Set(r#"["198.51.100.0/24"]"#.to_string()),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        let version = db::next_policy_version(&db, firewall::DEFAULT_POLICY_NAME)
+            .await
+            .unwrap();
+
+        let lookup = ThreatIntelLookup::default();
+        lookup.rebuild_from_db(&db, version).await.unwrap();
+        assert_eq!(
+            lookup
+                .lookup_source(&db, "198.51.100.10".parse().unwrap())
+                .await,
+            Some("feed-a,feed-b".to_string())
+        );
+        assert_eq!(
+            lookup
+                .lookup_source(&db, "203.0.113.10".parse().unwrap())
+                .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn threat_intel_lookup_ignores_disabled_sources() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.sqlx_logging(false);
+        let db = Database::connect(options).await.unwrap();
+        crate::db::migrate(&db).await.unwrap();
+        let now = chrono::Utc::now().naive_utc();
+
+        for (name, enabled) in [("enabled-feed", true), ("disabled-feed", false)] {
+            threat_source::ActiveModel {
+                policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+                enabled: Set(enabled),
+                name: Set(name.to_string()),
+                url: Set(format!("https://example.com/{name}.txt")),
+                format: Set("cidr".to_string()),
+                min_score: Set(None),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            threat_prefix::ActiveModel {
+                policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+                source_name: Set(name.to_string()),
+                cidrs_json: Set(if enabled {
+                    r#"["198.51.100.0/24"]"#.to_string()
+                } else {
+                    r#"["203.0.113.0/24"]"#.to_string()
+                }),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+
+        let lookup = ThreatIntelLookup::default();
+        let version = db::next_policy_version(&db, firewall::DEFAULT_POLICY_NAME)
+            .await
+            .unwrap();
+        lookup.rebuild_from_db(&db, version).await.unwrap();
+        assert_eq!(
+            lookup
+                .lookup_source(&db, "198.51.100.10".parse().unwrap())
+                .await,
+            Some("enabled-feed".to_string())
+        );
+        assert_eq!(
+            lookup
+                .lookup_source(&db, "203.0.113.10".parse().unwrap())
+                .await,
+            None
+        );
     }
 }

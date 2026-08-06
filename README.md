@@ -77,7 +77,7 @@ curl -X POST http://127.0.0.1:8080/rules \
   -d '{"priority":10,"action":"deny","cidr":"203.0.113.0/24","protocol":"any"}'
 ```
 
-Every mutating endpoint increments the policy version so the xDS control plane can push a fresh snapshot to running agents.
+Every mutating endpoint that immediately changes the active firewall policy increments the policy version so the xDS control plane can push a fresh snapshot to running agents. Creating threat-intelligence sources is materialized by an asynchronous refresh; the policy version is incremented after the refreshed prefixes are persisted.
 
 List endpoints return `items`, `total`, `page`, `page_size`, and `total_pages`. The default page size is `20`; the maximum is `500`.
 
@@ -112,6 +112,7 @@ The frontend source is Vue 3. `frontend/package.json` aliases Vite to Rolldown V
 - `firewall_trusted_cidrs`: highest-priority source CIDR whitelist.
 - `firewall_threat_sources`: threat-intelligence feed definitions.
 - `firewall_threat_source_states`: last-seen threat feed fingerprints used by automatic refresh.
+- `firewall_threat_prefixes`: last successfully downloaded and normalized threat CIDR lists, stored per feed so agents do not directly access threat providers.
 - `firewall_nodes`: distributed node heartbeat and last applied version.
 
 Built-in threat sources:
@@ -122,7 +123,7 @@ Built-in threat sources:
 
 Threat feeds are fetched with a timeout, up to 3 redirects to allowed hosts, and a 16 MiB response limit. Text formats (`cidr`, `ips`, `ipsum`, and `voipbl`) are parsed line-by-line from the HTTP response; invalid IP/CIDR lines are skipped with a warning. `voipbl` ignores comment lines and compiles each valid IP/CIDR line as a deny prefix rule. `spamhaus_drop` keeps the existing JSON-compatible parser and may buffer the response body within the same 16 MiB cap; invalid JSON CIDR entries are skipped. Built-in feed hosts are allowed by default; add comma-separated custom hosts with `XDP_FIREWALL_ALLOWED_THREAT_HOSTS` before enabling other custom feed URLs.
 
-The xDS control plane automatically checks enabled threat feeds every 86400 seconds, using the same automatic refresh interval as country IP lists. Each check normalizes the fetched prefixes and compares a stable fingerprint with `firewall_threat_source_states`; the policy version is bumped only when at least one enabled feed changes, so agents refetch and apply the updated threat intelligence without unnecessary policy churn.
+The xDS control plane automatically refreshes enabled threat feeds every 86400 seconds, using the same normal refresh interval as country IP lists. It also polls every 1800 seconds for enabled feeds whose persisted prefix set is missing, so newly added feeds are materialized without waiting a full day. Each refresh normalizes the fetched prefixes, stores the last successful CIDR set in `firewall_threat_prefixes`, and compares a stable fingerprint with `firewall_threat_source_states`; the policy version is bumped only when at least one enabled feed changes or a persisted prefix set is missing. Policy snapshots compile threat intelligence from the database, so agents keep using the last successful feed result when a provider is unavailable.
 
 ## XDP Object
 
@@ -297,7 +298,7 @@ By default it prints one line every five seconds. Use `--interval-seconds` to ch
 Example output:
 
 ```text
-time=2026-07-23T12:13:12Z node_id=node-1 interface=ens5 control_url=http://127.0.0.1:50051 operstate=up mtu=9001 carrier=1 bpffs_mounted=true agent_only=true database_url_present=false local_db_file_present=false xdp_firewall_processes=1 xds_status=ok policy_version=5 rules=0 geo_countries=0 trusted_cidrs=3 threat_sources=2 dynamic_defense=true ip_rate_limit=true flood=true
+time=2026-07-23T12:13:12Z node_id=node-1 interface=ens5 control_url=http://127.0.0.1:50051 operstate=up mtu=9001 carrier=1 bpffs_mounted=true agent_only=true database_url_present=false local_db_file_present=false xdp_firewall_processes=1 xds_status=ok policy_version=5 rules=0 geo_countries=0 trusted_cidrs=3 threat_sources=2 threat_prefixes=120 dynamic_defense=true ip_rate_limit=true flood=true
 ```
 
 ## Drop Visibility
@@ -323,6 +324,8 @@ Counters:
 These counters show which class is dropping traffic. Use realtime drop events when you need source IP and packet metadata.
 
 The embedded frontend has a realtime Drop page. Press Start to subscribe to all nodes, or select one node to subscribe only to that agent. The API tells agents through xDS to enable Drop monitoring only while a matching frontend subscriber is connected. When the last matching subscriber disconnects, xDS pushes the disabled state and agents stop reading the perf event buffer. The events are kept in memory and are not persisted to the database.
+
+For `threat_intel` drops, the control plane enriches streamed events with `threat_source` by looking up the source IP in an mmap-backed MMDB rebuilt from `firewall_threat_prefixes`. If multiple persisted feeds contain the same prefix, their names are returned as a comma-separated value.
 
 The HTTP stream also supports node filtering directly:
 

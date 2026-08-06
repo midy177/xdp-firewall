@@ -875,6 +875,7 @@
               <th>{{ t("node") }}</th>
               <th>{{ t("reason") }}</th>
               <th>{{ t("sourceIp") }}</th>
+              <th>{{ t("threatSource") }}</th>
               <th>{{ t("protocol") }}</th>
               <th>{{ t("port") }}</th>
               <th>{{ t("country") }}</th>
@@ -882,13 +883,14 @@
           </thead>
           <tbody>
             <tr v-if="filteredDropEvents.length === 0">
-              <td colspan="7" class="empty">{{ t("emptyDropEvents") }}</td>
+              <td colspan="8" class="empty">{{ t("emptyDropEvents") }}</td>
             </tr>
             <tr v-for="event in filteredDropEvents" :key="event.local_id">
               <td>{{ formatLocalTime(event.time) }}</td>
               <td class="clip">{{ event.node_id }}</td>
               <td><Badge :tone="dropReasonTone(event.reason)">{{ dropReasonLabel(event.reason) }}</Badge></td>
               <td>{{ event.src }}</td>
+              <td>{{ event.threat_source || '-' }}</td>
               <td>{{ event.proto }}</td>
               <td>{{ event.dport || '*' }}</td>
               <td>{{ event.country || '-' }}</td>
@@ -1018,7 +1020,7 @@ type DynamicDefense = {
   flood_block_seconds?: number | null;
 };
 type NodeState = { node_id: string; interface_name: string; last_applied_version: number; status: string; last_seen_at: string; error?: string };
-type DropEvent = { local_id: number; node_id: string; interface_name: string; time: string; event_time_ns: number; cpu: number; reason: string; src: string; family: number; proto: string; dport: number; country?: string; action: string };
+type DropEvent = { local_id: number; node_id: string; interface_name: string; time: string; event_time_ns: number; cpu: number; reason: string; src: string; family: number; proto: string; dport: number; country?: string; threat_source?: string; action: string };
 type Snapshot = { version: number };
 type Page<T> = { items: T[]; total: number; page: number; page_size: number; total_pages: number };
 type PageState = { page: number; total_pages: number; total: number };
@@ -1235,6 +1237,7 @@ const messages = {
     threats: "威胁",
     threatsHint: "配置威胁情报源，下发为拒绝规则",
     threatScore: "威胁评分",
+    threatSource: "威胁源",
     threatSourceFormat: "威胁源格式",
     threatSourceName: "威胁源名称",
     threatSourceUrl: "威胁源 URL",
@@ -1358,6 +1361,7 @@ const messages = {
     threats: "Threats",
     threatsHint: "Configure threat intelligence feeds as deny rules",
     threatScore: "Threat score",
+    threatSource: "Threat source",
     threatSourceFormat: "Threat source format",
     threatSourceName: "Threat source name",
     threatSourceUrl: "Threat source URL",
@@ -1512,11 +1516,11 @@ const apiDocsZh: ApiDocSection[] = [
     description: "威胁源会被编译为拒绝前缀规则。内置 ipsum、spamhaus-drop 和 voipbl。",
     endpoints: [
       { method: "GET", path: "/threat-sources?page=1&page_size=20&name=test-feed&format=cidr&enabled=true", summary: "分页列出威胁源，可按 name、url、format、enabled、min_score 过滤，条件按 AND 匹配。" },
-      { method: "POST", path: "/threat-sources/refresh", summary: "异步刷新启用的威胁源；5 分钟内重复调用直接返回上一次刷新结果。" },
+      { method: "POST", path: "/threat-sources/refresh", summary: "异步刷新启用的威胁源；缺少持久化前缀时会绕过 5 分钟限流。" },
       {
         method: "POST",
         path: "/threat-sources",
-        summary: "新增威胁情报源。",
+        summary: "新增威胁情报源；启用的源会排队刷新并在前缀持久化后更新策略版本。",
         body: `{
   "name": "ipsum",
   "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt",
@@ -1607,7 +1611,7 @@ const apiDocsZh: ApiDocSection[] = [
   },
   {
     title: "实时 Drop",
-    description: "NDJSON 流。无订阅时 agent 不读取 perf buffer，也不会开启 BPF drop event 输出。",
+    description: "NDJSON 流。威胁情报 Drop 会补充 threat_source；无订阅时 agent 不读取 perf buffer，也不会开启 BPF drop event 输出。",
     endpoints: [
       {
         method: "GET",
@@ -1726,11 +1730,11 @@ const apiDocsEn: ApiDocSection[] = [
     description: "Threat feeds compile into deny prefix rules. Built-ins include ipsum, spamhaus-drop, and voipbl.",
     endpoints: [
       { method: "GET", path: "/threat-sources?page=1&page_size=20&name=test-feed&format=cidr&enabled=true", summary: "List threat sources, optionally filtered by name, url, format, enabled, and min_score with AND semantics." },
-      { method: "POST", path: "/threat-sources/refresh", summary: "Start an async refresh for enabled threat feeds; repeated calls within 5 minutes return the previous result." },
+      { method: "POST", path: "/threat-sources/refresh", summary: "Start an async refresh for enabled threat feeds; missing persisted prefixes bypass the 5-minute rate limit." },
       {
         method: "POST",
         path: "/threat-sources",
-        summary: "Create a threat feed.",
+        summary: "Create a threat feed; enabled feeds queue a refresh and update the policy version after prefixes are persisted.",
         body: `{
   "name": "ipsum",
   "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt",
@@ -1821,7 +1825,7 @@ const apiDocsEn: ApiDocSection[] = [
   },
   {
     title: "Live Drop Events",
-    description: "NDJSON stream. Agents do not read the perf buffer or enable BPF drop event output when there are no subscribers.",
+    description: "NDJSON stream. Threat-intel drops include threat_source; agents do not read the perf buffer or enable BPF drop event output when there are no subscribers.",
     endpoints: [
       {
         method: "GET",

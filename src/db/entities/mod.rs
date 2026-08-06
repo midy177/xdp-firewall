@@ -8,6 +8,7 @@ pub mod geo_ip_prefix;
 pub mod node;
 pub mod policy_version;
 pub mod temp_ban;
+pub mod threat_prefix;
 pub mod threat_source;
 pub mod threat_source_state;
 pub mod trusted_cidr;
