@@ -1417,6 +1417,18 @@ const validationMessages = {
 
 const apiDocsZh: ApiDocSection[] = [
   {
+    title: "通用约定",
+    description: "除 /health、/countries 和前端静态资源外都需要 API 令牌；请求头支持 Authorization: Bearer <token> 或 X-API-Token。错误响应为 {\"error\":\"...\"}。",
+    endpoints: [
+      { method: "GET", path: "分页接口", summary: "列表响应统一为 {items,total,page,page_size,total_pages}；page 默认 1，page_size 默认 20，最大 500。" },
+      { method: "POST", path: "批量新增", summary: "批量新增请求体为 {\"items\":[...]}，items 必须非空且最多 500 项；每项格式同单条 POST。" },
+      { method: "DELETE", path: "批量删除", summary: "批量删除请求体为 {\"ids\":[1,2]}，ids 必须非空且最多 500 项。" },
+      { method: "POST", path: "写操作响应", summary: "大多数写操作返回 {version,data}；POST /policy/seed-example 返回策略快照本身。配置类 enabled 省略时默认 true。" },
+      { method: "ANY", path: "字段约束", summary: "action 支持 allow、deny，drop 会归一化为 deny；protocol 支持 any、tcp、udp、icmp；port 范围 1-65535，icmp 不能设置 port。" },
+      { method: "ANY", path: "/policies", summary: "多策略 API 已移除，/policies 和 /policies/{path} 会返回 404；请使用单策略资源接口。" }
+    ]
+  },
+  {
     title: "系统",
     description: "健康检查、国家列表和策略版本。",
     endpoints: [
@@ -1469,7 +1481,7 @@ const apiDocsZh: ApiDocSection[] = [
     description: "按国家代码允许或拒绝。国家名称和更新时间来自 IPdeny /ipblocks/ 页面，CIDR 从 aggregated 列表下载。",
     endpoints: [
       { method: "GET", path: "/geo-countries?page=1&page_size=20&country=CN&action=deny&enabled=true", summary: "分页列出国家规则，可按 country、action、enabled 过滤，条件按 AND 匹配。" },
-      { method: "POST", path: "/geo-countries/refresh", summary: "异步启动所有国家 IP 列表刷新；5 分钟内重复调用直接返回上一次刷新结果。" },
+      { method: "POST", path: "/geo-countries/refresh", summary: "异步启动所有国家 IP 列表刷新；5 分钟内重复调用直接返回上一次刷新结果。响应 data 包含 countries、checked_country_count、changed_country_count、failed_country_count、prefix_count、refresh_status、cached、running、errors。" },
       {
         method: "POST",
         path: "/geo-countries",
@@ -1487,7 +1499,7 @@ const apiDocsZh: ApiDocSection[] = [
   },
   {
     title: "临时封禁",
-    description: "临时封禁单个源 IP，可选协议和目的端口。duration_seconds 默认 300。",
+    description: "临时封禁单个源 IP，可选协议和目的端口。duration_seconds 默认 300，必须大于 0，最大 31536000。",
     endpoints: [
       { method: "GET", path: "/temp-bans?page=1&page_size=20&ip=203.0.113.10&protocol=tcp&port=443", summary: "分页列出未过期临时封禁，可按 ip、protocol、port 过滤，条件按 AND 匹配。" },
       {
@@ -1513,14 +1525,14 @@ const apiDocsZh: ApiDocSection[] = [
   },
   {
     title: "威胁情报",
-    description: "威胁源会被编译为拒绝前缀规则。内置 ipsum、spamhaus-drop 和 voipbl。",
+    description: "威胁源会被编译为拒绝前缀规则。format 支持 cidr、ips、ipsum、voipbl、spamhaus_drop；内置 ipsum、spamhaus-drop 和 voipbl。",
     endpoints: [
-      { method: "GET", path: "/threat-sources?page=1&page_size=20&name=test-feed&format=cidr&enabled=true", summary: "分页列出威胁源，可按 name、url、format、enabled、min_score 过滤，条件按 AND 匹配。" },
-      { method: "POST", path: "/threat-sources/refresh", summary: "异步刷新启用的威胁源；缺少持久化前缀时会绕过 5 分钟限流。" },
+      { method: "GET", path: "/threat-sources?page=1&page_size=20&name=test-feed&format=ipsum&enabled=true", summary: "分页列出威胁源，可按 name、url、format、enabled、min_score 过滤；format 可为 cidr、ips、ipsum、voipbl、spamhaus_drop，条件按 AND 匹配。" },
+      { method: "POST", path: "/threat-sources/refresh", summary: "异步刷新启用的威胁源；缺少持久化前缀时会绕过 5 分钟限流。响应 data 包含 enabled_source_count、changed_source_count、prefix_count、refreshed、refresh_status、cached、running。" },
       {
         method: "POST",
         path: "/threat-sources",
-        summary: "新增威胁情报源；启用的源会排队刷新并在前缀持久化后更新策略版本。",
+        summary: "新增威胁情报源；format 可为 cidr、ips、ipsum、voipbl、spamhaus_drop，也接受 voipbl_cidr、voipbl-cidr、spamhaus-drop 别名；启用的源会排队刷新并在前缀持久化后更新策略版本。",
         body: `{
   "name": "ipsum",
   "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt",
@@ -1584,7 +1596,7 @@ const apiDocsZh: ApiDocSection[] = [
     title: "白名单",
     description: "最高优先级源 CIDR 白名单。命中后直接允许。",
     endpoints: [
-      { method: "GET", path: "/trusted-cidrs?page=1&page_size=20", summary: "分页列出数据库管理的白名单。" },
+      { method: "GET", path: "/trusted-cidrs?page=1&page_size=20&cidr=10.0.0.0/8&enabled=true", summary: "分页列出数据库管理的白名单，可按 cidr、enabled 过滤，条件按 AND 匹配。" },
       {
         method: "POST",
         path: "/trusted-cidrs",
@@ -1611,7 +1623,7 @@ const apiDocsZh: ApiDocSection[] = [
   },
   {
     title: "实时 Drop",
-    description: "NDJSON 流。威胁情报 Drop 会补充 threat_source；无订阅时 agent 不读取 perf buffer，也不会开启 BPF drop event 输出。",
+    description: "NDJSON 流。事件字段包含 node_id、interface_name、time、event_time_ns、cpu、reason、src、family、proto、dport、country、threat_source、action。威胁情报 Drop 会补充 threat_source；无订阅时 agent 不读取 perf buffer，也不会开启 BPF drop event 输出。",
     endpoints: [
       {
         method: "GET",
@@ -1630,6 +1642,18 @@ const apiDocsZh: ApiDocSection[] = [
 ];
 
 const apiDocsEn: ApiDocSection[] = [
+  {
+    title: "Conventions",
+    description: "All APIs except /health, /countries, and frontend assets require an API token. Send either Authorization: Bearer <token> or X-API-Token. Error responses are {\"error\":\"...\"}.",
+    endpoints: [
+      { method: "GET", path: "Paginated APIs", summary: "List responses are {items,total,page,page_size,total_pages}; page defaults to 1, page_size defaults to 20, and the maximum page_size is 500." },
+      { method: "POST", path: "Batch create", summary: "Batch create bodies are {\"items\":[...]}; items must be non-empty and contain at most 500 entries. Each item matches the single-row POST shape." },
+      { method: "DELETE", path: "Batch delete", summary: "Batch delete bodies are {\"ids\":[1,2]}; ids must be non-empty and contain at most 500 entries." },
+      { method: "POST", path: "Write responses", summary: "Most write APIs return {version,data}; POST /policy/seed-example returns the policy snapshot directly. Configuration enabled fields default to true when omitted." },
+      { method: "ANY", path: "Field rules", summary: "action supports allow and deny; drop is normalized to deny. protocol supports any, tcp, udp, and icmp. port must be 1-65535, and icmp cannot set a port." },
+      { method: "ANY", path: "/policies", summary: "Multi-policy APIs are removed. /policies and /policies/{path} return 404; use the single-policy resource endpoints." }
+    ]
+  },
   {
     title: "System",
     description: "Health, country options, and policy version.",
@@ -1683,7 +1707,7 @@ const apiDocsEn: ApiDocSection[] = [
     description: "Allow or deny by country code. Country names and update metadata come from IPdeny /ipblocks/; CIDRs are downloaded from aggregated lists.",
     endpoints: [
       { method: "GET", path: "/geo-countries?page=1&page_size=20&country=CN&action=deny&enabled=true", summary: "List country rules, optionally filtered by country, action, and enabled with AND semantics." },
-      { method: "POST", path: "/geo-countries/refresh", summary: "Start an async refresh for all country IP lists; repeated calls within 5 minutes return the previous result." },
+      { method: "POST", path: "/geo-countries/refresh", summary: "Start an async refresh for all country IP lists; repeated calls within 5 minutes return the previous result. data includes countries, checked_country_count, changed_country_count, failed_country_count, prefix_count, refresh_status, cached, running, and errors." },
       {
         method: "POST",
         path: "/geo-countries",
@@ -1701,7 +1725,7 @@ const apiDocsEn: ApiDocSection[] = [
   },
   {
     title: "Temporary Bans",
-    description: "Temporarily block one source IP with optional protocol and destination port. duration_seconds defaults to 300.",
+    description: "Temporarily block one source IP with optional protocol and destination port. duration_seconds defaults to 300, must be greater than 0, and is capped at 31536000.",
     endpoints: [
       { method: "GET", path: "/temp-bans?page=1&page_size=20&ip=203.0.113.10&protocol=tcp&port=443", summary: "List unexpired temporary bans, optionally filtered by ip, protocol, and port with AND semantics." },
       {
@@ -1727,14 +1751,14 @@ const apiDocsEn: ApiDocSection[] = [
   },
   {
     title: "Threat Intelligence",
-    description: "Threat feeds compile into deny prefix rules. Built-ins include ipsum, spamhaus-drop, and voipbl.",
+    description: "Threat feeds compile into deny prefix rules. Supported format values are cidr, ips, ipsum, voipbl, and spamhaus_drop; built-ins include ipsum, spamhaus-drop, and voipbl.",
     endpoints: [
-      { method: "GET", path: "/threat-sources?page=1&page_size=20&name=test-feed&format=cidr&enabled=true", summary: "List threat sources, optionally filtered by name, url, format, enabled, and min_score with AND semantics." },
-      { method: "POST", path: "/threat-sources/refresh", summary: "Start an async refresh for enabled threat feeds; missing persisted prefixes bypass the 5-minute rate limit." },
+      { method: "GET", path: "/threat-sources?page=1&page_size=20&name=test-feed&format=ipsum&enabled=true", summary: "List threat sources, optionally filtered by name, url, format, enabled, and min_score. Supported format values are cidr, ips, ipsum, voipbl, and spamhaus_drop; filters use AND semantics." },
+      { method: "POST", path: "/threat-sources/refresh", summary: "Start an async refresh for enabled threat feeds; missing persisted prefixes bypass the 5-minute rate limit. data includes enabled_source_count, changed_source_count, prefix_count, refreshed, refresh_status, cached, and running." },
       {
         method: "POST",
         path: "/threat-sources",
-        summary: "Create a threat feed; enabled feeds queue a refresh and update the policy version after prefixes are persisted.",
+        summary: "Create a threat feed; format can be cidr, ips, ipsum, voipbl, or spamhaus_drop, with aliases voipbl_cidr, voipbl-cidr, and spamhaus-drop. Enabled feeds queue a refresh and update the policy version after prefixes are persisted.",
         body: `{
   "name": "ipsum",
   "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt",
@@ -1798,7 +1822,7 @@ const apiDocsEn: ApiDocSection[] = [
     title: "Whitelist",
     description: "Highest-priority source CIDR whitelist. Matching sources pass immediately.",
     endpoints: [
-      { method: "GET", path: "/trusted-cidrs?page=1&page_size=20", summary: "List database-managed whitelist entries." },
+      { method: "GET", path: "/trusted-cidrs?page=1&page_size=20&cidr=10.0.0.0/8&enabled=true", summary: "List database-managed whitelist entries, optionally filtered by cidr and enabled with AND semantics." },
       {
         method: "POST",
         path: "/trusted-cidrs",
@@ -1825,7 +1849,7 @@ const apiDocsEn: ApiDocSection[] = [
   },
   {
     title: "Live Drop Events",
-    description: "NDJSON stream. Threat-intel drops include threat_source; agents do not read the perf buffer or enable BPF drop event output when there are no subscribers.",
+    description: "NDJSON stream. Event fields include node_id, interface_name, time, event_time_ns, cpu, reason, src, family, proto, dport, country, threat_source, and action. Threat-intel drops include threat_source; agents do not read the perf buffer or enable BPF drop event output when there are no subscribers.",
     endpoints: [
       {
         method: "GET",

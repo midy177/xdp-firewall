@@ -44,6 +44,7 @@ Useful endpoints:
 - `GET /geo-countries?page=1&page_size=20&country=CN&action=deny&enabled=true`
 - `POST /geo-countries`
 - `POST /geo-countries/batch`
+- `DELETE /geo-countries/{id}`
 - `DELETE /geo-countries/batch`
 - `DELETE /geo-countries?country=CN&action=deny&enabled=true`
 - `POST /geo-countries/refresh`
@@ -51,22 +52,33 @@ Useful endpoints:
 - `GET /temp-bans?page=1&page_size=20&ip=203.0.113.10&protocol=tcp&port=443`
 - `POST /temp-bans`
 - `POST /temp-bans/batch`
+- `DELETE /temp-bans/{id}`
 - `DELETE /temp-bans/batch`
-- `GET /threat-sources?page=1&page_size=20&name=test-feed&format=cidr&enabled=true`
+- `GET /threat-sources?page=1&page_size=20&name=test-feed&format=ipsum&enabled=true`
 - `POST /threat-sources/refresh`
 - `POST /threat-sources`
 - `POST /threat-sources/batch`
+- `DELETE /threat-sources/{id}`
 - `DELETE /threat-sources/batch`
 - `DELETE /threat-sources?name=test-feed`
+- `GET /dynamic-defense`
+- `PUT /dynamic-defense`
 - `GET /dynamic-rate-limits?page=1&page_size=20&enabled=true&priority=10&protocol=tcp&port=443&packets_per_second=1000&burst=2000`
+- `POST /dynamic-rate-limits`
 - `POST /dynamic-rate-limits/batch`
+- `DELETE /dynamic-rate-limits/{id}`
 - `DELETE /dynamic-rate-limits/batch`
 - `DELETE /dynamic-rate-limits?enabled=true&priority=10&protocol=tcp&port=443&packets_per_second=1000&burst=2000`
 - `GET /trusted-cidrs?page=1&page_size=20&cidr=10.0.0.0/8&enabled=true`
+- `POST /trusted-cidrs`
 - `POST /trusted-cidrs/batch`
+- `DELETE /trusted-cidrs/{id}`
 - `DELETE /trusted-cidrs/batch`
 - `DELETE /trusted-cidrs?cidr=10.0.0.0/8`
 - `GET /nodes?page=1&page_size=20`
+- `GET /nodes/{node_id}`
+- `GET /drop-events/stream`
+- `GET /drop-events/stream?node_id=node-1`
 
 Example:
 
@@ -83,9 +95,13 @@ List endpoints return `items`, `total`, `page`, `page_size`, and `total_pages`. 
 
 Batch create endpoints use `{"items":[...]}` and accept the same item shape as the single-row `POST` endpoint. Batch delete endpoints use `{"ids":[1,2]}`. Batch requests are limited to 500 entries, run in a single transaction, and bump the policy version once after the whole batch succeeds.
 
+Most write endpoints return `{"version":...,"data":...}`. `POST /policy/seed-example` returns the policy snapshot directly. Error responses use `{"error":"..."}`. `enabled` defaults to `true` for configuration resources when omitted. `action` accepts `allow` and `deny`; `drop` is accepted and normalized to `deny`. `protocol` accepts `any`, `tcp`, `udp`, and `icmp`; `port` must be 1-65535 and cannot be set for `icmp`.
+
 `GET /rules` supports optional filters for `action`, `cidr`, `protocol`, `port`, and `priority`; omit all filters to page through all rules. Filters are combined with AND semantics. `DELETE /rules` deletes by the complete rule tuple and requires all five fields: `action`, `cidr`, `protocol`, `port`, and `priority`. Use `DELETE /rules/{id}` for rules that do not have a stored port. `protocol=any` also matches older rules whose protocol field is unset.
 
 `GET /geo-countries`, `GET /temp-bans`, `GET /threat-sources`, `GET /dynamic-rate-limits`, and `GET /trusted-cidrs` also support optional field filters combined with AND semantics. Temporary bans support `ip`, `protocol`, and `port` filters and should still be deleted by ID. Their collection DELETE endpoints require the identifying fields: country rules require `country`, `action`, and `enabled`; threat sources require the unique `name`; dynamic rate limits require `enabled`, `priority`, `protocol`, `port`, `packets_per_second`, and `burst`; trusted CIDRs require the unique `cidr`. Use the existing ID DELETE endpoints for configurations whose identifying fields are not stable or unique. Dynamic rate limits without a stored port must also be deleted by ID.
+
+The removed multi-policy endpoints `/policies` and `/policies/{path}` return 404 with a migration message; use the single-policy resource endpoints above.
 
 Set `XDP_FIREWALL_API_TOKEN` to protect configuration and `/nodes` API routes. The API refuses to bind to a non-loopback address without a token unless `XDP_FIREWALL_ALLOW_UNAUTHENTICATED=true` is explicitly set. Clients can send either `Authorization: Bearer <token>` or `X-API-Token: <token>`. `/health`, `/countries`, and embedded frontend assets stay public for probes and page loading. When the embedded frontend is used with auth enabled, enter the token in the API token field; it is kept in memory only and is cleared when leaving the page.
 
@@ -120,6 +136,8 @@ Built-in threat sources:
 - `ipsum`: `https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt`, format `ipsum`, minimum score `3`.
 - `spamhaus-drop`: `https://www.spamhaus.org/drop/drop.txt`, format `spamhaus_drop`.
 - `voipbl`: `https://voipbl.org/update/`, format `voipbl`.
+
+Threat source `format` accepts `cidr`, `ips`, `ipsum`, `voipbl`, and `spamhaus_drop`. The aliases `voipbl_cidr`, `voipbl-cidr`, and `spamhaus-drop` are accepted and normalized.
 
 Threat feeds are fetched with a timeout, up to 3 redirects to allowed hosts, and a 16 MiB response limit. Text formats (`cidr`, `ips`, `ipsum`, and `voipbl`) are parsed line-by-line from the HTTP response; invalid IP/CIDR lines are skipped with a warning. `voipbl` ignores comment lines and compiles each valid IP/CIDR line as a deny prefix rule. `spamhaus_drop` keeps the existing JSON-compatible parser and may buffer the response body within the same 16 MiB cap; invalid JSON CIDR entries are skipped. Built-in feed hosts are allowed by default; add comma-separated custom hosts with `XDP_FIREWALL_ALLOWED_THREAT_HOSTS` before enabling other custom feed URLs.
 
@@ -235,7 +253,7 @@ For memory troubleshooting during country refresh or lookup rebuilds, run the co
 
 ## Temporary Bans
 
-Temporary bans block one source IP, optionally scoped by protocol and destination port. The default duration is 300 seconds.
+Temporary bans block one source IP, optionally scoped by protocol and destination port. The default duration is 300 seconds. `duration_seconds` must be greater than 0 and at most 31536000.
 
 - `GET /temp-bans?page=1&page_size=20`
 - `POST /temp-bans`
@@ -270,6 +288,7 @@ Whitelist entries are evaluated before dynamic defense, so matching sources are 
 - `POST /dynamic-rate-limits/batch`
 - `DELETE /dynamic-rate-limits/{id}`
 - `DELETE /dynamic-rate-limits/batch`
+- `DELETE /dynamic-rate-limits?enabled=true&priority=10&protocol=tcp&port=443&packets_per_second=1000&burst=2000`
 
 Custom dynamic rate limits are enabled rows with `priority`, `protocol`, optional `port`, `packets_per_second`, `burst`, and optional `comment`. Lower numeric priority is higher priority when multiple rows compile to the same effective key. A row with `protocol=any` and `port=443` rate-limits traffic to destination port 443 for protocols that expose a destination port; `protocol=tcp` with no port rate-limits all TCP traffic per source IP. Custom limits run before the global `ip_rate_limit` and `flood` checks.
 
@@ -333,6 +352,8 @@ The HTTP stream also supports node filtering directly:
 curl -H "X-API-Token: $XDP_FIREWALL_API_TOKEN" \
   "http://127.0.0.1:8080/drop-events/stream?node_id=node-1"
 ```
+
+Each NDJSON event includes `node_id`, `interface_name`, `time`, `event_time_ns`, `cpu`, `reason`, `src`, `family`, `proto`, `dport`, `country`, `threat_source`, and `action`.
 
 For realtime drop events, start the agent with the current image and run:
 
