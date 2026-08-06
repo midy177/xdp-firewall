@@ -822,8 +822,10 @@ async fn delete_rules_batch(
         .all(&txn)
         .await?;
 
-    ensure_all_rule_batch_selectors_found(&targets, &ids, &rule_keys)?;
     let target_ids = targets.iter().map(|rule| rule.id).collect::<Vec<_>>();
+    if target_ids.is_empty() {
+        return Err(ApiError::not_found("rule not found"));
+    }
     let deleted = firewall_rule::Entity::delete_many()
         .filter(firewall_rule::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
         .filter(firewall_rule::Column::Id.is_in(target_ids.iter().copied()))
@@ -2242,34 +2244,6 @@ fn ensure_all_ids_deleted(
     Ok(())
 }
 
-fn ensure_all_rule_batch_selectors_found(
-    targets: &[firewall_rule::Model],
-    ids: &[i32],
-    rule_keys: &[String],
-) -> ApiResult<()> {
-    if !ids.is_empty() {
-        let found_ids = targets.iter().map(|rule| rule.id).collect::<HashSet<_>>();
-        if ids.iter().any(|id| !found_ids.contains(id)) {
-            return Err(ApiError::not_found("rule not found"));
-        }
-    }
-
-    if !rule_keys.is_empty() {
-        let found_rule_keys = targets
-            .iter()
-            .filter_map(|rule| rule.rule_key.as_deref())
-            .collect::<HashSet<_>>();
-        if rule_keys
-            .iter()
-            .any(|rule_key| !found_rule_keys.contains(rule_key.as_str()))
-        {
-            return Err(ApiError::not_found("rule not found"));
-        }
-    }
-
-    Ok(())
-}
-
 impl RuleQuery {
     fn pagination(&self) -> PaginationQuery {
         PaginationQuery {
@@ -3213,7 +3187,7 @@ mod tests {
                 "/rules/batch",
                 json!({
                     "ids": [by_id["data"]["id"]],
-                    "rule_keys": ["batch-by-key", ""]
+                    "rule_keys": ["batch-by-key", "missing-rule-key", ""]
                 }),
             )
             .await,
