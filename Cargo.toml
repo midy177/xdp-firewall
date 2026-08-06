@@ -1,6 +1,6 @@
 [package]
 name = "xdp-firewall"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 description = "Distributed XDP firewall with database-backed policy"
 license = "MIT"
