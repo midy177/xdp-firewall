@@ -2210,6 +2210,11 @@ fn validate_rule_batch_delete_request(
     if entries == 0 {
         return Err(ApiError::bad_request("ids or rule_keys must not be empty"));
     }
+    if !ids.is_empty() && !rule_keys.is_empty() {
+        return Err(ApiError::bad_request(
+            "ids and rule_keys cannot be used together",
+        ));
+    }
     if entries > MAX_BATCH_SIZE {
         return Err(ApiError::bad_request(format!(
             "ids and rule_keys must contain at most {MAX_BATCH_SIZE} entries"
@@ -3125,7 +3130,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_batch_delete_supports_ids_and_rule_keys() {
+    async fn rule_batch_delete_supports_either_ids_or_rule_keys() {
         let (app, _db) = test_router().await;
 
         let by_id = response_json(
@@ -3145,7 +3150,7 @@ mod tests {
             .await,
         )
         .await;
-        response_json(
+        let by_key = response_json(
             send_json(
                 &app,
                 Method::POST,
@@ -3162,7 +3167,52 @@ mod tests {
             .await,
         )
         .await;
-        response_json(
+
+        let mixed_error = response_error(
+            send_json(
+                &app,
+                Method::DELETE,
+                "/rules/batch",
+                json!({
+                    "ids": [by_id["data"]["id"]],
+                    "rule_keys": ["batch-by-key"]
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(mixed_error.contains("ids and rule_keys cannot be used together"));
+
+        let deleted_by_id = response_json(
+            send_json(
+                &app,
+                Method::DELETE,
+                "/rules/batch",
+                json!({
+                    "ids": [by_id["data"]["id"]],
+                    "rule_keys": ["", " "]
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(deleted_by_id["data"]["deleted"], 1);
+
+        let deleted_by_key = response_json(
+            send_json(
+                &app,
+                Method::DELETE,
+                "/rules/batch",
+                json!({
+                    "rule_keys": [by_key["data"]["rule_key"]]
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(deleted_by_key["data"]["deleted"], 1);
+
+        let keep = response_json(
             send_json(
                 &app,
                 Method::POST,
@@ -3180,24 +3230,9 @@ mod tests {
         )
         .await;
 
-        let deleted = response_json(
-            send_json(
-                &app,
-                Method::DELETE,
-                "/rules/batch",
-                json!({
-                    "ids": [by_id["data"]["id"]],
-                    "rule_keys": ["batch-by-key", "missing-rule-key", ""]
-                }),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(deleted["data"]["deleted"], 2);
-
         let remaining = response_json(send_empty(&app, Method::GET, "/rules").await).await;
         assert_eq!(remaining["total"], 1);
-        assert_eq!(remaining["items"][0]["rule_key"], "batch-keep");
+        assert_eq!(remaining["items"][0]["id"], keep["data"]["id"]);
     }
 
     #[tokio::test]

@@ -94,7 +94,7 @@ Every mutating endpoint that immediately changes the active firewall policy incr
 
 List endpoints return `items`, `total`, `page`, `page_size`, and `total_pages`. The default page size is `20`; the maximum is `500`.
 
-Batch create endpoints use `{"items":[...]}` and accept the same item shape as the single-row `POST` endpoint. Batch delete endpoints use `{"ids":[1,2]}`. `DELETE /rules/batch` also accepts `{"ids":[1,2],"rule_keys":["edge-web-deny"]}` and deletes the union of matching IDs and rule keys. Batch requests are limited to 500 entries, run in a single transaction, and bump the policy version once after the whole batch succeeds.
+Batch create endpoints use `{"items":[...]}` and accept the same item shape as the single-row `POST` endpoint. Batch delete endpoints use `{"ids":[1,2]}`. `DELETE /rules/batch` also accepts `{"rule_keys":["edge-web-deny"]}` as an alternative to `ids`; effective `ids` and `rule_keys` cannot be used together. Batch requests are limited to 500 entries, run in a single transaction, and bump the policy version once after the whole batch succeeds.
 
 Most write endpoints return `{"version":...,"data":...}`. `POST /policy/seed-example` returns the policy snapshot directly. Error responses use `{"error":"..."}`. `enabled` defaults to `true` for configuration resources when omitted. `action` accepts `allow` and `deny`; `drop` is accepted and normalized to `deny`. `protocol` accepts `any`, `tcp`, `udp`, and `icmp`; `port` must be 1-65535 and cannot be set for `icmp`.
 
