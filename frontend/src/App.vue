@@ -1434,7 +1434,7 @@ const apiDocsZh: ApiDocSection[] = [
     endpoints: [
       { method: "GET", path: "分页接口", summary: "列表响应统一为 {items,total,page,page_size,total_pages}；page 默认 1，page_size 默认 20，最大 500。" },
       { method: "POST", path: "批量新增", summary: "批量新增请求体为 {\"items\":[...]}，items 必须非空且最多 500 项；每项格式同单条 POST。" },
-      { method: "DELETE", path: "批量删除", summary: "批量删除请求体为 {\"ids\":[1,2]}，ids 必须非空且最多 500 项。" },
+      { method: "DELETE", path: "批量删除", summary: "批量删除请求体通常为 {\"ids\":[1,2]}，普通规则还支持 {\"ids\":[1,2],\"rule_keys\":[\"edge-web-deny\"]}；有效条目最多 500 项。" },
       { method: "POST", path: "写操作响应", summary: "大多数写操作返回 {version,data}；POST /policy/seed-example 返回策略快照本身。配置类 enabled 省略时默认 true。" },
       { method: "ANY", path: "字段约束", summary: "action 支持 allow、deny，drop 会归一化为 deny；protocol 支持 any、tcp、udp、icmp；port 范围 1-65535，icmp 不能设置 port。" },
       { method: "ANY", path: "/policies", summary: "多策略 API 已移除，/policies 和 /policies/{path} 会返回 404；请使用单策略资源接口。" }
@@ -1481,7 +1481,7 @@ const apiDocsZh: ApiDocSection[] = [
       },
       { method: "POST", path: "/rules/batch", summary: "批量新增普通规则；请求体为 {\"items\":[...]}，每项格式同 POST /rules。" },
       { method: "DELETE", path: "/rules/{id}", summary: "按 id 删除普通规则。" },
-      { method: "DELETE", path: "/rules/batch", summary: "按 id 批量删除普通规则；请求体为 {\"ids\":[1,2]}。" },
+      { method: "DELETE", path: "/rules/batch", summary: "按 id 和 rule_key 批量删除普通规则；请求体为 {\"ids\":[1,2],\"rule_keys\":[\"edge-web-deny\"]}，两者至少提供一个。" },
       {
         method: "DELETE",
         path: "/rules?action=deny&cidr=203.0.113.0/24&protocol=tcp&port=443&priority=10",

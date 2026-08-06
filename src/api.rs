@@ -144,6 +144,14 @@ struct BatchDeleteRequest {
     ids: Vec<i32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RuleBatchDeleteRequest {
+    #[serde(default)]
+    ids: Vec<i32>,
+    #[serde(default)]
+    rule_keys: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct BatchDeleteResponse {
     deleted: u64,
@@ -795,16 +803,33 @@ async fn delete_rule(
 
 async fn delete_rules_batch(
     State(state): State<ApiState>,
-    Json(request): Json<BatchDeleteRequest>,
+    Json(request): Json<RuleBatchDeleteRequest>,
 ) -> ApiResult<Json<Versioned<BatchDeleteResponse>>> {
-    let ids = validate_batch_ids(request.ids)?;
+    let (ids, rule_keys) = validate_rule_batch_delete_request(request)?;
     let txn = state.db.begin().await?;
+
+    let mut selector = Condition::any();
+    if !ids.is_empty() {
+        selector = selector.add(firewall_rule::Column::Id.is_in(ids.iter().copied()));
+    }
+    if !rule_keys.is_empty() {
+        selector = selector.add(firewall_rule::Column::RuleKey.is_in(rule_keys.iter().cloned()));
+    }
+
+    let targets = firewall_rule::Entity::find()
+        .filter(firewall_rule::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(selector)
+        .all(&txn)
+        .await?;
+
+    ensure_all_rule_batch_selectors_found(&targets, &ids, &rule_keys)?;
+    let target_ids = targets.iter().map(|rule| rule.id).collect::<Vec<_>>();
     let deleted = firewall_rule::Entity::delete_many()
         .filter(firewall_rule::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
-        .filter(firewall_rule::Column::Id.is_in(ids.iter().copied()))
+        .filter(firewall_rule::Column::Id.is_in(target_ids.iter().copied()))
         .exec(&txn)
         .await?;
-    ensure_all_ids_deleted(deleted.rows_affected, ids.len(), "rule not found")?;
+    ensure_all_ids_deleted(deleted.rows_affected, target_ids.len(), "rule not found")?;
     let version =
         db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
     txn.commit().await?;
@@ -2162,6 +2187,50 @@ fn validate_batch_ids(ids: Vec<i32>) -> ApiResult<Vec<i32>> {
     Ok(unique)
 }
 
+fn validate_rule_batch_delete_request(
+    request: RuleBatchDeleteRequest,
+) -> ApiResult<(Vec<i32>, Vec<String>)> {
+    let mut entries = request.ids.len();
+    let ids = validate_optional_batch_ids(request.ids)?;
+    let mut seen = HashSet::with_capacity(request.rule_keys.len());
+    let mut rule_keys = Vec::with_capacity(request.rule_keys.len());
+
+    for rule_key in request.rule_keys {
+        let Some(rule_key) = normalize_rule_key(Some(rule_key))? else {
+            continue;
+        };
+        entries += 1;
+        if seen.insert(rule_key.clone()) {
+            rule_keys.push(rule_key);
+        }
+    }
+
+    if entries == 0 {
+        return Err(ApiError::bad_request("ids or rule_keys must not be empty"));
+    }
+    if entries > MAX_BATCH_SIZE {
+        return Err(ApiError::bad_request(format!(
+            "ids and rule_keys must contain at most {MAX_BATCH_SIZE} entries"
+        )));
+    }
+
+    Ok((ids, rule_keys))
+}
+
+fn validate_optional_batch_ids(ids: Vec<i32>) -> ApiResult<Vec<i32>> {
+    let mut seen = HashSet::with_capacity(ids.len());
+    let mut unique = Vec::with_capacity(ids.len());
+    for id in ids {
+        if id <= 0 {
+            return Err(ApiError::bad_request("ids must be positive integers"));
+        }
+        if seen.insert(id) {
+            unique.push(id);
+        }
+    }
+    Ok(unique)
+}
+
 fn ensure_all_ids_deleted(
     deleted: u64,
     requested: usize,
@@ -2170,6 +2239,34 @@ fn ensure_all_ids_deleted(
     if deleted != requested as u64 {
         return Err(ApiError::not_found(not_found));
     }
+    Ok(())
+}
+
+fn ensure_all_rule_batch_selectors_found(
+    targets: &[firewall_rule::Model],
+    ids: &[i32],
+    rule_keys: &[String],
+) -> ApiResult<()> {
+    if !ids.is_empty() {
+        let found_ids = targets.iter().map(|rule| rule.id).collect::<HashSet<_>>();
+        if ids.iter().any(|id| !found_ids.contains(id)) {
+            return Err(ApiError::not_found("rule not found"));
+        }
+    }
+
+    if !rule_keys.is_empty() {
+        let found_rule_keys = targets
+            .iter()
+            .filter_map(|rule| rule.rule_key.as_deref())
+            .collect::<HashSet<_>>();
+        if rule_keys
+            .iter()
+            .any(|rule_key| !found_rule_keys.contains(rule_key.as_str()))
+        {
+            return Err(ApiError::not_found("rule not found"));
+        }
+    }
+
     Ok(())
 }
 
@@ -3051,6 +3148,82 @@ mod tests {
             response_json(send_empty(&app, Method::DELETE, "/rules?rule_key=edge-web-deny").await)
                 .await;
         assert_eq!(deleted["data"]["deleted"], 1);
+    }
+
+    #[tokio::test]
+    async fn rule_batch_delete_supports_ids_and_rule_keys() {
+        let (app, _db) = test_router().await;
+
+        let by_id = response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules",
+                json!({
+                    "rule_key": "batch-by-id",
+                    "priority": 10,
+                    "action": "deny",
+                    "cidr": "203.0.113.0/24",
+                    "protocol": "tcp",
+                    "port": 443
+                }),
+            )
+            .await,
+        )
+        .await;
+        response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules",
+                json!({
+                    "rule_key": "batch-by-key",
+                    "priority": 20,
+                    "action": "allow",
+                    "cidr": "198.51.100.0/24",
+                    "protocol": "udp",
+                    "port": 53
+                }),
+            )
+            .await,
+        )
+        .await;
+        response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules",
+                json!({
+                    "rule_key": "batch-keep",
+                    "priority": 30,
+                    "action": "deny",
+                    "cidr": "192.0.2.0/24",
+                    "protocol": "any",
+                    "port": 80
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        let deleted = response_json(
+            send_json(
+                &app,
+                Method::DELETE,
+                "/rules/batch",
+                json!({
+                    "ids": [by_id["data"]["id"]],
+                    "rule_keys": ["batch-by-key", ""]
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(deleted["data"]["deleted"], 2);
+
+        let remaining = response_json(send_empty(&app, Method::GET, "/rules").await).await;
+        assert_eq!(remaining["total"], 1);
+        assert_eq!(remaining["items"][0]["rule_key"], "batch-keep");
     }
 
     #[tokio::test]
