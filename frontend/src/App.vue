@@ -473,6 +473,13 @@
             </Select>
           </label>
           <label class="field">
+            <span>{{ t("status") }}</span>
+            <Select v-model="threatForm.enabled" aria-label="Threat source status">
+              <option value="true">{{ t("enabled") }}</option>
+              <option value="false">{{ t("disabledShort") }}</option>
+            </Select>
+          </label>
+          <label class="field">
             <span>{{ t("score") }}</span>
             <Input v-model.number="threatForm.min_score" type="number" aria-label="Score" />
           </label>
@@ -520,6 +527,7 @@
             <tr>
               <th>{{ t("name") }}</th>
               <th>{{ t("format") }}</th>
+              <th>{{ t("status") }}</th>
               <th>{{ t("score") }}</th>
               <th>URL</th>
               <th></th>
@@ -527,11 +535,12 @@
           </thead>
           <tbody>
             <tr v-if="!loading && threatSources.length === 0">
-              <td colspan="5" class="empty">{{ t("emptyThreats") }}</td>
+              <td colspan="6" class="empty">{{ t("emptyThreats") }}</td>
             </tr>
             <tr v-for="source in threatSources" :key="source.id">
               <td>{{ source.name }}</td>
               <td>{{ source.format }}</td>
+              <td><Badge :tone="source.enabled ? 'green' : 'amber'">{{ source.enabled ? t("enabledShort") : t("disabledShort") }}</Badge></td>
               <td>{{ source.min_score ?? '' }}</td>
               <td class="clip">{{ source.url }}</td>
               <td class="right"><Button variant="ghost" :title="t('delete')" :disabled="actionBusy" @click="runAction(() => deleteItem(`/threat-sources/${source.id}`))"><Trash2 :size="15" /></Button></td>
@@ -1014,7 +1023,7 @@ import Select from "./components/ui/Select.vue";
 
 type Rule = { id: number; rule_key?: string | null; priority: number; action: string; cidr: string; protocol?: string | null; port?: number | null };
 type GeoCountry = { id: number; country: string; action: string; packets_per_second?: number; burst?: number };
-type ThreatSource = { id: number; name: string; url: string; format: string; min_score?: number };
+type ThreatSource = { id: number; enabled: boolean; name: string; url: string; format: string; min_score?: number };
 type TrustedCidr = { id: number; cidr: string; enabled: boolean; comment?: string };
 type DynamicRateLimit = { id: number; enabled: boolean; priority: number; protocol: string; port?: number | null; packets_per_second: number; burst: number; comment?: string | null };
 type TempBan = { id: number; ip: string; protocol: string; port?: number | null; expires_at: string; comment?: string | null; created_at: string };
@@ -1107,7 +1116,7 @@ const geoForm = reactive({ country: "CN", action: "allow" });
 const geoFilters = reactive({ country: "all", action: "all", enabled: "all" });
 const geoLookupForm = reactive({ ip: "8.8.8.8" });
 const geoLookupResult = ref<GeoLookupResponse | null>(null);
-const threatForm = reactive({ name: "ipsum", url: "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt", format: "ipsum", min_score: 3 });
+const threatForm = reactive({ name: "ipsum", url: "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt", format: "ipsum", enabled: "true", min_score: 3 });
 const threatFilters = reactive({ name: "", url: "", format: "all", enabled: "all", min_score: "" });
 const trustedForm = reactive({ cidr: "10.0.0.0/8", comment: "" });
 const trustedFilters = reactive({ cidr: "", enabled: "all" });
@@ -1550,6 +1559,7 @@ const apiDocsZh: ApiDocSection[] = [
   "name": "ipsum",
   "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt",
   "format": "ipsum",
+  "enabled": true,
   "min_score": 3
 }`
       },
@@ -1777,6 +1787,7 @@ const apiDocsEn: ApiDocSection[] = [
   "name": "ipsum",
   "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt",
   "format": "ipsum",
+  "enabled": true,
   "min_score": 3
 }`
       },
@@ -2988,6 +2999,7 @@ function validateThreatForm() {
   const url = requireHttpUrl(t("threatSourceUrl"), threatForm.url);
   const format = requireOneOf(t("threatSourceFormat"), threatForm.format, threatFormats);
   return {
+    enabled: threatForm.enabled === "true",
     name,
     url,
     format,

@@ -380,7 +380,7 @@ main {
 }
 
 .threat-form {
-  grid-template-columns: 160px minmax(280px, 640px) 150px 120px 38px;
+  grid-template-columns: 160px minmax(280px, 1fr) 150px 112px 100px 38px;
   justify-content: start;
 }
 
