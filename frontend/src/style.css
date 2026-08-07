@@ -283,12 +283,12 @@ main {
 }
 
 .rule-form {
-  grid-template-columns: 92px 120px minmax(220px, 520px) 120px 100px 38px;
+  grid-template-columns: minmax(150px, 1.1fr) 120px 88px minmax(180px, 1.3fr) 100px 96px 38px;
   justify-content: start;
 }
 
 .rule-filter-form {
-  grid-template-columns: 120px minmax(220px, 1fr) 120px 100px 100px auto;
+  grid-template-columns: minmax(140px, 1fr) 112px minmax(180px, 1.3fr) 120px 96px 100px auto;
   border-bottom: 1px solid #dfe5eb;
 }
 
@@ -433,7 +433,7 @@ main {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-rows: 16px 38px 34px;
+  grid-template-rows: 16px 38px;
   align-content: start;
   gap: 5px;
   min-width: 0;
@@ -450,7 +450,8 @@ main {
 
 .field-error {
   display: -webkit-box;
-  min-height: 34px;
+  min-height: 0;
+  max-height: 0;
   color: #b42318;
   font-size: 12px;
   line-height: 1.35;
@@ -463,6 +464,8 @@ main {
 }
 
 .field-error.visible {
+  min-height: 16px;
+  max-height: 34px;
   visibility: visible;
 }
 
