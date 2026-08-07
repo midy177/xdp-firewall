@@ -543,7 +543,12 @@
               <td><Badge :tone="source.enabled ? 'green' : 'amber'">{{ source.enabled ? t("enabledShort") : t("disabledShort") }}</Badge></td>
               <td>{{ source.min_score ?? '' }}</td>
               <td class="clip">{{ source.url }}</td>
-              <td class="right"><Button variant="ghost" :title="t('delete')" :disabled="actionBusy" @click="runAction(() => deleteItem(`/threat-sources/${source.id}`))"><Trash2 :size="15" /></Button></td>
+              <td class="right">
+                <div class="row-actions">
+                  <Button variant="ghost" :title="source.enabled ? t('stop') : t('start')" :disabled="actionBusy" @click="runAction(() => updateThreatSourceEnabled(source))"><Power :size="15" /></Button>
+                  <Button variant="ghost" :title="t('delete')" :disabled="actionBusy" @click="runAction(() => deleteItem(`/threat-sources/${source.id}`))"><Trash2 :size="15" /></Button>
+                </div>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -1015,7 +1020,7 @@ X-API-Token: &lt;token&gt;</code></pre>
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { Activity, Ban, BookOpen, ChevronLeft, ChevronRight, DatabaseZap, Globe2, KeyRound, ListFilter, Plus, RefreshCcw, Search, Server, ShieldCheck, Square, Trash2, X } from "lucide-vue-next";
+import { Activity, Ban, BookOpen, ChevronLeft, ChevronRight, DatabaseZap, Globe2, KeyRound, ListFilter, Plus, Power, RefreshCcw, Search, Server, ShieldCheck, Square, Trash2, X } from "lucide-vue-next";
 import Badge from "./components/ui/Badge.vue";
 import Button from "./components/ui/Button.vue";
 import Input from "./components/ui/Input.vue";
@@ -1563,6 +1568,14 @@ const apiDocsZh: ApiDocSection[] = [
   "min_score": 3
 }`
       },
+      {
+        method: "PUT",
+        path: "/threat-sources/{id}",
+        summary: "修改威胁源启用状态；关闭时会清理该源已持久化的状态和前缀并更新策略版本，开启时会排队刷新。",
+        body: `{
+  "enabled": false
+}`
+      },
       { method: "POST", path: "/threat-sources/batch", summary: "批量新增威胁源；请求体为 {\"items\":[...]}，每项格式同 POST /threat-sources。" },
       { method: "DELETE", path: "/threat-sources/{id}", summary: "按 id 删除威胁源。" },
       { method: "DELETE", path: "/threat-sources/batch", summary: "按 id 批量删除威胁源；请求体为 {\"ids\":[1,2]}。" },
@@ -1789,6 +1802,14 @@ const apiDocsEn: ApiDocSection[] = [
   "format": "ipsum",
   "enabled": true,
   "min_score": 3
+}`
+      },
+      {
+        method: "PUT",
+        path: "/threat-sources/{id}",
+        summary: "Update a threat feed enabled state. Disabling clears the persisted state and prefixes for that source and bumps the policy version; enabling queues a refresh.",
+        body: `{
+  "enabled": false
 }`
       },
       { method: "POST", path: "/threat-sources/batch", summary: "Create threat sources in one request; body is {\"items\":[...]} and each item matches POST /threat-sources." },
@@ -2869,6 +2890,15 @@ async function createThreat() {
   await api("threat-sources", {
     method: "POST",
     body: JSON.stringify(payload)
+  });
+  await refreshAll();
+  showNotice(t("saved"));
+}
+
+async function updateThreatSourceEnabled(source: ThreatSource) {
+  await api(`threat-sources/${source.id}`, {
+    method: "PUT",
+    body: JSON.stringify({ enabled: !source.enabled })
   });
   await refreshAll();
   showNotice(t("saved"));

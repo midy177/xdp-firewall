@@ -519,6 +519,12 @@ tbody tr:hover {
   text-align: right;
 }
 
+.row-actions {
+  display: inline-flex;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
 .pager {
   display: flex;
   align-items: center;

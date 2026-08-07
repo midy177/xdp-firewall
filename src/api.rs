@@ -12,7 +12,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{any, delete, get, post},
+    routing::{any, delete, get, post, put},
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
@@ -332,6 +332,11 @@ struct CreateThreatSourceRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct UpdateThreatSourceRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateTrustedCidrRequest {
     enabled: Option<bool>,
     cidr: String,
@@ -473,7 +478,10 @@ fn router(state: ApiState) -> Router {
             post(create_threat_sources).delete(delete_threat_sources_batch),
         )
         .route("/threat-sources/refresh", post(refresh_threat_sources))
-        .route("/threat-sources/{id}", delete(delete_threat_source))
+        .route(
+            "/threat-sources/{id}",
+            put(update_threat_source).delete(delete_threat_source),
+        )
         .route(
             "/dynamic-defense",
             get(get_dynamic_defense).put(update_dynamic_defense),
@@ -1275,6 +1283,45 @@ async fn create_threat_sources(
             data: rows,
         }),
     ))
+}
+
+async fn update_threat_source(
+    State(state): State<ApiState>,
+    Path(id): Path<i32>,
+    Json(request): Json<UpdateThreatSourceRequest>,
+) -> ApiResult<Json<Versioned<threat_source::Model>>> {
+    let row = threat_source::Entity::find()
+        .filter(threat_source::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .filter(threat_source::Column::Id.eq(id))
+        .one(&state.db)
+        .await?
+        .ok_or_else(|| ApiError::not_found("threat source not found"))?;
+
+    if row.enabled == request.enabled {
+        return Ok(Json(Versioned {
+            version: current_policy_version(&state.db).await?,
+            data: row,
+        }));
+    }
+
+    let source_name = row.name.clone();
+    let txn = state.db.begin().await?;
+    let mut active: threat_source::ActiveModel = row.into();
+    active.enabled = Set(request.enabled);
+    active.updated_at = Set(chrono::Utc::now().naive_utc());
+    let row = active.update(&txn).await?;
+    if !request.enabled {
+        delete_threat_source_states_by_name(&txn, std::iter::once(source_name.as_str())).await?;
+    }
+    let version =
+        db::next_policy_version_in_transaction(&txn, firewall::DEFAULT_POLICY_NAME).await?;
+    txn.commit().await?;
+
+    if request.enabled {
+        spawn_threat_refresh(state.db.clone());
+    }
+
+    Ok(Json(Versioned { version, data: row }))
 }
 
 fn threat_source_active_model(
@@ -2782,6 +2829,7 @@ fn normalize_threat_format(value: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::entities::threat_prefix;
     use axum::{
         body::to_bytes,
         http::{Method, Request},
@@ -3439,6 +3487,99 @@ mod tests {
         )
         .await;
         assert_eq!(deleted["data"]["deleted"], 1);
+    }
+
+    #[tokio::test]
+    async fn threat_source_update_toggles_enabled_and_cleans_persisted_data() {
+        let (app, db) = test_router().await;
+        let created = response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/threat-sources",
+                json!({
+                    "enabled": false,
+                    "name": "toggle-feed",
+                    "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt",
+                    "format": "cidr"
+                }),
+            )
+            .await,
+        )
+        .await;
+        let id = created["data"]["id"].as_i64().unwrap() as i32;
+
+        let row = threat_source::Entity::find_by_id(id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active: threat_source::ActiveModel = row.into();
+        active.enabled = Set(true);
+        active.update(&db).await.unwrap();
+        threat_source_state::ActiveModel {
+            policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+            source_name: Set("toggle-feed".to_string()),
+            fingerprint: Set("stale-fingerprint".to_string()),
+            prefix_count: Set(1),
+            last_checked_at: Set(chrono::Utc::now().naive_utc()),
+            last_changed_at: Set(Some(chrono::Utc::now().naive_utc())),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+        threat_prefix::ActiveModel {
+            policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+            source_name: Set("toggle-feed".to_string()),
+            cidrs_json: Set("[\"203.0.113.0/24\"]".to_string()),
+            updated_at: Set(chrono::Utc::now().naive_utc()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
+
+        let disabled = response_json(
+            send_json(
+                &app,
+                Method::PUT,
+                &format!("/threat-sources/{id}"),
+                json!({"enabled": false}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(disabled["data"]["enabled"], false);
+        let stale_states = threat_source_state::Entity::find()
+            .filter(threat_source_state::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+            .count(&db)
+            .await
+            .unwrap();
+        assert_eq!(stale_states, 0);
+        let stale_prefixes = threat_prefix::Entity::find()
+            .filter(threat_prefix::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+            .count(&db)
+            .await
+            .unwrap();
+        assert_eq!(stale_prefixes, 0);
+        let disabled_query =
+            response_json(send_empty(&app, Method::GET, "/threat-sources?enabled=false").await)
+                .await;
+        assert_eq!(disabled_query["total"], 1);
+
+        let enabled = response_json(
+            send_json(
+                &app,
+                Method::PUT,
+                &format!("/threat-sources/{id}"),
+                json!({"enabled": true}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(enabled["data"]["enabled"], true);
     }
 
     #[tokio::test]

@@ -59,6 +59,7 @@ Useful endpoints:
 - `POST /threat-sources/refresh`
 - `POST /threat-sources`
 - `POST /threat-sources/batch`
+- `PUT /threat-sources/{id}`
 - `DELETE /threat-sources/{id}`
 - `DELETE /threat-sources/batch`
 - `DELETE /threat-sources?name=test-feed`
@@ -100,7 +101,7 @@ Most write endpoints return `{"version":...,"data":...}`. `POST /policy/seed-exa
 
 `GET /rules` supports optional filters for `rule_key`, `action`, `cidr`, `protocol`, `port`, and `priority`; omit all filters to page through all rules. Filters are combined with AND semantics. `rule_key` is optional on create; when present it must be unique within the policy and duplicate creates return a conflict instead of updating the existing rule. `DELETE /rules` deletes by `rule_key` when supplied, otherwise by the complete rule tuple and requires all five fields: `action`, `cidr`, `protocol`, `port`, and `priority`. Use `DELETE /rules/{id}` for rules that do not have a `rule_key` or stored port. `protocol=any` also matches older rules whose protocol field is unset.
 
-`GET /geo-countries`, `GET /temp-bans`, `GET /threat-sources`, `GET /dynamic-rate-limits`, and `GET /trusted-cidrs` also support optional field filters combined with AND semantics. Temporary bans support `ip`, `protocol`, and `port` filters and should still be deleted by ID. Their collection DELETE endpoints require the identifying fields: country rules require `country`, `action`, and `enabled`; threat sources require the unique `name`; dynamic rate limits require `enabled`, `priority`, `protocol`, `port`, `packets_per_second`, and `burst`; trusted CIDRs require the unique `cidr`. Use the existing ID DELETE endpoints for configurations whose identifying fields are not stable or unique. Dynamic rate limits without a stored port must also be deleted by ID.
+`GET /geo-countries`, `GET /temp-bans`, `GET /threat-sources`, `GET /dynamic-rate-limits`, and `GET /trusted-cidrs` also support optional field filters combined with AND semantics. Temporary bans support `ip`, `protocol`, and `port` filters and should still be deleted by ID. `PUT /threat-sources/{id}` accepts `{"enabled":true}` or `{"enabled":false}` to turn a threat source on or off. Their collection DELETE endpoints require the identifying fields: country rules require `country`, `action`, and `enabled`; threat sources require the unique `name`; dynamic rate limits require `enabled`, `priority`, `protocol`, `port`, `packets_per_second`, and `burst`; trusted CIDRs require the unique `cidr`. Use the existing ID DELETE endpoints for configurations whose identifying fields are not stable or unique. Dynamic rate limits without a stored port must also be deleted by ID.
 
 The removed multi-policy endpoints `/policies` and `/policies/{path}` return 404 with a migration message; use the single-policy resource endpoints above.
 
