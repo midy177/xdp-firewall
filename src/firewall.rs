@@ -515,6 +515,13 @@ pub async fn seed_example_policy(db: &DatabaseConnection, args: SeedExampleArgs)
     let now = chrono::Utc::now().naive_utc();
     firewall_rule::ActiveModel {
         policy_name: Set(policy_name.to_string()),
+        rule_key: Set(firewall_rule::generated_rule_key(
+            10,
+            "deny",
+            "203.0.113.0/24",
+            None,
+            None,
+        )),
         enabled: Set(true),
         priority: Set(10),
         action: Set("deny".to_string()),
@@ -529,6 +536,13 @@ pub async fn seed_example_policy(db: &DatabaseConnection, args: SeedExampleArgs)
     .await?;
     firewall_rule::ActiveModel {
         policy_name: Set(policy_name.to_string()),
+        rule_key: Set(firewall_rule::generated_rule_key(
+            20,
+            "allow",
+            "10.0.0.0/8",
+            None,
+            None,
+        )),
         enabled: Set(true),
         priority: Set(20),
         action: Set("allow".to_string()),

@@ -1,7 +1,7 @@
 pub mod entities;
 
 use anyhow::{Context, Result, bail};
-use sea_orm::sea_query::Index;
+use sea_orm::sea_query::{Index, Value};
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction, DbBackend,
     DbErr, EntityName, Schema, Statement,
@@ -147,18 +147,7 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
         schema.create_table_from_entity(entities::temp_ban::Entity),
     )
     .await?;
-    create_index(
-        db,
-        Index::create()
-            .if_not_exists()
-            .name("idx_firewall_rules_policy_name_rule_key")
-            .table(entities::firewall_rule::Entity.table_ref())
-            .col(entities::firewall_rule::Column::PolicyName)
-            .col(entities::firewall_rule::Column::RuleKey)
-            .unique()
-            .to_owned(),
-    )
-    .await?;
+    ensure_firewall_rule_key_unique_index(db).await?;
     create_index(
         db,
         Index::create()
@@ -288,19 +277,204 @@ async fn create_index(
     Ok(())
 }
 
-async fn ensure_firewall_rule_key_column(db: &DatabaseConnection) -> Result<()> {
-    if column_exists(db, "firewall_rules", "rule_key").await? {
+async fn ensure_firewall_rule_key_unique_index(db: &DatabaseConnection) -> Result<()> {
+    drop_index_if_exists(
+        db,
+        "idx_firewall_rules_policy_name_rule_key",
+        "firewall_rules",
+    )
+    .await?;
+    create_index(
+        db,
+        Index::create()
+            .if_not_exists()
+            .name("idx_firewall_rules_rule_key")
+            .table(entities::firewall_rule::Entity.table_ref())
+            .col(entities::firewall_rule::Column::RuleKey)
+            .unique()
+            .to_owned(),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn drop_index_if_exists(db: &DatabaseConnection, index: &str, table: &str) -> Result<()> {
+    let backend = db.get_database_backend();
+    if !index_exists(db, index, table).await? {
         return Ok(());
     }
 
-    let backend = db.get_database_backend();
     let sql = match backend {
-        DbBackend::Postgres => "ALTER TABLE firewall_rules ADD COLUMN rule_key VARCHAR(128)",
-        DbBackend::MySql => "ALTER TABLE firewall_rules ADD COLUMN rule_key VARCHAR(128)",
-        DbBackend::Sqlite => "ALTER TABLE firewall_rules ADD COLUMN rule_key TEXT",
-        _ => bail!("unsupported database backend for firewall rule migration"),
+        DbBackend::Postgres | DbBackend::Sqlite => format!("DROP INDEX {index}"),
+        DbBackend::MySql => format!("DROP INDEX {index} ON {table}"),
+        _ => bail!("unsupported database backend for index migration"),
     };
     db.execute_raw(raw_sql(backend, sql)).await?;
+    Ok(())
+}
+
+async fn ensure_firewall_rule_key_column(db: &DatabaseConnection) -> Result<()> {
+    let backend = db.get_database_backend();
+    if !column_exists(db, "firewall_rules", "rule_key").await? {
+        let sql = match backend {
+            DbBackend::Postgres => "ALTER TABLE firewall_rules ADD COLUMN rule_key VARCHAR(128)",
+            DbBackend::MySql => "ALTER TABLE firewall_rules ADD COLUMN rule_key VARCHAR(128)",
+            DbBackend::Sqlite => "ALTER TABLE firewall_rules ADD COLUMN rule_key TEXT",
+            _ => bail!("unsupported database backend for firewall rule migration"),
+        };
+        db.execute_raw(raw_sql(backend, sql)).await?;
+    }
+
+    backfill_firewall_rule_keys(db).await?;
+    ensure_firewall_rule_key_not_null(db).await?;
+    Ok(())
+}
+
+async fn backfill_firewall_rule_keys(db: &DatabaseConnection) -> Result<()> {
+    let backend = db.get_database_backend();
+    let rows = db
+        .query_all_raw(raw_sql(
+            backend,
+            "SELECT id, priority, action, cidr, protocol, port FROM firewall_rules WHERE rule_key IS NULL OR TRIM(rule_key) = ''",
+        ))
+        .await?;
+
+    for row in rows {
+        let id = row.try_get::<i32>("", "id")?;
+        let priority = row.try_get::<i32>("", "priority")?;
+        let action = row.try_get::<String>("", "action")?;
+        let cidr = row.try_get::<String>("", "cidr")?;
+        let protocol = row.try_get::<Option<String>>("", "protocol")?;
+        let port = row.try_get::<Option<i32>>("", "port")?;
+        let rule_key = entities::firewall_rule::generated_rule_key(
+            priority,
+            &action,
+            &cidr,
+            protocol.as_deref(),
+            port,
+        );
+        db.execute_raw(Statement::from_sql_and_values(
+            backend,
+            format!(
+                "UPDATE firewall_rules SET rule_key = {} WHERE id = {}",
+                placeholder(backend, 1),
+                placeholder(backend, 2)
+            ),
+            vec![Value::String(Some(rule_key)), Value::Int(Some(id))],
+        ))
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_firewall_rule_key_not_null(db: &DatabaseConnection) -> Result<()> {
+    let backend = db.get_database_backend();
+    match backend {
+        DbBackend::Postgres => {
+            db.execute_raw(raw_sql(
+                backend,
+                "ALTER TABLE firewall_rules ALTER COLUMN rule_key SET NOT NULL",
+            ))
+            .await?;
+        }
+        DbBackend::MySql => {
+            db.execute_raw(raw_sql(
+                backend,
+                "ALTER TABLE firewall_rules MODIFY rule_key VARCHAR(128) NOT NULL",
+            ))
+            .await?;
+        }
+        DbBackend::Sqlite => {
+            if sqlite_column_is_not_null(db, "firewall_rules", "rule_key").await? {
+                return Ok(());
+            }
+            rebuild_sqlite_firewall_rules_with_required_rule_key(db).await?;
+        }
+        _ => bail!("unsupported database backend for firewall rule migration"),
+    }
+    Ok(())
+}
+
+async fn sqlite_column_is_not_null(
+    db: &DatabaseConnection,
+    table: &str,
+    column: &str,
+) -> Result<bool> {
+    let rows = db
+        .query_all_raw(raw_sql(
+            DbBackend::Sqlite,
+            format!("PRAGMA table_info('{table}')"),
+        ))
+        .await?;
+    for row in rows {
+        let name = row.try_get::<String>("", "name")?;
+        if name == column {
+            let not_null = row.try_get::<i32>("", "notnull")?;
+            return Ok(not_null != 0);
+        }
+    }
+    Ok(false)
+}
+
+async fn rebuild_sqlite_firewall_rules_with_required_rule_key(
+    db: &DatabaseConnection,
+) -> Result<()> {
+    let backend = DbBackend::Sqlite;
+    db.execute_raw(raw_sql(
+        backend,
+        "CREATE TABLE firewall_rules_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+            policy_name TEXT NOT NULL,
+            rule_key TEXT NOT NULL,
+            enabled BOOLEAN NOT NULL,
+            priority INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            cidr TEXT NOT NULL,
+            protocol TEXT,
+            port INTEGER,
+            comment TEXT,
+            updated_at TIMESTAMP NOT NULL
+        )",
+    ))
+    .await?;
+    db.execute_raw(raw_sql(
+        backend,
+        "INSERT INTO firewall_rules_new (
+            id,
+            policy_name,
+            rule_key,
+            enabled,
+            priority,
+            action,
+            cidr,
+            protocol,
+            port,
+            comment,
+            updated_at
+        )
+        SELECT
+            id,
+            policy_name,
+            rule_key,
+            enabled,
+            priority,
+            action,
+            cidr,
+            protocol,
+            port,
+            comment,
+            updated_at
+        FROM firewall_rules",
+    ))
+    .await?;
+    db.execute_raw(raw_sql(backend, "DROP TABLE firewall_rules"))
+        .await?;
+    db.execute_raw(raw_sql(
+        backend,
+        "ALTER TABLE firewall_rules_new RENAME TO firewall_rules",
+    ))
+    .await?;
     Ok(())
 }
 
@@ -329,6 +503,33 @@ async fn column_exists(db: &DatabaseConnection, table: &str, column: &str) -> Re
         .collect::<std::result::Result<Vec<_>, _>>()?
         .into_iter()
         .any(|name| name == column))
+}
+
+async fn index_exists(db: &DatabaseConnection, index: &str, table: &str) -> Result<bool> {
+    let backend = db.get_database_backend();
+    let sql = match backend {
+        DbBackend::Postgres => format!(
+            "SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND tablename = '{table}' AND indexname = '{index}'"
+        ),
+        DbBackend::MySql => format!(
+            "SELECT 1 FROM information_schema.statistics WHERE table_schema = database() AND table_name = '{table}' AND index_name = '{index}'"
+        ),
+        DbBackend::Sqlite => format!("PRAGMA index_list('{table}')"),
+        _ => bail!("unsupported database backend for schema inspection"),
+    };
+
+    if backend != DbBackend::Sqlite {
+        return Ok(db.query_one_raw(raw_sql(backend, sql)).await?.is_some());
+    }
+
+    Ok(db
+        .query_all_raw(raw_sql(backend, sql))
+        .await?
+        .into_iter()
+        .map(|row| row.try_get::<String>("", "name"))
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .any(|name| name == index))
 }
 
 pub async fn next_policy_version(db: &DatabaseConnection, policy_name: &str) -> Result<i64> {
@@ -396,4 +597,151 @@ pub fn placeholder(backend: DbBackend, n: usize) -> String {
 
 pub fn raw_sql(backend: DbBackend, sql: impl Into<String>) -> Statement {
     Statement::from_string(backend, sql.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn migrate_backfills_and_requires_firewall_rule_key() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options).await.unwrap();
+        let backend = DbBackend::Sqlite;
+
+        db.execute_raw(raw_sql(
+            backend,
+            "CREATE TABLE firewall_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                policy_name TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL,
+                priority INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                cidr TEXT NOT NULL,
+                protocol TEXT,
+                port INTEGER,
+                comment TEXT,
+                updated_at TIMESTAMP NOT NULL
+            )",
+        ))
+        .await
+        .unwrap();
+        db.execute_raw(raw_sql(
+            backend,
+            "INSERT INTO firewall_rules (
+                policy_name,
+                enabled,
+                priority,
+                action,
+                cidr,
+                protocol,
+                port,
+                comment,
+                updated_at
+            ) VALUES (
+                'default',
+                TRUE,
+                10,
+                'deny',
+                '203.0.113.0/24',
+                'tcp',
+                443,
+                NULL,
+                '2026-01-01 00:00:00'
+            )",
+        ))
+        .await
+        .unwrap();
+
+        migrate(&db).await.unwrap();
+
+        let row = db
+            .query_one_raw(raw_sql(
+                backend,
+                "SELECT rule_key FROM firewall_rules WHERE id = 1",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let rule_key = row.try_get::<String>("", "rule_key").unwrap();
+        assert_eq!(
+            rule_key,
+            entities::firewall_rule::generated_rule_key(
+                10,
+                "deny",
+                "203.0.113.0/24",
+                Some("tcp"),
+                Some(443),
+            )
+        );
+        assert!(
+            sqlite_column_is_not_null(&db, "firewall_rules", "rule_key")
+                .await
+                .unwrap()
+        );
+
+        let insert_null = db
+            .execute_raw(raw_sql(
+                backend,
+                "INSERT INTO firewall_rules (
+                    policy_name,
+                    rule_key,
+                    enabled,
+                    priority,
+                    action,
+                    cidr,
+                    protocol,
+                    port,
+                    comment,
+                    updated_at
+                ) VALUES (
+                    'default',
+                    NULL,
+                    TRUE,
+                    20,
+                    'allow',
+                    '198.51.100.0/24',
+                    'udp',
+                    53,
+                    NULL,
+                    '2026-01-01 00:00:00'
+                )",
+            ))
+            .await;
+        assert!(insert_null.is_err());
+
+        let insert_duplicate_rule_key = db
+            .execute_raw(raw_sql(
+                backend,
+                format!(
+                    "INSERT INTO firewall_rules (
+                        policy_name,
+                        rule_key,
+                        enabled,
+                        priority,
+                        action,
+                        cidr,
+                        protocol,
+                        port,
+                        comment,
+                        updated_at
+                    ) VALUES (
+                        'secondary',
+                        '{}',
+                        TRUE,
+                        20,
+                        'allow',
+                        '198.51.100.0/24',
+                        'udp',
+                        53,
+                        NULL,
+                        '2026-01-01 00:00:00'
+                    )",
+                    rule_key
+                ),
+            ))
+            .await;
+        assert!(insert_duplicate_rule_key.is_err());
+    }
 }

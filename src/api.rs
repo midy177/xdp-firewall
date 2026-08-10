@@ -782,7 +782,6 @@ async fn create_rules(
 }
 
 fn rule_active_model(request: CreateRuleRequest) -> ApiResult<firewall_rule::ActiveModel> {
-    validate_action(&request.action)?;
     let rule_key = normalize_rule_key(request.rule_key)?;
     let cidr = normalize_cidr(&request.cidr)?;
     let protocol = request
@@ -791,12 +790,22 @@ fn rule_active_model(request: CreateRuleRequest) -> ApiResult<firewall_rule::Act
         .map(normalize_protocol)
         .transpose()?;
     let port = validate_port(protocol.as_deref(), request.port)?;
+    let action = normalize_action(&request.action)?;
+    let rule_key = rule_key.unwrap_or_else(|| {
+        firewall_rule::generated_rule_key(
+            request.priority,
+            &action,
+            &cidr,
+            protocol.as_deref(),
+            port,
+        )
+    });
     Ok(firewall_rule::ActiveModel {
         policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
         rule_key: Set(rule_key),
         enabled: Set(request.enabled.unwrap_or(true)),
         priority: Set(request.priority),
-        action: Set(normalize_action(&request.action)?),
+        action: Set(action),
         cidr: Set(cidr),
         protocol: Set(protocol),
         port: Set(port),
@@ -2671,6 +2680,7 @@ fn rule_insert_error(value: sea_orm::DbErr) -> ApiError {
     let normalized = message.to_ascii_lowercase();
     if normalized.contains("rule_key")
         || normalized.contains("idx_firewall_rules_policy_name_rule_key")
+        || normalized.contains("idx_firewall_rules_rule_key")
     {
         return ApiError::conflict("firewall rule_key already exists");
     }
@@ -2899,6 +2909,18 @@ mod tests {
             threat_refresh_limiter: ThreatRefreshLimiter::default(),
         });
         (app, db)
+    }
+
+    fn assert_generated_rule_key(value: &Value) -> &str {
+        let rule_key = value.as_str().expect("rule_key must be a string");
+        assert_eq!(rule_key.len(), 36);
+        for index in [8, 13, 18, 23] {
+            assert_eq!(rule_key.as_bytes()[index], b'-');
+        }
+        assert!(rule_key.bytes().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23) || byte.is_ascii_hexdigit()
+        }));
+        rule_key
     }
 
     async fn send_json(app: &Router, method: Method, uri: &str, body: Value) -> Response {
@@ -3234,7 +3256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rule_key_is_optional_unique_and_deletable() {
+    async fn rule_key_is_generated_unique_and_deletable() {
         let (app, _db) = test_router().await;
         let created = response_json(
             send_json(
@@ -3255,6 +3277,28 @@ mod tests {
         .await;
         assert_eq!(created["data"]["rule_key"], "edge-web-deny");
 
+        let generated = response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules",
+                json!({
+                    "priority": 30,
+                    "action": "deny",
+                    "cidr": "192.0.2.0/24",
+                    "protocol": "any",
+                    "port": 80
+                }),
+            )
+            .await,
+        )
+        .await;
+        let generated_rule_key = assert_generated_rule_key(&generated["data"]["rule_key"]);
+        assert_eq!(
+            generated_rule_key,
+            firewall_rule::generated_rule_key(30, "deny", "192.0.2.0/24", Some("any"), Some(80),)
+        );
+
         let duplicate_error = response_error(
             send_json(
                 &app,
@@ -3274,24 +3318,23 @@ mod tests {
         .await;
         assert!(duplicate_error.contains("rule_key already exists"));
 
-        for _ in 0..2 {
-            response_json(
-                send_json(
-                    &app,
-                    Method::POST,
-                    "/rules",
-                    json!({
-                        "priority": 30,
-                        "action": "deny",
-                        "cidr": "192.0.2.0/24",
-                        "protocol": "any",
-                        "port": 80
-                    }),
-                )
-                .await,
+        let generated_duplicate_error = response_error(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules",
+                json!({
+                    "priority": 30,
+                    "action": "deny",
+                    "cidr": "192.0.2.0/24",
+                    "protocol": "any",
+                    "port": 80
+                }),
             )
-            .await;
-        }
+            .await,
+        )
+        .await;
+        assert!(generated_duplicate_error.contains("rule_key already exists"));
 
         let page =
             response_json(send_empty(&app, Method::GET, "/rules?rule_key=edge-web-deny").await)
