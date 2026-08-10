@@ -811,7 +811,10 @@
             <h2>{{ t("nodes") }}</h2>
             <p>{{ t("nodesHint") }}</p>
           </div>
-          <Button variant="secondary" :disabled="actionBusy" @click="runAction(() => loadNodes())"><RefreshCcw :class="{ spin: loading }" :size="16" /></Button>
+          <div class="panel-actions">
+            <Button variant="secondary" :title="t('refresh')" :disabled="actionBusy" @click="runAction(() => loadNodes())"><RefreshCcw :class="{ spin: loading }" :size="16" /></Button>
+            <Button variant="danger" :title="t('maintainNodes')" :disabled="actionBusy" @click="runAction(maintainNodes)"><Wrench :size="16" /><span>{{ t("maintainNodes") }}</span></Button>
+          </div>
         </div>
         <table>
           <thead>
@@ -831,8 +834,8 @@
             <tr v-for="node in nodes" :key="node.node_id">
               <td>{{ node.node_id }}</td>
               <td>{{ node.interface_name }}</td>
-              <td>{{ node.last_applied_version }}</td>
-              <td><Badge :tone="node.status === 'ok' ? 'green' : 'amber'">{{ node.status }}</Badge></td>
+              <td>{{ node.last_applied_version }}/{{ node.current_policy_version }}</td>
+              <td><Badge :tone="nodeSyncTone(node)">{{ nodeSyncStatusLabel(node.sync_status) }}</Badge></td>
               <td>{{ formatLocalTime(node.last_seen_at) }}</td>
               <td class="clip">{{ node.error ?? '' }}</td>
             </tr>
@@ -1020,7 +1023,7 @@ X-API-Token: &lt;token&gt;</code></pre>
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { Activity, Ban, BookOpen, ChevronLeft, ChevronRight, DatabaseZap, Globe2, KeyRound, ListFilter, Plus, Power, RefreshCcw, Search, Server, ShieldCheck, Square, Trash2, X } from "lucide-vue-next";
+import { Activity, Ban, BookOpen, ChevronLeft, ChevronRight, DatabaseZap, Globe2, KeyRound, ListFilter, Plus, Power, RefreshCcw, Search, Server, ShieldCheck, Square, Trash2, Wrench, X } from "lucide-vue-next";
 import Badge from "./components/ui/Badge.vue";
 import Button from "./components/ui/Button.vue";
 import Input from "./components/ui/Input.vue";
@@ -1043,7 +1046,7 @@ type DynamicDefense = {
   flood_burst?: number | null;
   flood_block_seconds?: number | null;
 };
-type NodeState = { node_id: string; interface_name: string; last_applied_version: number; status: string; last_seen_at: string; error?: string };
+type NodeState = { node_id: string; interface_name: string; last_applied_version: number; current_policy_version: number; status: string; sync_status: string; healthy: boolean; seconds_since_seen: number; last_seen_at: string; error?: string };
 type DropEvent = { local_id: number; node_id: string; interface_name: string; time: string; event_time_ns: number; cpu: number; reason: string; src: string; family: number; proto: string; dport: number; country?: string; threat_source?: string; action: string };
 type Snapshot = { version: number };
 type Page<T> = { items: T[]; total: number; page: number; page_size: number; total_pages: number };
@@ -1052,6 +1055,7 @@ type ApiDocEndpoint = { method: string; path: string; summary: string; body?: st
 type ApiDocSection = { title: string; description: string; endpoints: ApiDocEndpoint[] };
 type GeoRefreshResponse = { countries: string[]; checked_country_count: number; changed_country_count: number; prefix_count: number; provider_base_url: string; refresh_status?: string; cached?: boolean; running?: boolean };
 type ThreatRefreshResponse = { enabled_source_count: number; changed_source_count: number; prefix_count: number; refreshed: boolean; refresh_status?: string; cached?: boolean; running?: boolean };
+type NodeMaintenanceResponse = { deleted: number; max_age_seconds: number };
 type GeoLookupResponse = { ip: string; country?: string | null; country_name?: string | null };
 type Lang = "zh" | "en";
 type FieldKey = "ruleCidr" | "rulePort" | "geoLookupIp" | "tempBanIp" | "tempBanPort" | "dynamicRatePort" | "trustedCidr";
@@ -1144,6 +1148,7 @@ const actions = new Set(["allow", "deny"]);
 const protocols = new Set(["any", "tcp", "udp", "icmp"]);
 const threatFormats = new Set(["cidr", "ips", "ipsum", "voipbl", "spamhaus_drop"]);
 const pageSize = 20;
+const nodeMaintenanceMaxAgeSeconds = 300;
 const authHeader = "Authorization";
 const apiTokenHeader = "X-API-Token";
 
@@ -1212,9 +1217,11 @@ const messages = {
     ipAddress: "IP 地址",
     ipPps: "IP PPS",
     interface: "网卡",
+    maintainNodes: "节点维护",
     name: "名称",
     node: "节点",
     nodes: "节点",
+    nodesMaintained: "已摘除不健康节点",
     page: "页",
     policy: "策略",
     port: "端口",
@@ -1255,6 +1262,7 @@ const messages = {
     status: "状态",
     stop: "停止",
     stopped: "已停止",
+    stale: "版本落后",
     streaming: "订阅中",
     reason: "原因",
     tempBans: "临时封禁",
@@ -1271,6 +1279,8 @@ const messages = {
     trustedCidrsHint: "最高优先级；匹配这些 CIDR 的源 IP 会在普通规则、威胁情报、国家规则、动态防御之前直接允许",
     total: "总数",
     version: "版本",
+    offline: "离线",
+    confirmMaintainNodes: "确认摘除超过 5 分钟未在线的节点？",
     nodesHint: "查看各节点最近同步状态"
   },
   en: {
@@ -1337,9 +1347,11 @@ const messages = {
     ipAddress: "IP address",
     ipPps: "IP PPS",
     interface: "Interface",
+    maintainNodes: "Maintain nodes",
     name: "Name",
     node: "Node",
     nodes: "Nodes",
+    nodesMaintained: "Unhealthy nodes pruned",
     page: "Page",
     policy: "Policy",
     port: "Port",
@@ -1380,6 +1392,7 @@ const messages = {
     status: "Status",
     stop: "Stop",
     stopped: "stopped",
+    stale: "stale",
     streaming: "streaming",
     reason: "Reason",
     tempBans: "Temporary Bans",
@@ -1396,6 +1409,8 @@ const messages = {
     trustedCidrsHint: "Highest priority; source IPs matching these CIDRs are allowed before firewall rules, threat intelligence, country rules, and dynamic defense",
     total: "Total",
     version: "Version",
+    offline: "offline",
+    confirmMaintainNodes: "Prune nodes that have not checked in for more than 5 minutes?",
     nodesHint: "View the last sync state for each node"
   }
 } as const;
@@ -1887,10 +1902,11 @@ const apiDocsEn: ApiDocSection[] = [
   },
   {
     title: "Nodes",
-    description: "Agent heartbeat, last applied version, and status.",
+    description: "Agent heartbeat, applied policy version, derived sync health, and node maintenance.",
     endpoints: [
-      { method: "GET", path: "/nodes?page=1&page_size=20", summary: "List nodes." },
-      { method: "GET", path: "/nodes/{node_id}", summary: "Read one node." }
+      { method: "GET", path: "/nodes?page=1&page_size=20", summary: "List nodes. Each row includes current_policy_version, sync_status, healthy, and seconds_since_seen." },
+      { method: "GET", path: "/nodes/{node_id}", summary: "Read one node with derived sync health." },
+      { method: "POST", path: "/nodes/maintenance?max_age_seconds=300", summary: "Prune stale node heartbeat records. Omit max_age_seconds to use 300 seconds." }
     ]
   },
   {
@@ -2018,6 +2034,30 @@ function formatLocalTime(value: string | null | undefined) {
     minute: "2-digit",
     second: "2-digit"
   });
+}
+
+function nodeSyncStatusLabel(status: string): string {
+  const normalized = status.trim().toLowerCase();
+  if (normalized === "ok") {
+    return "ok";
+  }
+  if (normalized === "stale") {
+    return t("stale");
+  }
+  if (normalized === "offline") {
+    return t("offline");
+  }
+  return normalized || "-";
+}
+
+function nodeSyncTone(node: NodeState): "neutral" | "green" | "red" | "amber" {
+  if (node.sync_status === "ok") {
+    return "green";
+  }
+  if (node.sync_status === "offline" || node.sync_status === "error") {
+    return "red";
+  }
+  return "amber";
 }
 
 function timestampWithUtcDefault(value: string) {
@@ -2730,6 +2770,15 @@ async function loadNodes(page = nodePage.page) {
   const data = await api<Page<NodeState>>(`nodes?${pageQuery(page)}`);
   nodes.value = data.items;
   updatePage(nodePage, data);
+}
+
+async function maintainNodes() {
+  if (!window.confirm(t("confirmMaintainNodes"))) {
+    return;
+  }
+  const data = await api<NodeMaintenanceResponse>(`nodes/maintenance?max_age_seconds=${nodeMaintenanceMaxAgeSeconds}`, { method: "POST" });
+  await loadNodes(1);
+  showNotice(`${t("nodesMaintained")}: ${data.deleted}`);
 }
 
 async function startDropStream() {

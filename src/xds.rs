@@ -1,6 +1,6 @@
 use crate::cli::XdsArgs;
 use crate::db::entities::{geo_country_policy, geo_ip_prefix, node, policy_version, temp_ban};
-use crate::{firewall, geo, k8s, monitor, security, threat};
+use crate::{firewall, geo, k8s, monitor, node_maintenance, security, threat};
 use anyhow::{Context, Result, bail};
 use ipnet::IpNet;
 use sea_orm::{
@@ -789,6 +789,10 @@ pub async fn serve(
         threat_source_refresh,
         THREAT_MISSING_PREFIX_POLL_INTERVAL,
     );
+    spawn_node_maintenance_loop(
+        db.clone(),
+        Duration::from_secs(node_maintenance::NODE_MAINTENANCE_INTERVAL_SECONDS),
+    );
     Server::builder()
         .add_service(
             FirewallXdsServer::new(XdsService {
@@ -833,6 +837,26 @@ fn spawn_threat_refresh_loop(
         loop {
             if let Err(err) = threat_source_refresh.maybe_run(&db).await {
                 warn!(error = %err, "threat intelligence background refresh trigger failed");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+fn spawn_node_maintenance_loop(db: DatabaseConnection, interval: Duration) {
+    tokio::spawn(async move {
+        loop {
+            match node_maintenance::prune_unhealthy_nodes(
+                &db,
+                node_maintenance::DEFAULT_UNHEALTHY_NODE_AFTER_SECONDS,
+            )
+            .await
+            {
+                Ok(deleted) if deleted > 0 => {
+                    info!(deleted, "pruned unhealthy node heartbeat records");
+                }
+                Ok(_) => {}
+                Err(err) => warn!(error = %err, "node maintenance failed"),
             }
             tokio::time::sleep(interval).await;
         }

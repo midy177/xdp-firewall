@@ -79,6 +79,7 @@ Useful endpoints:
 - `DELETE /trusted-cidrs?cidr=10.0.0.0/8`
 - `GET /nodes?page=1&page_size=20`
 - `GET /nodes/{node_id}`
+- `POST /nodes/maintenance?max_age_seconds=300`
 - `GET /drop-events/stream`
 - `GET /drop-events/stream?node_id=node-1`
 
@@ -385,7 +386,7 @@ XDP_FIREWALL_AGENT_TOKEN='change-this-agent-token' \
 xdp-firewall api --bind 0.0.0.0:8080 --xds-bind 0.0.0.0:50051 --xds-push-interval-seconds 5
 ```
 
-xDS runs in the same control-plane process as the HTTP API. It reads policy snapshots from the database and accepts node heartbeats. `XDP_FIREWALL_AGENT_TOKEN` is required when xDS binds to a non-loopback address. Agents must send the token with `Authorization: Bearer <token>` or `x-agent-token`.
+xDS runs in the same control-plane process as the HTTP API. It reads policy snapshots from the database and accepts node heartbeats. Node list responses include derived `sync_status`, `healthy`, `seconds_since_seen`, and `current_policy_version` fields so stale/offline agents are visible even when their last raw status was `ok`. The control plane runs node maintenance every 60 seconds and prunes node heartbeat rows that have not checked in for more than 300 seconds; `POST /nodes/maintenance?max_age_seconds=300` runs the same cleanup manually. Agents that recover later recreate their heartbeat row automatically. `XDP_FIREWALL_AGENT_TOKEN` is required when xDS binds to a non-loopback address. Agents must send the token with `Authorization: Bearer <token>` or `x-agent-token`.
 
 `xdp-firewall xds` is still available for debugging or intentionally split control-plane deployments, but the provided Docker Compose and Kubernetes templates run xDS inside the API service to keep production configuration smaller.
 

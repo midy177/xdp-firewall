@@ -3,7 +3,7 @@ use crate::db::entities::{
     dynamic_defense, dynamic_rate_limit, firewall_rule, geo_country_policy, node, policy_version,
     temp_ban, threat_source, threat_source_state, trusted_cidr,
 };
-use crate::{db, firewall, geo, security, threat, xds};
+use crate::{db, firewall, geo, node_maintenance, security, threat, xds};
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
@@ -157,10 +157,21 @@ struct BatchDeleteResponse {
     deleted: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct NodeMaintenanceResponse {
+    deleted: u64,
+    max_age_seconds: i64,
+}
+
 #[derive(Debug, Deserialize)]
 struct PaginationQuery {
     page: Option<u64>,
     page_size: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeMaintenanceQuery {
+    max_age_seconds: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,7 +310,11 @@ struct NodeResponse {
     interface_name: String,
     last_seen_at: chrono::NaiveDateTime,
     last_applied_version: i64,
+    current_policy_version: i64,
     status: String,
+    sync_status: String,
+    healthy: bool,
+    seconds_since_seen: i64,
     error: Option<String>,
 }
 
@@ -518,6 +533,7 @@ fn router(state: ApiState) -> Router {
         )
         .route("/trusted-cidrs/{id}", delete(delete_trusted_cidr))
         .route("/nodes", get(list_nodes))
+        .route("/nodes/maintenance", post(maintain_nodes))
         .route("/nodes/{node_id}", get(get_node))
         .route("/drop-events/stream", get(stream_drop_events));
 
@@ -2153,6 +2169,8 @@ async fn list_nodes(
     Query(query): Query<PaginationQuery>,
 ) -> ApiResult<Json<Page<NodeResponse>>> {
     let pagination = query.normalize()?;
+    let current_version = current_policy_version(&state.db).await?;
+    let now = chrono::Utc::now().naive_utc();
     let paginator = node::Entity::find()
         .order_by_asc(node::Column::NodeId)
         .paginate(&state.db, pagination.page_size);
@@ -2161,20 +2179,35 @@ async fn list_nodes(
         .fetch_page(pagination.page - 1)
         .await?
         .into_iter()
-        .map(NodeResponse::from)
+        .map(|row| NodeResponse::new(row, current_version, now))
         .collect();
     Ok(Json(Page::new(items, total, pagination)))
+}
+
+async fn maintain_nodes(
+    State(state): State<ApiState>,
+    Query(query): Query<NodeMaintenanceQuery>,
+) -> ApiResult<Json<NodeMaintenanceResponse>> {
+    let max_age_seconds =
+        node_maintenance::normalize_unhealthy_node_after_seconds(query.max_age_seconds)?;
+    let deleted = node_maintenance::prune_unhealthy_nodes(&state.db, max_age_seconds).await?;
+    Ok(Json(NodeMaintenanceResponse {
+        deleted,
+        max_age_seconds,
+    }))
 }
 
 async fn get_node(
     State(state): State<ApiState>,
     Path(node_id): Path<String>,
 ) -> ApiResult<Json<NodeResponse>> {
+    let current_version = current_policy_version(&state.db).await?;
+    let now = chrono::Utc::now().naive_utc();
     let row = node::Entity::find_by_id(node_id)
         .one(&state.db)
         .await?
         .ok_or_else(|| ApiError::not_found("node not found"))?;
-    Ok(Json(NodeResponse::from(row)))
+    Ok(Json(NodeResponse::new(row, current_version, now)))
 }
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
@@ -2420,14 +2453,28 @@ impl<T> Page<T> {
     }
 }
 
-impl From<node::Model> for NodeResponse {
-    fn from(value: node::Model) -> Self {
+impl NodeResponse {
+    fn new(value: node::Model, current_policy_version: i64, now: chrono::NaiveDateTime) -> Self {
+        let seconds_since_seen = node_maintenance::seconds_since_seen(value.last_seen_at, now);
+        let sync_status = node_maintenance::sync_status(
+            &value.status,
+            value.last_applied_version,
+            current_policy_version,
+            value.last_seen_at,
+            now,
+            node_maintenance::DEFAULT_UNHEALTHY_NODE_AFTER_SECONDS,
+        );
+        let healthy = node_maintenance::is_healthy_sync_status(&sync_status);
         Self {
             node_id: value.node_id,
             interface_name: value.interface_name,
             last_seen_at: value.last_seen_at,
             last_applied_version: value.last_applied_version,
+            current_policy_version,
             status: value.status,
+            sync_status,
+            healthy,
+            seconds_since_seen,
             error: value.error.as_deref().map(security::public_error_message),
         }
     }
@@ -2980,6 +3027,87 @@ mod tests {
         assert_eq!(fetched["flood_packets_per_second"], 3456);
         assert_eq!(fetched["flood_burst"], 4567);
         assert_eq!(fetched["flood_block_seconds"], 89);
+    }
+
+    #[tokio::test]
+    async fn nodes_report_sync_health_and_maintenance_prunes_stale_rows() {
+        let (app, db) = test_router().await;
+        db::next_policy_version(&db, firewall::DEFAULT_POLICY_NAME)
+            .await
+            .unwrap();
+        db::next_policy_version(&db, firewall::DEFAULT_POLICY_NAME)
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().naive_utc();
+
+        node::Entity::insert_many([
+            node::ActiveModel {
+                node_id: Set("fresh-ok".to_string()),
+                policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+                interface_name: Set("eth0".to_string()),
+                last_seen_at: Set(now),
+                last_applied_version: Set(2),
+                status: Set("ok".to_string()),
+                error: Set(None),
+            },
+            node::ActiveModel {
+                node_id: Set("fresh-stale".to_string()),
+                policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+                interface_name: Set("eth0".to_string()),
+                last_seen_at: Set(now),
+                last_applied_version: Set(1),
+                status: Set("ok".to_string()),
+                error: Set(None),
+            },
+            node::ActiveModel {
+                node_id: Set("old-ok".to_string()),
+                policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+                interface_name: Set("eth0".to_string()),
+                last_seen_at: Set(now - chrono::Duration::seconds(600)),
+                last_applied_version: Set(2),
+                status: Set("ok".to_string()),
+                error: Set(None),
+            },
+        ])
+        .exec(&db)
+        .await
+        .unwrap();
+
+        let page =
+            response_json(send_empty(&app, Method::GET, "/nodes?page=1&page_size=10").await).await;
+        assert_eq!(page["total"], 3);
+        let items = page["items"].as_array().unwrap();
+        let fresh_ok = items
+            .iter()
+            .find(|item| item["node_id"] == "fresh-ok")
+            .unwrap();
+        assert_eq!(fresh_ok["current_policy_version"], 2);
+        assert_eq!(fresh_ok["sync_status"], "ok");
+        assert_eq!(fresh_ok["healthy"], true);
+        let fresh_stale = items
+            .iter()
+            .find(|item| item["node_id"] == "fresh-stale")
+            .unwrap();
+        assert_eq!(fresh_stale["sync_status"], "stale");
+        assert_eq!(fresh_stale["healthy"], false);
+        let old_ok = items
+            .iter()
+            .find(|item| item["node_id"] == "old-ok")
+            .unwrap();
+        assert_eq!(old_ok["sync_status"], "offline");
+        assert_eq!(old_ok["healthy"], false);
+        assert!(old_ok["seconds_since_seen"].as_i64().unwrap() >= 600);
+
+        let pruned = response_json(
+            send_empty(&app, Method::POST, "/nodes/maintenance?max_age_seconds=300").await,
+        )
+        .await;
+        assert_eq!(pruned["deleted"], 1);
+        assert_eq!(pruned["max_age_seconds"], 300);
+
+        let page =
+            response_json(send_empty(&app, Method::GET, "/nodes?page=1&page_size=10").await).await;
+        assert_eq!(page["total"], 2);
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ pub mod firewall;
 pub mod geo;
 pub mod k8s;
 pub mod monitor;
+pub mod node_maintenance;
 pub mod security;
 pub mod sync;
 pub mod threat;
