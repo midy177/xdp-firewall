@@ -185,7 +185,7 @@
             <Button variant="secondary" :disabled="actionBusy || !hasRuleFilters" :title="t('clear')" @click="runAction(clearRuleFilters)"><X :size="15" /><span>{{ t("clear") }}</span></Button>
           </div>
         </div>
-        <table>
+        <ResizableTable storage-key="rules" :default-widths="[220, 112, 96, 210, 112, 92, 72]">
           <thead>
             <tr>
               <th>{{ t("ruleKey") }}</th>
@@ -216,7 +216,7 @@
               <td class="right"><Button variant="ghost" :title="t('delete')" :disabled="actionBusy" @click="runAction(() => deleteItem(`/rules/${rule.id}`))"><Trash2 :size="15" /></Button></td>
             </tr>
           </tbody>
-        </table>
+        </ResizableTable>
         <div class="pager">
           <Button variant="secondary" :disabled="rulePage.page <= 1" @click="runAction(() => loadRules(rulePage.page - 1))"><ChevronLeft :size="15" /></Button>
           <span>{{ pageLabel(rulePage) }}</span>
@@ -307,7 +307,7 @@
             <Button variant="secondary" :disabled="actionBusy || !hasGeoFilters" :title="t('clear')" @click="runAction(clearGeoFilters)"><X :size="15" /><span>{{ t("clear") }}</span></Button>
           </div>
         </div>
-        <table>
+        <ResizableTable storage-key="geo" :default-widths="[180, 120, 72]">
           <thead>
             <tr>
               <th>{{ t("country") }}</th>
@@ -325,7 +325,7 @@
               <td class="right"><Button variant="ghost" :title="t('delete')" :disabled="actionBusy" @click="runAction(() => deleteItem(`/geo-countries/${item.id}`))"><Trash2 :size="15" /></Button></td>
             </tr>
           </tbody>
-        </table>
+        </ResizableTable>
         <div class="pager">
           <Button variant="secondary" :disabled="geoPage.page <= 1" @click="runAction(() => loadGeo(geoPage.page - 1))"><ChevronLeft :size="15" /></Button>
           <span>{{ pageLabel(geoPage) }}</span>
@@ -411,7 +411,7 @@
             <Button variant="secondary" :disabled="actionBusy || !hasTempBanFilters" :title="t('clear')" @click="runAction(clearTempBanFilters)"><X :size="15" /><span>{{ t("clear") }}</span></Button>
           </div>
         </div>
-        <table>
+        <ResizableTable storage-key="temp-bans" :default-widths="[220, 112, 92, 180, 240, 72]">
           <thead>
             <tr>
               <th>{{ t("sourceCidr") }}</th>
@@ -435,7 +435,7 @@
               <td class="right"><Button variant="ghost" :title="t('delete')" :disabled="actionBusy" @click="runAction(() => deleteItem(`/temp-bans/${ban.id}`))"><Trash2 :size="15" /></Button></td>
             </tr>
           </tbody>
-        </table>
+        </ResizableTable>
         <div class="pager">
           <Button variant="secondary" :disabled="tempBanPage.page <= 1" @click="runAction(() => loadTempBans(tempBanPage.page - 1))"><ChevronLeft :size="15" /></Button>
           <span>{{ pageLabel(tempBanPage) }}</span>
@@ -522,7 +522,7 @@
             <Button variant="secondary" :disabled="actionBusy || !hasThreatFilters" :title="t('clear')" @click="runAction(clearThreatFilters)"><X :size="15" /><span>{{ t("clear") }}</span></Button>
           </div>
         </div>
-        <table>
+        <ResizableTable storage-key="threat-sources" :default-widths="[180, 120, 110, 90, 320, 92]">
           <thead>
             <tr>
               <th>{{ t("name") }}</th>
@@ -551,7 +551,7 @@
               </td>
             </tr>
           </tbody>
-        </table>
+        </ResizableTable>
         <div class="pager">
           <Button variant="secondary" :disabled="threatPage.page <= 1" @click="runAction(() => loadThreats(threatPage.page - 1))"><ChevronLeft :size="15" /></Button>
           <span>{{ pageLabel(threatPage) }}</span>
@@ -694,7 +694,7 @@
             <Button variant="secondary" :disabled="actionBusy || !hasDynamicRateFilters" :title="t('clear')" @click="runAction(clearDynamicRateFilters)"><X :size="15" /><span>{{ t("clear") }}</span></Button>
           </div>
         </div>
-        <table>
+        <ResizableTable storage-key="dynamic-rate-limits" :default-widths="[120, 112, 92, 110, 110, 240, 72]">
           <thead>
             <tr>
               <th>{{ t("priority") }}</th>
@@ -725,7 +725,7 @@
               <td class="right"><Button variant="ghost" :title="t('delete')" :disabled="actionBusy" @click="runAction(() => deleteItem(`/dynamic-rate-limits/${limit.id}`))"><Trash2 :size="15" /></Button></td>
             </tr>
           </tbody>
-        </table>
+        </ResizableTable>
         <div class="pager">
           <Button variant="secondary" :disabled="dynamicRatePage.page <= 1" @click="runAction(() => loadDynamicRateLimits(dynamicRatePage.page - 1))"><ChevronLeft :size="15" /></Button>
           <span>{{ pageLabel(dynamicRatePage) }}</span>
@@ -777,7 +777,7 @@
             <Button variant="secondary" :disabled="actionBusy || !hasTrustedFilters" :title="t('clear')" @click="runAction(clearTrustedFilters)"><X :size="15" /><span>{{ t("clear") }}</span></Button>
           </div>
         </div>
-        <table>
+        <ResizableTable storage-key="trusted-cidrs" :default-widths="[240, 120, 260, 72]">
           <thead>
             <tr>
               <th>CIDR</th>
@@ -797,7 +797,7 @@
               <td class="right"><Button variant="ghost" :title="t('delete')" :disabled="actionBusy" @click="runAction(() => deleteItem(`/trusted-cidrs/${item.id}`))"><Trash2 :size="15" /></Button></td>
             </tr>
           </tbody>
-        </table>
+        </ResizableTable>
         <div class="pager">
           <Button variant="secondary" :disabled="trustedPage.page <= 1" @click="runAction(() => loadTrustedCidrs(trustedPage.page - 1))"><ChevronLeft :size="15" /></Button>
           <span>{{ pageLabel(trustedPage) }}</span>
@@ -816,7 +816,7 @@
             <Button variant="danger" :title="t('maintainNodes')" :disabled="actionBusy" @click="runAction(maintainNodes)"><Wrench :size="16" /><span>{{ t("maintainNodes") }}</span></Button>
           </div>
         </div>
-        <table>
+        <ResizableTable storage-key="nodes" :default-widths="[260, 140, 150, 120, 180, 260]">
           <thead>
             <tr>
               <th>{{ t("node") }}</th>
@@ -840,7 +840,7 @@
               <td class="clip">{{ node.error ?? '' }}</td>
             </tr>
           </tbody>
-        </table>
+        </ResizableTable>
         <div class="pager">
           <Button variant="secondary" :disabled="nodePage.page <= 1" @click="runAction(() => loadNodes(nodePage.page - 1))"><ChevronLeft :size="15" /></Button>
           <span>{{ pageLabel(nodePage) }}</span>
@@ -895,7 +895,7 @@
           </label>
           <span>{{ t("dropEventsLimit") }}</span>
         </div>
-        <table>
+        <ResizableTable storage-key="drop-events" :default-widths="[180, 240, 150, 150, 160, 110, 90, 110]">
           <thead>
             <tr>
               <th>{{ t("seen") }}</th>
@@ -923,7 +923,7 @@
               <td>{{ event.country || '-' }}</td>
             </tr>
           </tbody>
-        </table>
+        </ResizableTable>
       </section>
 
       <div v-if="loading" class="loading-bar"><span></span></div>
@@ -1027,6 +1027,7 @@ import { Activity, Ban, BookOpen, ChevronLeft, ChevronRight, DatabaseZap, Globe2
 import Badge from "./components/ui/Badge.vue";
 import Button from "./components/ui/Button.vue";
 import Input from "./components/ui/Input.vue";
+import ResizableTable from "./components/ResizableTable.vue";
 import Select from "./components/ui/Select.vue";
 
 type Rule = { id: number; rule_key?: string | null; priority: number; action: string; cidr: string; protocol?: string | null; port?: number | null };

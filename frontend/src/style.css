@@ -482,6 +482,16 @@ main {
   height: 16px;
 }
 
+.resizable-table {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.resizable-table.resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
 table {
   width: 100%;
   min-width: 720px;
@@ -500,9 +510,51 @@ td {
 }
 
 th {
+  position: relative;
   color: #607080;
   font-weight: 600;
   background: #fbfcfd;
+}
+
+.resizable-th {
+  padding-right: 22px;
+}
+
+.column-resizer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 10px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: transparent;
+  cursor: col-resize;
+}
+
+.column-resizer::after {
+  position: absolute;
+  top: 10px;
+  right: 4px;
+  bottom: 10px;
+  width: 1px;
+  background: #d6dde5;
+  content: "";
+  opacity: 0;
+  transition: opacity 120ms ease, background 120ms ease;
+}
+
+.resizable-th:hover .column-resizer::after,
+.column-resizer:focus-visible::after,
+.resizable-table.resizing .column-resizer::after {
+  opacity: 1;
+}
+
+.column-resizer:focus-visible {
+  outline: 2px solid #2f7de1;
+  outline-offset: -2px;
 }
 
 tbody tr:hover {
