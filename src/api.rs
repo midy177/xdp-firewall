@@ -426,14 +426,14 @@ pub async fn serve(
         .unwrap_or_default();
     let configured_runtime_trusted_cidrs =
         configured_runtime_trusted_cidr_values(&args.trusted_cidrs);
-    info!(
+    debug!(
         api_env_runtime_trusted_cidrs = %env_runtime_trusted_cidrs_values.join(","),
         api_env_runtime_trusted_cidr_count = env_runtime_trusted_cidrs_values.len(),
         api_runtime_trusted_cidrs_env_present = env_runtime_trusted_cidrs.is_some(),
         api_clap_runtime_trusted_cidrs = %configured_runtime_trusted_cidrs.join(","),
         api_clap_runtime_trusted_cidr_count = configured_runtime_trusted_cidrs.len(),
         api_runtime_trusted_cidrs_config_source = concat!("--trusted-cidr/", "XDP_FIREWALL_TRUSTED_CIDRS"),
-        "API loaded runtime trusted CIDR config"
+        "API observed runtime trusted CIDR config"
     );
     if api_token.is_none() && !allow_unauthenticated && !bind.ip().is_loopback() {
         bail!(

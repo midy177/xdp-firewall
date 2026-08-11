@@ -1033,7 +1033,7 @@ mod linux {
             let mut dispatcher_loaded = false;
             let attach_result = (|| -> Result<Self> {
                 prepare_map_pin_dir(&pin_dir)?;
-                recreate_incompatible_dispatcher_pins(
+                recreate_incompatible_pinned_maps(
                     interface,
                     program_name,
                     &attach_options,
@@ -1657,43 +1657,53 @@ mod linux {
         })
     }
 
-    fn recreate_incompatible_dispatcher_pins(
+    fn recreate_incompatible_pinned_maps(
         interface: &str,
         program_name: &str,
         attach_options: &XdpAttachOptions,
         pin_dir: &Path,
     ) -> Result<()> {
-        if attach_options.strategy != XdpAttachStrategy::Dispatcher {
+        let Some(temp_bans_map_type) = pinned_map_type(pin_dir, "temp_bans")? else {
+            return Ok(());
+        };
+        if temp_bans_map_type == MapType::LpmTrie {
             return Ok(());
         }
-        if pinned_map_type(pin_dir, "temp_bans")? != Some(MapType::LpmTrie) {
-            if !pin_dir.join("temp_bans").exists() {
-                return Ok(());
+
+        match attach_options.strategy {
+            XdpAttachStrategy::Direct if !attach_options.allow_replace => {
+                ensure_no_existing_xdp(interface)?;
             }
-            warn!(
-                interface,
-                pin_dir = %pin_dir.display(),
-                "recreating pinned XDP maps because temp_bans map type changed"
-            );
-            unload_dispatcher_programs_by_name(
-                &attach_options.loader_path,
-                interface,
-                program_name,
-                false,
-            )?;
-            std::fs::remove_dir_all(pin_dir).with_context(|| {
-                format!(
-                    "failed to remove incompatible pinned map directory '{}'",
-                    pin_dir.display()
-                )
-            })?;
-            std::fs::create_dir_all(pin_dir).with_context(|| {
-                format!(
-                    "failed to recreate bpffs map pin directory '{}'",
-                    pin_dir.display()
-                )
-            })?;
+            XdpAttachStrategy::Direct => {}
+            XdpAttachStrategy::Dispatcher => {
+                unload_dispatcher_programs_by_name(
+                    &attach_options.loader_path,
+                    interface,
+                    program_name,
+                    false,
+                )?;
+            }
         }
+
+        warn!(
+            interface,
+            strategy = %attach_options.strategy.as_str(),
+            pin_dir = %pin_dir.display(),
+            old_temp_bans_map_type = ?temp_bans_map_type,
+            "recreating pinned XDP maps because temp_bans map type changed"
+        );
+        std::fs::remove_dir_all(pin_dir).with_context(|| {
+            format!(
+                "failed to remove incompatible pinned map directory '{}'",
+                pin_dir.display()
+            )
+        })?;
+        std::fs::create_dir_all(pin_dir).with_context(|| {
+            format!(
+                "failed to recreate bpffs map pin directory '{}'",
+                pin_dir.display()
+            )
+        })?;
         Ok(())
     }
 
