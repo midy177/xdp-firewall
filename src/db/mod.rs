@@ -344,7 +344,7 @@ async fn ensure_temp_ban_cidr_column(db: &DatabaseConnection) -> Result<()> {
     }
 
     backfill_temp_ban_cidrs(db).await?;
-    relax_or_remove_legacy_temp_ban_ip_column(db).await?;
+    drop_legacy_temp_ban_ip_column(db).await?;
     Ok(())
 }
 
@@ -389,7 +389,7 @@ async fn backfill_temp_ban_cidrs(db: &DatabaseConnection) -> Result<()> {
     Ok(())
 }
 
-async fn relax_or_remove_legacy_temp_ban_ip_column(db: &DatabaseConnection) -> Result<()> {
+async fn drop_legacy_temp_ban_ip_column(db: &DatabaseConnection) -> Result<()> {
     if !column_exists(db, "firewall_temp_bans", "ip").await? {
         return Ok(());
     }
@@ -399,21 +399,18 @@ async fn relax_or_remove_legacy_temp_ban_ip_column(db: &DatabaseConnection) -> R
         DbBackend::Postgres => {
             db.execute_raw(raw_sql(
                 backend,
-                "ALTER TABLE firewall_temp_bans ALTER COLUMN ip DROP NOT NULL",
+                "ALTER TABLE firewall_temp_bans DROP COLUMN ip",
             ))
             .await?;
         }
         DbBackend::MySql => {
             db.execute_raw(raw_sql(
                 backend,
-                "ALTER TABLE firewall_temp_bans MODIFY ip VARCHAR(255) NULL",
+                "ALTER TABLE firewall_temp_bans DROP COLUMN ip",
             ))
             .await?;
         }
         DbBackend::Sqlite => {
-            if !sqlite_column_is_not_null(db, "firewall_temp_bans", "ip").await? {
-                return Ok(());
-            }
             rebuild_sqlite_temp_bans_without_legacy_ip(db).await?;
         }
         _ => bail!("unsupported database backend for temporary ban legacy IP migration"),
@@ -888,7 +885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrate_backfills_temp_ban_cidr_and_removes_legacy_ip_constraint() {
+    async fn migrate_backfills_temp_ban_cidr_and_drops_legacy_ip_column() {
         let mut options = ConnectOptions::new("sqlite::memory:");
         options.max_connections(1);
         let db = Database::connect(options).await.unwrap();
