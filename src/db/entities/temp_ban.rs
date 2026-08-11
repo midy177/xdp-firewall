@@ -8,7 +8,7 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub policy_name: String,
-    pub ip: String,
+    pub cidr: String,
     pub protocol: String,
     pub port: Option<i32>,
     pub expires_at: NaiveDateTime,

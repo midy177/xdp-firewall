@@ -137,7 +137,7 @@ XDP 程序在入口包进入 Linux 协议栈前执行，主要逻辑在 BPF map 
 - `defense_policy`：全局动态防御配置，array map。
 - `custom_rate_limits`：协议/目的端口自定义限流配置，hash map。
 - `rate_buckets`：每源 IP token bucket 状态，LRU hash map。
-- `temp_bans`：临时封禁源 IP，hash map。
+- `temp_bans`：临时封禁源 CIDR，LPM trie。
 - `stats`：分类计数器，array map。
 - `drop_events`：实时 Drop perf event。
 - `drop_config`：实时 Drop 开关。
@@ -189,7 +189,7 @@ flowchart TB
 - `firewall_geo_ip_prefixes`：已下载并持久化的国家 CIDR 列表，每个国家一行，CIDR 以 JSON 数组保存，agent 不直接访问 IPdeny。
 - `firewall_dynamic_defense`：全局 IP 限流和 flood 配置。
 - `firewall_dynamic_rate_limits`：按协议和目的端口配置的自定义限流。
-- `firewall_temp_bans`：临时源 IP 封禁。
+- `firewall_temp_bans`：临时源 CIDR 封禁。
 - `firewall_trusted_cidrs`：数据库管理的白名单。
 - `firewall_threat_sources`：威胁情报源配置。
 - `firewall_threat_source_states`：威胁情报源的最近指纹、检查时间和前缀数量。
@@ -212,7 +212,7 @@ flowchart TB
 数据面执行顺序：
 
 1. 白名单：命中 `trusted_cidrs` 后立即放行。
-2. 临时封禁：命中源 IP、可选协议、可选目的端口后，在过期前拒绝。
+2. 临时封禁：命中源 CIDR、可选协议、可选目的端口后，在过期前拒绝。
 3. 普通防火墙规则和威胁情报 deny 前缀。
 4. 国家 allow/deny 规则。
 5. 自定义动态防御限流：按协议和目的端口匹配。
@@ -288,7 +288,7 @@ flowchart TB
 
 ## 临时封禁设计
 
-临时封禁用于人工处置或后续自动化联动。它面向“某个源 IP 临时禁止访问”，可选限制到协议和目的端口，默认时长 5 分钟。
+临时封禁用于人工处置或后续自动化联动。它面向“某个源 CIDR 临时禁止访问”，可用 /32 或 /128 表示单个源 IP，可选限制到协议和目的端口，默认时长 5 分钟。
 
 实现方式：
 
@@ -569,7 +569,7 @@ Axum API 提供：
 
 后续计划：
 
-- 修复临时封禁 fallback 查找，避免过期精确 key 遮蔽更宽泛的有效封禁。
+- 保持临时封禁 CIDR fallback 查找的覆盖关系和过期处理测试。
 - 让前端 API 文档页在未输入 token 时也能阅读。
 - 保持 README 的 BPF stats 文档与实际 counter 数量一致。
 - 增加临时封禁、自定义动态防御、xDS Drop 订阅生命周期的集成测试。

@@ -32,6 +32,7 @@ use tracing::{debug, error, info, warn};
 
 const API_TOKEN_ENV: &str = "XDP_FIREWALL_API_TOKEN";
 const ALLOW_UNAUTHENTICATED_ENV: &str = "XDP_FIREWALL_ALLOW_UNAUTHENTICATED";
+const RUNTIME_TRUSTED_CIDRS_ENV: &str = "XDP_FIREWALL_TRUSTED_CIDRS";
 const API_TOKEN_HEADER: &str = "x-api-token";
 const DEFAULT_PAGE_SIZE: u64 = 20;
 const MAX_PAGE_SIZE: u64 = 500;
@@ -267,7 +268,7 @@ struct TrustedCidrMatchQuery {
 struct TempBanQuery {
     page: Option<u64>,
     page_size: Option<u64>,
-    ip: Option<String>,
+    cidr: Option<String>,
     protocol: Option<String>,
     port: Option<i32>,
 }
@@ -383,7 +384,7 @@ struct CreateDynamicRateLimitRequest {
 
 #[derive(Debug, Deserialize)]
 struct CreateTempBanRequest {
-    ip: String,
+    cidr: String,
     protocol: Option<String>,
     port: Option<i32>,
     duration_seconds: Option<i64>,
@@ -418,6 +419,22 @@ pub async fn serve(
     let allow_unauthenticated = std::env::var(ALLOW_UNAUTHENTICATED_ENV)
         .ok()
         .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    let env_runtime_trusted_cidrs = std::env::var(RUNTIME_TRUSTED_CIDRS_ENV).ok();
+    let env_runtime_trusted_cidrs_values = env_runtime_trusted_cidrs
+        .as_ref()
+        .map(|value| configured_runtime_trusted_cidr_values(std::slice::from_ref(value)))
+        .unwrap_or_default();
+    let configured_runtime_trusted_cidrs =
+        configured_runtime_trusted_cidr_values(&args.trusted_cidrs);
+    info!(
+        api_env_runtime_trusted_cidrs = %env_runtime_trusted_cidrs_values.join(","),
+        api_env_runtime_trusted_cidr_count = env_runtime_trusted_cidrs_values.len(),
+        api_runtime_trusted_cidrs_env_present = env_runtime_trusted_cidrs.is_some(),
+        api_clap_runtime_trusted_cidrs = %configured_runtime_trusted_cidrs.join(","),
+        api_clap_runtime_trusted_cidr_count = configured_runtime_trusted_cidrs.len(),
+        api_runtime_trusted_cidrs_config_source = concat!("--trusted-cidr/", "XDP_FIREWALL_TRUSTED_CIDRS"),
+        "API loaded runtime trusted CIDR config"
+    );
     if api_token.is_none() && !allow_unauthenticated && !bind.ip().is_loopback() {
         bail!(
             "{API_TOKEN_ENV} must be set when the API binds to a non-loopback address; set {ALLOW_UNAUTHENTICATED_ENV}=true only for trusted development networks"
@@ -451,6 +468,22 @@ pub async fn serve(
     axum::serve(listener, app)
         .await
         .context("API server failed")
+}
+
+fn configured_runtime_trusted_cidr_values(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut cidrs = Vec::new();
+    for value in values
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if seen.insert(value.to_string()) {
+            cidrs.push(value.to_string());
+        }
+    }
+    cidrs
 }
 
 fn router(state: ApiState) -> Router {
@@ -1877,8 +1910,8 @@ async fn list_temp_bans(
     let mut select = temp_ban::Entity::find()
         .filter(temp_ban::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
         .filter(temp_ban::Column::ExpiresAt.gt(chrono::Utc::now().naive_utc()));
-    if let Some(ip) = query.ip.as_deref() {
-        select = select.filter(temp_ban::Column::Ip.eq(normalize_ip(ip)?));
+    if let Some(cidr) = query.cidr.as_deref() {
+        select = select.filter(temp_ban::Column::Cidr.eq(normalize_cidr(cidr)?));
     }
     if let Some(protocol) = protocol {
         select = select.filter(temp_ban::Column::Protocol.eq(protocol));
@@ -1931,7 +1964,7 @@ async fn create_temp_bans(
 }
 
 fn temp_ban_active_model(request: CreateTempBanRequest) -> ApiResult<temp_ban::ActiveModel> {
-    let ip = normalize_ip(&request.ip)?;
+    let cidr = normalize_cidr(&request.cidr)?;
     let protocol = request
         .protocol
         .as_deref()
@@ -1946,7 +1979,7 @@ fn temp_ban_active_model(request: CreateTempBanRequest) -> ApiResult<temp_ban::A
         .context("temporary ban expiration overflowed")?;
     Ok(temp_ban::ActiveModel {
         policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
-        ip: Set(ip),
+        cidr: Set(cidr),
         protocol: Set(protocol),
         port: Set(port),
         expires_at: Set(expires_at),
@@ -2646,6 +2679,9 @@ impl From<sea_orm::DbErr> for ApiError {
 
 fn normalize_cidr(value: &str) -> Result<String> {
     let cidr = value.trim();
+    if !cidr.contains('/') {
+        bail!("CIDR must include a prefix length");
+    }
     let net = cidr
         .parse::<ipnet::IpNet>()
         .with_context(|| format!("invalid CIDR '{cidr}'"))?;
@@ -2685,17 +2721,6 @@ fn rule_insert_error(value: sea_orm::DbErr) -> ApiError {
         return ApiError::conflict("firewall rule_key already exists");
     }
     ApiError::from(value)
-}
-
-fn normalize_ip(value: &str) -> Result<String> {
-    let ip = value.trim();
-    if ip.contains('/') {
-        bail!("source IP must be a single IP address, not CIDR");
-    }
-    let ip = ip
-        .parse::<std::net::IpAddr>()
-        .with_context(|| format!("invalid IP address '{ip}'"))?;
-    Ok(ip.to_string())
 }
 
 fn validate_action(value: &str) -> Result<()> {
@@ -3913,13 +3938,13 @@ mod tests {
                 json!({
                     "items": [
                         {
-                            "ip": "203.0.113.10",
+                            "cidr": "203.0.113.10/32",
                             "protocol": "tcp",
                             "port": 443,
                             "duration_seconds": 300
                         },
                         {
-                            "ip": "203.0.113.11",
+                            "cidr": "203.0.113.11/32",
                             "protocol": "any",
                             "duration_seconds": 600
                         }
@@ -4033,15 +4058,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn temporary_ban_rejects_cidr_source_and_invalid_port() {
+    async fn temporary_ban_accepts_cidr_source_and_rejects_bare_ip() {
         let (app, _db) = test_router().await;
-        let cidr_error = response_error(
+        let bare_ip_error = response_error(
             send_json(
                 &app,
                 Method::POST,
                 "/temp-bans",
                 json!({
-                    "ip": "203.0.113.0/24",
+                    "cidr": "203.0.113.10",
                     "protocol": "tcp",
                     "port": 443,
                     "duration_seconds": 300
@@ -4050,7 +4075,7 @@ mod tests {
             .await,
         )
         .await;
-        assert!(cidr_error.contains("source IP must be a single IP address"));
+        assert!(bare_ip_error.contains("CIDR must include a prefix length"));
 
         let port_error = response_error(
             send_json(
@@ -4058,7 +4083,7 @@ mod tests {
                 Method::POST,
                 "/temp-bans",
                 json!({
-                    "ip": "203.0.113.10",
+                    "cidr": "203.0.113.10/32",
                     "protocol": "tcp",
                     "port": 0,
                     "duration_seconds": 300
@@ -4075,7 +4100,7 @@ mod tests {
                 Method::POST,
                 "/temp-bans",
                 json!({
-                    "ip": "203.0.113.10",
+                    "cidr": "203.0.113.10/32",
                     "protocol": "tcp",
                     "port": 443,
                     "duration_seconds": 300
@@ -4088,7 +4113,7 @@ mod tests {
             send_empty(
                 &app,
                 Method::GET,
-                "/temp-bans?ip=203.0.113.10&protocol=tcp&port=443",
+                "/temp-bans?cidr=203.0.113.10/32&protocol=tcp&port=443",
             )
             .await,
         )

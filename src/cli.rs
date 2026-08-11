@@ -152,6 +152,7 @@ pub enum PolicyCommand {
 #[derive(Debug, Subcommand)]
 pub enum XdpCommand {
     Status(XdpStatusArgs),
+    TempBans(XdpTempBansArgs),
     Unload(XdpUnloadArgs),
     Replace(XdpReplaceArgs),
 }
@@ -483,6 +484,17 @@ pub struct XdpStatusArgs {
     pub xdp_loader_path: String,
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct XdpTempBansArgs {
+    #[arg(
+        long,
+        help = "Network interface whose pinned temp_bans map should be listed. Auto-detects the default-route interface when omitted."
+    )]
+    pub interface: Option<String>,
+    #[arg(long, help = "Print JSON instead of a text table.")]
+    pub json: bool,
 }
 
 #[derive(Debug, Args, Clone)]

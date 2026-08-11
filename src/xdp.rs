@@ -1,13 +1,16 @@
-use crate::cli::{XdpReplaceArgs, XdpStatusArgs, XdpUnloadArgs};
+use crate::cli::{XdpReplaceArgs, XdpStatusArgs, XdpTempBansArgs, XdpUnloadArgs};
 use crate::firewall::CompiledPolicy;
 #[cfg(target_os = "linux")]
 use crate::firewall::{
-    L4Protocol, RuleAction, XdpCountryRule, XdpDynamicDefense, XdpDynamicRateLimit, XdpGeoPrefix,
-    XdpPrefixRule, XdpRuleSource, XdpTempBan,
+    L4Protocol, XdpCountryRule, XdpDynamicDefense, XdpDynamicRateLimit, XdpGeoPrefix, XdpRuleSource,
 };
+#[cfg(any(target_os = "linux", test))]
+use crate::firewall::{RuleAction, XdpPrefixRule, XdpTempBan, XdpTrustedPrefix};
 use anyhow::{Result, bail};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use std::net::IpAddr;
+#[cfg(target_os = "linux")]
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 pub const DEFAULT_RULE_MAP_ENTRIES: u32 = 262_144;
 pub const DEFAULT_GEO_MAP_ENTRIES: u32 = 262_144;
@@ -207,6 +210,18 @@ pub fn dispatcher_status(args: XdpStatusArgs) -> Result<()> {
     {
         let _ = args;
         bail!("xdp status is only supported on Linux")
+    }
+}
+
+pub fn dispatcher_temp_bans(args: XdpTempBansArgs) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        return linux::dispatcher_temp_bans(args);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = args;
+        bail!("xdp temp-bans is only supported on Linux");
     }
 }
 
@@ -494,6 +509,142 @@ fn expanded_capacity(map: &str, current: u32, required: u32) -> Result<u32> {
 }
 
 #[cfg(any(target_os = "linux", test))]
+fn compact_trusted_prefixes(prefixes: &[XdpTrustedPrefix]) -> Vec<XdpTrustedPrefix> {
+    let mut compacted = Vec::with_capacity(prefixes.len());
+    for (index, prefix) in prefixes.iter().enumerate() {
+        if prefixes.iter().enumerate().any(|(other_index, other)| {
+            other_index != index && trusted_prefix_covers(*other, *prefix)
+        }) {
+            continue;
+        }
+        compacted.push(*prefix);
+    }
+    compacted
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn trusted_prefix_covers(cover: XdpTrustedPrefix, prefix: XdpTrustedPrefix) -> bool {
+    if cover == prefix || cover.prefix > prefix.prefix {
+        return false;
+    }
+    let Some(cover) = trusted_prefix_ipnet(cover) else {
+        return false;
+    };
+    let Some(prefix) = trusted_prefix_ipnet(prefix) else {
+        return false;
+    };
+    match (cover, prefix) {
+        (ipnet::IpNet::V4(cover), ipnet::IpNet::V4(prefix)) => cover.contains(&prefix.network()),
+        (ipnet::IpNet::V6(cover), ipnet::IpNet::V6(prefix)) => cover.contains(&prefix.network()),
+        _ => false,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn trusted_prefix_ipnet(prefix: XdpTrustedPrefix) -> Option<ipnet::IpNet> {
+    ipnet::IpNet::new(prefix.addr, prefix.prefix)
+        .ok()
+        .map(|net| net.trunc())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn compact_temp_bans(bans: &[XdpTempBan]) -> Vec<XdpTempBan> {
+    let mut compacted = Vec::with_capacity(bans.len());
+    for (index, ban) in bans.iter().enumerate() {
+        if bans.iter().enumerate().any(|(other_index, other)| {
+            other_index != index && temp_ban_covers_or_supersedes(*other, *ban)
+        }) {
+            continue;
+        }
+        compacted.push(*ban);
+    }
+    compacted
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn temp_ban_covers_or_supersedes(cover: XdpTempBan, ban: XdpTempBan) -> bool {
+    if cover.protocol != ban.protocol || cover.port != ban.port {
+        return false;
+    }
+    if cover.addr == ban.addr && cover.prefix == ban.prefix {
+        return cover.expires_at > ban.expires_at;
+    }
+    if cover.prefix > ban.prefix || cover.expires_at < ban.expires_at {
+        return false;
+    }
+    let Some(cover) = temp_ban_ipnet(cover) else {
+        return false;
+    };
+    let Some(ban) = temp_ban_ipnet(ban) else {
+        return false;
+    };
+    match (cover, ban) {
+        (ipnet::IpNet::V4(cover), ipnet::IpNet::V4(ban)) => cover.contains(&ban.network()),
+        (ipnet::IpNet::V6(cover), ipnet::IpNet::V6(ban)) => cover.contains(&ban.network()),
+        _ => false,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn temp_ban_ipnet(ban: XdpTempBan) -> Option<ipnet::IpNet> {
+    ipnet::IpNet::new(ban.addr, ban.prefix)
+        .ok()
+        .map(|net| net.trunc())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn deny_rule_matching_local_cidr(
+    rule: &XdpPrefixRule,
+    local_cidrs: &[LocalInterfaceCidr],
+) -> Option<LocalInterfaceCidr> {
+    if rule.action != RuleAction::Deny {
+        return None;
+    }
+    local_cidrs
+        .iter()
+        .copied()
+        .find(|local| prefix_contains_ip(rule.addr, rule.prefix, local.ip))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn temp_ban_matching_local_cidr(
+    ban: XdpTempBan,
+    local_cidrs: &[LocalInterfaceCidr],
+) -> Option<LocalInterfaceCidr> {
+    local_cidrs
+        .iter()
+        .copied()
+        .find(|local| prefix_contains_ip(ban.addr, ban.prefix, local.ip))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn prefix_contains_ip(addr: IpAddr, prefix: u8, ip: IpAddr) -> bool {
+    if addr.is_ipv4() != ip.is_ipv4() {
+        return false;
+    }
+    ipnet::IpNet::new(addr, prefix)
+        .ok()
+        .map(|net| net.trunc().contains(&ip))
+        .unwrap_or(false)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn format_local_interface_cidrs(cidrs: &[LocalInterfaceCidr]) -> String {
+    cidrs
+        .iter()
+        .map(|cidr| format!("{}/{}", cidr.ip, cidr.prefix))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LocalInterfaceCidr {
+    ip: IpAddr,
+    prefix: u8,
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn ensure_capacity(map: &str, needed: u32, configured: u32) -> Result<()> {
     if needed > configured {
         bail!("{map} needs {needed} entries but map capacity is {configured}");
@@ -515,15 +666,15 @@ mod linux {
     use aya::{
         Ebpf, EbpfLoader, Pod,
         maps::{
-            Array as AyaArray, HashMap as AyaHashMap, IterableMap, LpmTrie, MapData, PerCpuArray,
-            PerfEventArray, lpm_trie::Key as LpmKey,
+            Array as AyaArray, HashMap as AyaHashMap, IterableMap, LpmTrie, Map, MapData, MapType,
+            PerCpuArray, PerfEventArray, lpm_trie::Key as LpmKey,
         },
         programs::{ProgramFd, ProgramInfo, Xdp, XdpMode},
     };
     use std::collections::HashSet;
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
     use std::path::{Path, PathBuf};
-    use tracing::{debug, info, warn};
+    use tracing::{debug, error, info, warn};
 
     pub struct LinuxXdpManager {
         interface: String,
@@ -538,11 +689,12 @@ mod linux {
         country_rules: AyaHashMap<MapData, u32, CountryValue>,
         defense_policy: AyaArray<MapData, DefenseValue>,
         custom_rate_limits: AyaHashMap<MapData, CustomRateKey, CustomRateValue>,
-        temp_bans: AyaHashMap<MapData, TempBanKey, TempBanValue>,
+        temp_bans: LpmTrie<MapData, TempBanData, TempBanValue>,
         drop_config: AyaArray<MapData, DropConfigValue>,
         stats: PerCpuArray<MapData, u64>,
         _drop_events: PerfEventArray<MapData>,
         map_sizes: XdpMapSizes,
+        local_interface_cidrs: Vec<LocalInterfaceCidr>,
     }
 
     struct DirectNetlinkLink {
@@ -592,7 +744,7 @@ mod linux {
         country_rules: AyaHashMap<MapData, u32, CountryValue>,
         defense_policy: AyaArray<MapData, DefenseValue>,
         custom_rate_limits: AyaHashMap<MapData, CustomRateKey, CustomRateValue>,
-        temp_bans: AyaHashMap<MapData, TempBanKey, TempBanValue>,
+        temp_bans: LpmTrie<MapData, TempBanData, TempBanValue>,
         drop_config: AyaArray<MapData, DropConfigValue>,
         stats: PerCpuArray<MapData, u64>,
         drop_events: PerfEventArray<MapData>,
@@ -678,19 +830,31 @@ mod linux {
         burst: u32,
     }
 
-    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    #[derive(Clone, Copy)]
     #[repr(C)]
-    struct TempBanKey {
+    struct TempBanData {
         family: u8,
         proto: u8,
         dport: u16,
         addr: [u8; 16],
     }
 
+    type TempBanKey = LpmKey<TempBanData>;
+
     #[derive(Clone, Copy)]
     #[repr(C)]
     struct TempBanValue {
         expires_at_ns: u64,
+    }
+
+    #[derive(Debug, serde::Serialize)]
+    struct PinnedTempBanEntry {
+        cidr: String,
+        protocol: String,
+        port: String,
+        expires_at_ns: u64,
+        remaining_seconds: i64,
+        active: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -714,7 +878,7 @@ mod linux {
     unsafe impl Pod for DefenseValue {}
     unsafe impl Pod for CustomRateKey {}
     unsafe impl Pod for CustomRateValue {}
-    unsafe impl Pod for TempBanKey {}
+    unsafe impl Pod for TempBanData {}
     unsafe impl Pod for TempBanValue {}
     unsafe impl Pod for TrustedValue {}
     unsafe impl Pod for DropConfigValue {}
@@ -747,6 +911,41 @@ mod linux {
         .with_context(|| format!("failed to run xdp-loader status for interface '{interface}'"))?;
         print_command_output(&output);
         ensure_success("xdp-loader status", &output)
+    }
+
+    pub(super) fn dispatcher_temp_bans(args: XdpTempBansArgs) -> Result<()> {
+        let interface = resolve_interface_name(args.interface.as_deref())?;
+        let entries = pinned_temp_bans(&interface)?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+            return Ok(());
+        }
+
+        println!(
+            "interface={} pinned_map={} temp_bans={}",
+            interface,
+            map_pin_dir(&interface)?.join("temp_bans").display(),
+            entries.len()
+        );
+        if entries.is_empty() {
+            return Ok(());
+        }
+        println!(
+            "{:<45} {:<5} {:<6} {:<20} {:<17} active",
+            "cidr", "proto", "port", "expires_at_ns", "remaining_seconds"
+        );
+        for entry in entries {
+            println!(
+                "{:<45} {:<5} {:<6} {:<20} {:<17} {}",
+                entry.cidr,
+                entry.protocol,
+                entry.port,
+                entry.expires_at_ns,
+                entry.remaining_seconds,
+                entry.active
+            );
+        }
+        Ok(())
     }
 
     pub(super) fn dispatcher_unload(args: XdpUnloadArgs) -> Result<()> {
@@ -834,6 +1033,12 @@ mod linux {
             let mut dispatcher_loaded = false;
             let attach_result = (|| -> Result<Self> {
                 prepare_map_pin_dir(&pin_dir)?;
+                recreate_incompatible_dispatcher_pins(
+                    interface,
+                    program_name,
+                    &attach_options,
+                    &pin_dir,
+                )?;
                 let mut ebpf = load_object_with_pinned_maps(object_path, map_sizes, &pin_dir)?;
                 let direct_netlink_link = match attach_options.strategy {
                     XdpAttachStrategy::Direct => {
@@ -881,6 +1086,7 @@ mod linux {
                 };
                 let mut maps = take_maps(&mut ebpf)?;
                 let actual_map_sizes = actual_map_sizes(&maps, map_sizes)?;
+                let local_interface_cidrs = local_interface_cidrs(interface)?;
                 let mut drop_config = maps.drop_config;
                 set_drop_config(&mut drop_config, false)?;
                 maps.drop_config = drop_config;
@@ -888,6 +1094,8 @@ mod linux {
                     interface,
                     strategy = %attach_options.strategy.as_str(),
                     pin_dir = %pin_dir.display(),
+                    local_interface_cidrs = %format_local_interface_cidrs(&local_interface_cidrs),
+                    local_interface_cidr_count = local_interface_cidrs.len(),
                     "XDP maps ready"
                 );
 
@@ -909,6 +1117,7 @@ mod linux {
                     stats: maps.stats,
                     _drop_events: maps.drop_events,
                     map_sizes: actual_map_sizes,
+                    local_interface_cidrs,
                 })
             })();
             if let Err(err) = attach_result {
@@ -959,17 +1168,33 @@ mod linux {
             self.put_dynamic_defense(&policy.dynamic_defense)?;
             let monotonic_now_ns = monotonic_now_ns()?;
             let wall_now = chrono::Utc::now().naive_utc();
-            for ban in &policy.temp_bans {
+            let temp_bans = compact_temp_bans(&policy.temp_bans);
+            for ban in &temp_bans {
                 if ban.expires_at <= wall_now {
                     continue;
                 }
-                let key = temp_ban_key(ban.addr, ban.protocol, ban.port);
+                if let Some(local) = temp_ban_matching_local_cidr(*ban, &self.local_interface_cidrs)
+                {
+                    error!(
+                        interface = %self.interface,
+                        local_ip = %local.ip,
+                        local_prefix = local.prefix,
+                        addr = %ban.addr,
+                        prefix = ban.prefix,
+                        protocol = ?ban.protocol,
+                        port = ban.port,
+                        "refusing to write temporary ban that matches the agent interface IP"
+                    );
+                    continue;
+                }
+                let key = temp_ban_key(ban.addr, ban.prefix, ban.protocol, ban.port);
                 let id = temp_ban_key_id(&key);
                 if new_temp_ban_ids.insert(id) {
                     new_temp_bans.push((key, ban));
                 } else {
                     warn!(
                         addr = %ban.addr,
+                        prefix = ban.prefix,
                         protocol = ?ban.protocol,
                         port = ban.port,
                         "skipping duplicate temporary ban key; first matching key remains active"
@@ -989,7 +1214,8 @@ mod linux {
                     );
                 }
             }
-            for prefix in &policy.trusted_prefixes {
+            let trusted_prefixes = compact_trusted_prefixes(&policy.trusted_prefixes);
+            for prefix in &trusted_prefixes {
                 let key = trusted_key(prefix.addr, prefix.prefix);
                 let id = trusted_key_id(&key);
                 if new_trusted_ids.insert(id) {
@@ -1007,6 +1233,22 @@ mod linux {
                 })
             });
             for rule in ordered_rules {
+                if let Some(local) =
+                    deny_rule_matching_local_cidr(rule, &self.local_interface_cidrs)
+                {
+                    error!(
+                        interface = %self.interface,
+                        local_ip = %local.ip,
+                        local_prefix = local.prefix,
+                        addr = %rule.addr,
+                        prefix = rule.prefix,
+                        protocol = ?rule.protocol,
+                        port = rule.port,
+                        source = ?rule.source,
+                        "refusing to write XDP deny rule that matches the agent interface IP"
+                    );
+                    continue;
+                }
                 let key = rule_key(rule.addr, rule.prefix, rule.protocol, rule.port);
                 let id = rule_key_id(&key);
                 if new_rule_ids.insert(id) {
@@ -1061,6 +1303,7 @@ mod linux {
                 &new_custom_rate_ids,
                 &new_temp_ban_ids,
             )?;
+            log_written_trusted_cidrs(&new_trusted_keys);
             Ok(())
         }
 
@@ -1124,14 +1367,20 @@ mod linux {
             Ok(XdpMapSizes {
                 rule_entries: usize_to_u32("rule_cidrs", rule_entries)?,
                 geo_entries: usize_to_u32("geo_cidrs", policy.geo_prefixes.len())?,
-                trusted_entries: usize_to_u32("trusted_cidrs", policy.trusted_prefixes.len())?,
+                trusted_entries: usize_to_u32(
+                    "trusted_cidrs",
+                    compact_trusted_prefixes(&policy.trusted_prefixes).len(),
+                )?,
                 country_entries: usize_to_u32("country_rules", country_entries)?,
                 rate_entries: self.map_sizes.rate_entries,
                 custom_rate_limit_entries: usize_to_u32(
                     "custom_rate_limits",
                     policy.dynamic_rate_limits.len(),
                 )?,
-                temp_ban_entries: usize_to_u32("temp_bans", policy.temp_bans.len())?,
+                temp_ban_entries: usize_to_u32(
+                    "temp_bans",
+                    compact_temp_bans(&policy.temp_bans).len(),
+                )?,
             })
         }
 
@@ -1278,7 +1527,7 @@ mod linux {
             new_trusted_ids: &HashSet<(u32, u8, [u8; 16])>,
             new_country_ids: &HashSet<u32>,
             new_custom_rate_ids: &HashSet<(u8, u16)>,
-            new_temp_ban_ids: &HashSet<(u8, u8, u16, [u8; 16])>,
+            new_temp_ban_ids: &HashSet<(u32, u8, u8, u16, [u8; 16])>,
         ) -> Result<()> {
             let rule_keys = self
                 .rule_cidrs
@@ -1406,6 +1655,199 @@ mod linux {
             )?,
             temp_ban_entries: map_max_entries("temp_bans", maps.temp_bans.map())?,
         })
+    }
+
+    fn recreate_incompatible_dispatcher_pins(
+        interface: &str,
+        program_name: &str,
+        attach_options: &XdpAttachOptions,
+        pin_dir: &Path,
+    ) -> Result<()> {
+        if attach_options.strategy != XdpAttachStrategy::Dispatcher {
+            return Ok(());
+        }
+        if pinned_map_type(pin_dir, "temp_bans")? != Some(MapType::LpmTrie) {
+            if !pin_dir.join("temp_bans").exists() {
+                return Ok(());
+            }
+            warn!(
+                interface,
+                pin_dir = %pin_dir.display(),
+                "recreating pinned XDP maps because temp_bans map type changed"
+            );
+            unload_dispatcher_programs_by_name(
+                &attach_options.loader_path,
+                interface,
+                program_name,
+                false,
+            )?;
+            std::fs::remove_dir_all(pin_dir).with_context(|| {
+                format!(
+                    "failed to remove incompatible pinned map directory '{}'",
+                    pin_dir.display()
+                )
+            })?;
+            std::fs::create_dir_all(pin_dir).with_context(|| {
+                format!(
+                    "failed to recreate bpffs map pin directory '{}'",
+                    pin_dir.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn pinned_map_type(pin_dir: &Path, name: &str) -> Result<Option<MapType>> {
+        let path = pin_dir.join(name);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let map = MapData::from_pin(&path)
+            .with_context(|| format!("failed to open pinned XDP map '{}'", path.display()))?;
+        let info = map
+            .info()
+            .with_context(|| format!("failed to inspect pinned XDP map '{}'", path.display()))?;
+        info.map_type()
+            .with_context(|| format!("failed to read pinned XDP map type '{}'", path.display()))
+            .map(Some)
+    }
+
+    fn local_interface_cidrs(interface: &str) -> Result<Vec<LocalInterfaceCidr>> {
+        let output = std::process::Command::new("ip")
+            .args(["-j", "addr", "show", "dev", interface])
+            .output()
+            .with_context(|| {
+                format!("failed to inspect interface '{interface}' addresses with ip")
+            })?;
+        if !output.status.success() {
+            bail!(
+                "failed to inspect interface '{interface}' addresses: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let value = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .context("failed to parse ip JSON while detecting interface addresses")?;
+        let mut cidrs = Vec::new();
+        collect_interface_cidrs_from_json(&value, &mut cidrs);
+        cidrs.sort_by(|left, right| {
+            left.ip
+                .cmp(&right.ip)
+                .then_with(|| left.prefix.cmp(&right.prefix))
+        });
+        cidrs.dedup();
+        Ok(cidrs)
+    }
+
+    fn collect_interface_cidrs_from_json(
+        value: &serde_json::Value,
+        cidrs: &mut Vec<LocalInterfaceCidr>,
+    ) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if let Some(addr_info) = object.get("addr_info") {
+                    collect_interface_cidrs_from_json(addr_info, cidrs);
+                }
+                if object
+                    .get("family")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|family| matches!(family, "inet" | "inet6"))
+                {
+                    if let Some(local) = object.get("local").and_then(|value| value.as_str()) {
+                        if let Ok(ip) = local.parse::<IpAddr>() {
+                            let prefix = object
+                                .get("prefixlen")
+                                .and_then(|value| value.as_u64())
+                                .and_then(|value| u8::try_from(value).ok())
+                                .unwrap_or_else(|| if ip.is_ipv4() { 32 } else { 128 });
+                            cidrs.push(LocalInterfaceCidr { ip, prefix });
+                        }
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect_interface_cidrs_from_json(value, cidrs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn pinned_temp_bans(interface: &str) -> Result<Vec<PinnedTempBanEntry>> {
+        let path = map_pin_dir(interface)?.join("temp_bans");
+        let map = MapData::from_pin(&path)
+            .with_context(|| format!("failed to open pinned temp_bans map '{}'", path.display()))?;
+        let map_type = map
+            .info()
+            .context("failed to inspect pinned temp_bans map")?
+            .map_type()
+            .context("failed to read pinned temp_bans map type")?;
+        if map_type != MapType::LpmTrie {
+            bail!(
+                "pinned temp_bans map has type {:?}; CIDR temporary bans require lpm_trie. Restart a CIDR-capable agent or unload with --remove-pins to recreate pinned maps.",
+                map_type
+            );
+        }
+        let temp_bans: LpmTrie<MapData, TempBanData, TempBanValue> =
+            Map::LpmTrie(map)
+                .try_into()
+                .context("pinned temp_bans map has unexpected type")?;
+        let now = monotonic_now_ns()?;
+        let mut entries = temp_bans
+            .iter()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to list pinned temp_bans entries")?
+            .into_iter()
+            .map(|(key, value)| pinned_temp_ban_entry(key, value, now))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.cidr
+                .cmp(&right.cidr)
+                .then_with(|| left.protocol.cmp(&right.protocol))
+                .then_with(|| left.port.cmp(&right.port))
+        });
+        Ok(entries)
+    }
+
+    fn pinned_temp_ban_entry(
+        key: TempBanKey,
+        value: TempBanValue,
+        monotonic_now_ns: u64,
+    ) -> PinnedTempBanEntry {
+        let data = key.data();
+        let prefix = key.prefix_len().saturating_sub(32);
+        let addr = match data.family {
+            4 => IpAddr::V4(Ipv4Addr::new(
+                data.addr[0],
+                data.addr[1],
+                data.addr[2],
+                data.addr[3],
+            )),
+            6 => IpAddr::V6(Ipv6Addr::from(data.addr)),
+            _ => IpAddr::V6(Ipv6Addr::from(data.addr)),
+        };
+        let remaining_ns = i128::from(value.expires_at_ns) - i128::from(monotonic_now_ns);
+        PinnedTempBanEntry {
+            cidr: format!("{addr}/{prefix}"),
+            protocol: protocol_name(data.proto).to_string(),
+            port: match u16::from_be(data.dport) {
+                0 => "*".to_string(),
+                port => port.to_string(),
+            },
+            expires_at_ns: value.expires_at_ns,
+            remaining_seconds: (remaining_ns / 1_000_000_000) as i64,
+            active: value.expires_at_ns > monotonic_now_ns,
+        }
+    }
+
+    fn protocol_name(protocol: u8) -> &'static str {
+        match protocol {
+            PROTO_ANY => "any",
+            PROTO_TCP => "tcp",
+            PROTO_UDP => "udp",
+            PROTO_ICMP => "icmp",
+            _ => "unknown",
+        }
     }
 
     fn map_max_entries(name: &str, map: &MapData) -> Result<u32> {
@@ -2570,13 +3012,16 @@ mod linux {
         }
     }
 
-    fn temp_ban_key(addr: IpAddr, protocol: L4Protocol, port: u16) -> TempBanKey {
-        TempBanKey {
-            family: if addr.is_ipv4() { 4 } else { 6 },
-            proto: proto_code(protocol),
-            dport: port.to_be(),
-            addr: addr_bytes(addr),
-        }
+    fn temp_ban_key(addr: IpAddr, prefix: u8, protocol: L4Protocol, port: u16) -> TempBanKey {
+        LpmKey::new(
+            lpm_prefix_len(prefix),
+            TempBanData {
+                family: if addr.is_ipv4() { 4 } else { 6 },
+                proto: proto_code(protocol),
+                dport: port.to_be(),
+                addr: addr_bytes(addr),
+            },
+        )
     }
 
     fn rule_key_id(key: &RuleKey) -> (u32, u8, u8, u16, [u8; 16]) {
@@ -2600,12 +3045,48 @@ mod linux {
         (key.prefix_len(), data.family, data.addr)
     }
 
+    fn log_written_trusted_cidrs(keys: &[TrustedKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut cidrs = keys.iter().map(trusted_key_cidr).collect::<Vec<_>>();
+        cidrs.sort();
+        info!(
+            trusted_cidrs = %cidrs.join(","),
+            trusted_cidr_count = cidrs.len(),
+            "wrote trusted CIDRs to XDP map"
+        );
+    }
+
+    fn trusted_key_cidr(key: &TrustedKey) -> String {
+        let data = key.data();
+        let prefix = key.prefix_len().saturating_sub(32);
+        let addr = match data.family {
+            4 => IpAddr::V4(Ipv4Addr::new(
+                data.addr[0],
+                data.addr[1],
+                data.addr[2],
+                data.addr[3],
+            )),
+            6 => IpAddr::V6(Ipv6Addr::from(data.addr)),
+            _ => IpAddr::V6(Ipv6Addr::from(data.addr)),
+        };
+        format!("{addr}/{prefix}")
+    }
+
     fn custom_rate_key_id(key: &CustomRateKey) -> (u8, u16) {
         (key.proto, key.dport)
     }
 
-    fn temp_ban_key_id(key: &TempBanKey) -> (u8, u8, u16, [u8; 16]) {
-        (key.family, key.proto, key.dport, key.addr)
+    fn temp_ban_key_id(key: &TempBanKey) -> (u32, u8, u8, u16, [u8; 16]) {
+        let data = key.data();
+        (
+            key.prefix_len(),
+            data.family,
+            data.proto,
+            data.dport,
+            data.addr,
+        )
     }
 
     fn lpm_prefix_len(prefix: u8) -> u32 {
@@ -2691,6 +3172,204 @@ mod tests {
         required.rate_entries = 1;
 
         assert_eq!(resized_map_sizes(current, required).unwrap(), None);
+    }
+
+    #[test]
+    fn compact_trusted_prefixes_removes_only_contained_prefixes() {
+        let compacted = compact_trusted_prefixes(&[
+            XdpTrustedPrefix {
+                addr: "172.30.133.54".parse().unwrap(),
+                prefix: 32,
+            },
+            XdpTrustedPrefix {
+                addr: "172.30.0.0".parse().unwrap(),
+                prefix: 16,
+            },
+            XdpTrustedPrefix {
+                addr: "10.0.0.0".parse().unwrap(),
+                prefix: 24,
+            },
+            XdpTrustedPrefix {
+                addr: "10.0.1.0".parse().unwrap(),
+                prefix: 24,
+            },
+            XdpTrustedPrefix {
+                addr: "fd00::1".parse().unwrap(),
+                prefix: 128,
+            },
+            XdpTrustedPrefix {
+                addr: "fd00::".parse().unwrap(),
+                prefix: 64,
+            },
+        ]);
+
+        assert_eq!(
+            compacted,
+            vec![
+                XdpTrustedPrefix {
+                    addr: "172.30.0.0".parse().unwrap(),
+                    prefix: 16,
+                },
+                XdpTrustedPrefix {
+                    addr: "10.0.0.0".parse().unwrap(),
+                    prefix: 24,
+                },
+                XdpTrustedPrefix {
+                    addr: "10.0.1.0".parse().unwrap(),
+                    prefix: 24,
+                },
+                XdpTrustedPrefix {
+                    addr: "fd00::".parse().unwrap(),
+                    prefix: 64,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn compact_temp_bans_drops_shorter_lived_covered_prefixes() {
+        let now = chrono::Utc::now().naive_utc();
+        let compacted = compact_temp_bans(&[
+            XdpTempBan {
+                addr: "203.0.113.10".parse().unwrap(),
+                prefix: 32,
+                protocol: crate::firewall::L4Protocol::Tcp,
+                port: 443,
+                expires_at: now + chrono::Duration::seconds(60),
+            },
+            XdpTempBan {
+                addr: "203.0.113.0".parse().unwrap(),
+                prefix: 24,
+                protocol: crate::firewall::L4Protocol::Tcp,
+                port: 443,
+                expires_at: now + chrono::Duration::seconds(300),
+            },
+            XdpTempBan {
+                addr: "203.0.113.20".parse().unwrap(),
+                prefix: 32,
+                protocol: crate::firewall::L4Protocol::Tcp,
+                port: 443,
+                expires_at: now + chrono::Duration::seconds(600),
+            },
+            XdpTempBan {
+                addr: "203.0.113.10".parse().unwrap(),
+                prefix: 32,
+                protocol: crate::firewall::L4Protocol::Udp,
+                port: 443,
+                expires_at: now + chrono::Duration::seconds(60),
+            },
+        ]);
+
+        assert_eq!(compacted.len(), 3);
+        assert!(compacted.iter().any(|ban| {
+            ban.addr.to_string() == "203.0.113.0"
+                && ban.prefix == 24
+                && ban.protocol == crate::firewall::L4Protocol::Tcp
+        }));
+        assert!(compacted.iter().any(|ban| {
+            ban.addr.to_string() == "203.0.113.20"
+                && ban.prefix == 32
+                && ban.protocol == crate::firewall::L4Protocol::Tcp
+        }));
+        assert!(compacted.iter().any(|ban| {
+            ban.addr.to_string() == "203.0.113.10"
+                && ban.prefix == 32
+                && ban.protocol == crate::firewall::L4Protocol::Udp
+        }));
+    }
+
+    #[test]
+    fn deny_rule_matching_local_cidr_detects_covering_cidr() {
+        let local_cidrs = vec![
+            LocalInterfaceCidr {
+                ip: "172.30.133.54".parse().unwrap(),
+                prefix: 20,
+            },
+            LocalInterfaceCidr {
+                ip: "fd00::1234".parse().unwrap(),
+                prefix: 64,
+            },
+        ];
+        let deny_rule = XdpPrefixRule {
+            addr: "172.30.0.0".parse().unwrap(),
+            prefix: 16,
+            priority: 10,
+            action: crate::firewall::RuleAction::Deny,
+            protocol: crate::firewall::L4Protocol::Any,
+            port: 0,
+            source: crate::firewall::XdpRuleSource::FirewallRule,
+        };
+        let allow_rule = XdpPrefixRule {
+            action: crate::firewall::RuleAction::Allow,
+            ..deny_rule
+        };
+        let unrelated_deny = XdpPrefixRule {
+            addr: "10.0.0.0".parse().unwrap(),
+            prefix: 8,
+            ..deny_rule
+        };
+
+        assert_eq!(
+            deny_rule_matching_local_cidr(&deny_rule, &local_cidrs),
+            Some(LocalInterfaceCidr {
+                ip: "172.30.133.54".parse().unwrap(),
+                prefix: 20,
+            })
+        );
+        assert_eq!(
+            deny_rule_matching_local_cidr(&allow_rule, &local_cidrs),
+            None
+        );
+        assert_eq!(
+            deny_rule_matching_local_cidr(&unrelated_deny, &local_cidrs),
+            None
+        );
+    }
+
+    #[test]
+    fn temp_ban_matching_local_cidr_detects_covering_cidr() {
+        let local_cidrs = vec![LocalInterfaceCidr {
+            ip: "203.0.113.10".parse().unwrap(),
+            prefix: 24,
+        }];
+        let ban = XdpTempBan {
+            addr: "203.0.113.0".parse().unwrap(),
+            prefix: 24,
+            protocol: crate::firewall::L4Protocol::Tcp,
+            port: 443,
+            expires_at: chrono::Utc::now().naive_utc() + chrono::Duration::seconds(300),
+        };
+        let unrelated = XdpTempBan {
+            addr: "198.51.100.0".parse().unwrap(),
+            prefix: 24,
+            ..ban
+        };
+
+        assert_eq!(
+            temp_ban_matching_local_cidr(ban, &local_cidrs),
+            Some(LocalInterfaceCidr {
+                ip: "203.0.113.10".parse().unwrap(),
+                prefix: 24,
+            })
+        );
+        assert_eq!(temp_ban_matching_local_cidr(unrelated, &local_cidrs), None);
+    }
+
+    #[test]
+    fn format_local_interface_cidrs_uses_ip_slash_prefix() {
+        assert_eq!(
+            format_local_interface_cidrs(&[
+                LocalInterfaceCidr {
+                    ip: "172.30.133.54".parse().unwrap(),
+                    prefix: 20,
+                },
+                LocalInterfaceCidr {
+                    ip: "fd00::1234".parse().unwrap(),
+                    prefix: 64,
+                },
+            ]),
+            "172.30.133.54/20,fd00::1234/64"
+        );
     }
 
     #[test]

@@ -50,7 +50,7 @@ Useful endpoints:
 - `DELETE /geo-countries?country=CN&action=deny&enabled=true`
 - `POST /geo-countries/refresh`
 - `GET /geo/lookup?ip=8.8.8.8`
-- `GET /temp-bans?page=1&page_size=20&ip=203.0.113.10&protocol=tcp&port=443`
+- `GET /temp-bans?page=1&page_size=20&cidr=203.0.113.10/32&protocol=tcp&port=443`
 - `POST /temp-bans`
 - `POST /temp-bans/batch`
 - `DELETE /temp-bans/{id}`
@@ -102,7 +102,7 @@ Most write endpoints return `{"version":...,"data":...}`. `POST /policy/seed-exa
 
 `GET /rules` supports optional filters for `rule_key`, `action`, `cidr`, `protocol`, `port`, and `priority`; omit all filters to page through all rules. Filters are combined with AND semantics. `rule_key` may be omitted on create; omitted or blank values are generated from the normalized `priority`, `action`, `cidr`, `protocol`, and `port` tuple and stored as a non-null UUID-like hash. Rule keys must be globally unique, and duplicate creates return a conflict instead of updating the existing rule. `DELETE /rules` deletes by `rule_key` when supplied, otherwise by the complete rule tuple and requires all five fields: `action`, `cidr`, `protocol`, `port`, and `priority`. `protocol=any` also matches older rules whose protocol field is unset.
 
-`GET /geo-countries`, `GET /temp-bans`, `GET /threat-sources`, `GET /dynamic-rate-limits`, and `GET /trusted-cidrs` also support optional field filters combined with AND semantics. Temporary bans support `ip`, `protocol`, and `port` filters and should still be deleted by ID. `PUT /threat-sources/{id}` accepts `{"enabled":true}` or `{"enabled":false}` to turn a threat source on or off. Their collection DELETE endpoints require the identifying fields: country rules require `country`, `action`, and `enabled`; threat sources require the unique `name`; dynamic rate limits require `enabled`, `priority`, `protocol`, `port`, `packets_per_second`, and `burst`; trusted CIDRs require the unique `cidr`. Use the existing ID DELETE endpoints for configurations whose identifying fields are not stable or unique. Dynamic rate limits without a stored port must also be deleted by ID.
+`GET /geo-countries`, `GET /temp-bans`, `GET /threat-sources`, `GET /dynamic-rate-limits`, and `GET /trusted-cidrs` also support optional field filters combined with AND semantics. Temporary bans support `cidr`, `protocol`, and `port` filters and should still be deleted by ID. `PUT /threat-sources/{id}` accepts `{"enabled":true}` or `{"enabled":false}` to turn a threat source on or off. Their collection DELETE endpoints require the identifying fields: country rules require `country`, `action`, and `enabled`; threat sources require the unique `name`; dynamic rate limits require `enabled`, `priority`, `protocol`, `port`, `packets_per_second`, and `burst`; trusted CIDRs require the unique `cidr`. Use the existing ID DELETE endpoints for configurations whose identifying fields are not stable or unique. Dynamic rate limits without a stored port must also be deleted by ID.
 
 The removed multi-policy endpoints `/policies` and `/policies/{path}` return 404 with a migration message; use the single-policy resource endpoints above.
 
@@ -125,7 +125,7 @@ The frontend source is Vue 3. `frontend/package.json` aliases Vite to Rolldown V
 - `firewall_policy_versions`: monotonically increasing version for the single firewall policy.
 - `firewall_rules`: static allow/deny CIDR rules with a required unique `rule_key`, protocol, and port match.
 - `firewall_geo_country_policies`: per-country allow/deny policy.
-- `firewall_temp_bans`: temporary source-IP bans with optional protocol and destination-port match.
+- `firewall_temp_bans`: temporary source-CIDR bans with optional protocol and destination-port match.
 - `firewall_dynamic_defense`: global `ip_rate_limit` and `flood` policy.
 - `firewall_dynamic_rate_limits`: custom dynamic defense rate limits by protocol and/or destination port.
 - `firewall_trusted_cidrs`: highest-priority source CIDR whitelist.
@@ -270,7 +270,7 @@ Example:
 curl -X POST http://127.0.0.1:8080/temp-bans \
   -H "X-API-Token: $XDP_FIREWALL_API_TOKEN" \
   -H 'content-type: application/json' \
-  -d '{"ip":"203.0.113.10","protocol":"tcp","port":443,"duration_seconds":300,"comment":"manual block"}'
+  -d '{"cidr":"203.0.113.10/32","protocol":"tcp","port":443,"duration_seconds":300,"comment":"manual block"}'
 ```
 
 Only unexpired temporary bans are sent to agents. The BPF map stores a monotonic expiration timestamp, so an already-applied ban stops dropping packets when it expires even if no new policy version is pushed. Whitelist entries remain higher priority than temporary bans so trusted control-plane, Kubernetes, or operator CIDRs are still allowed.
@@ -335,7 +335,7 @@ Counters:
 
 - `rule_drop`: ordinary firewall rules and threat-intelligence deny prefixes.
 - `geo_drop`: country deny rules.
-- `temp_ban_drop`: temporary source-IP ban.
+- `temp_ban_drop`: temporary source-CIDR ban.
 - `custom_rate_drop`: custom dynamic defense protocol/port rate limit.
 - `rate_drop`: global `ip_rate_limit`.
 - `flood_drop`: global `flood` temporary block/limit.
@@ -370,7 +370,7 @@ Realtime event `reason` values are product-oriented:
 
 - `firewall_rule`: ordinary firewall rule.
 - `threat_intel`: built-in or configured threat intelligence prefix.
-- `temporary_ban`: temporary source-IP ban.
+- `temporary_ban`: temporary source-CIDR ban.
 - `country`: country rule.
 - `dynamic_defense.custom_rate_limit`: custom protocol/port rate limit.
 - `dynamic_defense.ip_rate_limit`: global per-source-IP rate limit.
@@ -413,6 +413,10 @@ Dispatcher lifecycle commands are available through `xdp-firewall xdp`:
 # Show interface XDP state plus xdp-loader's dispatcher table.
 xdp-firewall xdp status --interface ens5
 
+# Decode temporary bans currently present in the pinned temp_bans map.
+xdp-firewall xdp temp-bans --interface ens5
+xdp-firewall xdp temp-bans --interface ens5 --json
+
 # Unload every dispatcher program from the interface. Pinned policy maps are kept by default.
 xdp-firewall xdp unload --interface ens5 --all --clean
 
@@ -450,7 +454,7 @@ Default capacity and approximate key/value payload:
 | `rule_cidrs` | `262144` | Ordinary firewall CIDR rules | `8 MiB` |
 | `geo_cidrs` | `262144` | Country CIDR prefixes | `6.5 MiB` |
 | `trusted_cidrs` | `4096` | Highest-priority source CIDR whitelist | `0.1 MiB` |
-| `temp_bans` | `4096` | Temporary exact source-IP bans | `0.1 MiB` |
+| `temp_bans` | `4096` | Temporary source-CIDR bans | `0.1 MiB` |
 | `country_rules` | `676` | Country-code allow/deny actions | A few KiB |
 | `defense_policy` | `1` | Global dynamic defense configuration | Negligible |
 | `custom_rate_limits` | `4096` | Custom protocol/port dynamic rate-limit definitions | `0.1 MiB` |
@@ -459,7 +463,7 @@ Default capacity and approximate key/value payload:
 
 The payload estimates count only the BPF key/value structs. Actual kernel memory is higher because hash tables, LRU bookkeeping, allocator rounding, per-CPU storage, and map metadata add overhead.
 
-`rule_cidrs`, `geo_cidrs`, and `trusted_cidrs` are LPM trie maps with `BPF_F_NO_PREALLOC`, so they grow with inserted prefixes instead of allocating the full capacity at startup. `temp_bans` and `custom_rate_limits` are small hash maps for configured exact-match keys. `rate_buckets` is the main memory driver because it can hold up to `XDP_FIREWALL_RATE_MAP_ENTRIES` source-IP state entries for dynamic defense.
+`rule_cidrs`, `geo_cidrs`, `trusted_cidrs`, and `temp_bans` are LPM trie maps with `BPF_F_NO_PREALLOC`, so they grow with inserted prefixes instead of allocating the full capacity at startup. `custom_rate_limits` is a small hash map for configured exact-match keys. `rate_buckets` is the main memory driver because it can hold up to `XDP_FIREWALL_RATE_MAP_ENTRIES` source-IP state entries for dynamic defense.
 
 Default Docker Compose deployments do not set explicit map entry values. Keep the defaults unless an agent reports a map capacity error or the deployment has a measured memory target that requires explicit sizing. These sizes are chosen at XDP load time; changing them for an existing pinned-map deployment requires map recreation, either through automatic resize or an explicit unload with pin removal.
 

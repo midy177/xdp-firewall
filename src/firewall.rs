@@ -84,7 +84,7 @@ pub struct DynamicRateLimitPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TempBanPolicy {
-    pub ip: IpAddr,
+    pub cidr: IpNet,
     pub protocol: L4Protocol,
     pub port: Option<u16>,
     pub expires_at: chrono::NaiveDateTime,
@@ -187,6 +187,7 @@ pub struct XdpCountryRule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XdpTempBan {
     pub addr: IpAddr,
+    pub prefix: u8,
     pub protocol: L4Protocol,
     pub port: u16,
     pub expires_at: chrono::NaiveDateTime,
@@ -445,11 +446,18 @@ pub async fn compile_policy(snapshot: &PolicySnapshot) -> Result<CompiledPolicy>
         .temp_bans
         .iter()
         .filter(|ban| ban.expires_at > chrono::Utc::now().naive_utc())
-        .map(|ban| XdpTempBan {
-            addr: ban.ip,
-            protocol: ban.protocol,
-            port: ban.port.unwrap_or(0),
-            expires_at: ban.expires_at,
+        .map(|ban| {
+            let (addr, prefix) = match ban.cidr {
+                IpNet::V4(net) => (IpAddr::V4(net.network()), net.prefix_len()),
+                IpNet::V6(net) => (IpAddr::V6(net.network()), net.prefix_len()),
+            };
+            XdpTempBan {
+                addr,
+                prefix,
+                protocol: ban.protocol,
+                port: ban.port.unwrap_or(0),
+                expires_at: ban.expires_at,
+            }
         })
         .collect();
     let dynamic_defense = XdpDynamicDefense {
@@ -827,10 +835,10 @@ fn parse_temp_ban(row: temp_ban::Model) -> Result<TempBanPolicy> {
         .map(|port| u16::try_from(port).context("temporary ban port is outside u16 range"))
         .transpose()?;
     let policy = TempBanPolicy {
-        ip: row
-            .ip
+        cidr: row
+            .cidr
             .parse()
-            .with_context(|| format!("invalid temporary ban IP '{}'", row.ip))?,
+            .with_context(|| format!("invalid temporary ban CIDR '{}'", row.cidr))?,
         protocol: parse_protocol(&row.protocol)?,
         port,
         expires_at: row.expires_at,

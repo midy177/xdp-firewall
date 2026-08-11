@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
         }
         Command::Api(args) => {
             info!(
-                trusted_cidrs = args.trusted_cidrs.len(),
+                api_configured_runtime_trusted_cidr_args = args.trusted_cidrs.len(),
                 "starting api command"
             );
             let db = db::connect(&args.database.database_url).await?;
@@ -106,6 +106,10 @@ async fn main() -> Result<()> {
             XdpCommand::Status(args) => {
                 info!("starting xdp status command");
                 xdp::dispatcher_status(args)
+            }
+            XdpCommand::TempBans(args) => {
+                info!("starting xdp temp-bans command");
+                xdp::dispatcher_temp_bans(args)
             }
             XdpCommand::Unload(args) => {
                 info!("starting xdp unload command");

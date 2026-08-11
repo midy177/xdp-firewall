@@ -539,6 +539,18 @@ struct K8sDiscoveryCache {
     last_refresh_failed: bool,
 }
 
+struct RuntimeTrustedCidrSnapshot {
+    configured: Vec<IpNet>,
+    all: Vec<IpNet>,
+    inject: Vec<IpNet>,
+    covered: usize,
+}
+
+struct CidrCompaction {
+    cidrs: Vec<IpNet>,
+    covered: usize,
+}
+
 impl RuntimeTrustedCidrs {
     fn new(configured: Vec<IpNet>, k8s_discovery: Option<k8s::KubernetesDiscovery>) -> Self {
         Self {
@@ -552,17 +564,25 @@ impl RuntimeTrustedCidrs {
         !self.configured.is_empty() || self.k8s_discovery.is_some()
     }
 
-    async fn current(&self) -> Vec<IpNet> {
+    async fn current_snapshot(&self) -> RuntimeTrustedCidrSnapshot {
         let mut cidrs = Vec::new();
         let mut seen = HashSet::new();
+        let mut configured = Vec::new();
         for cidr in &self.configured {
             if seen.insert(*cidr) {
+                configured.push(*cidr);
                 cidrs.push(*cidr);
             }
         }
 
         if self.k8s_discovery.is_none() {
-            return cidrs;
+            let configured = compact_covered_cidrs(configured);
+            return RuntimeTrustedCidrSnapshot {
+                all: configured.cidrs.clone(),
+                inject: configured.cidrs.clone(),
+                configured: configured.cidrs,
+                covered: configured.covered,
+            };
         }
         let cached = self.cache.lock().await.cidrs.clone();
         for cidr in cached {
@@ -570,7 +590,14 @@ impl RuntimeTrustedCidrs {
                 cidrs.push(cidr);
             }
         }
-        cidrs
+        let configured = compact_covered_cidrs(configured);
+        let cidrs = compact_covered_cidrs(cidrs);
+        RuntimeTrustedCidrSnapshot {
+            configured: configured.cidrs,
+            inject: cidrs.cidrs.clone(),
+            all: cidrs.cidrs,
+            covered: cidrs.covered,
+        }
     }
 
     async fn initial_refresh(&self) {
@@ -1480,12 +1507,8 @@ async fn build_policy_update(
 ) -> Result<Option<(PolicyUpdate, String)>> {
     temp_ban_cleanup.maybe_run(db).await?;
     let version = latest_version(db).await?;
-    let runtime_cidrs = runtime_trusted_cidrs.current().await;
-    let runtime_fingerprint = cidr_fingerprint(&runtime_cidrs);
-    if version <= current_version
-        && (!runtime_trusted_cidrs.enabled()
-            || current_runtime_fingerprint == Some(runtime_fingerprint.as_str()))
-    {
+    let runtime_cidrs = runtime_trusted_cidrs.current_snapshot().await;
+    if version <= current_version && !runtime_trusted_cidrs.enabled() {
         return Ok(None);
     }
     let mut snapshot = if supports_external_geo_prefixes {
@@ -1493,7 +1516,15 @@ async fn build_policy_update(
     } else {
         firewall::load_policy(db, firewall::DEFAULT_POLICY_NAME).await?
     };
-    inject_runtime_trusted_cidrs(&mut snapshot, runtime_cidrs);
+    let runtime_cidrs = compact_runtime_trusted_cidrs_with_snapshot(&snapshot, runtime_cidrs);
+    let runtime_fingerprint = cidr_fingerprint(&runtime_cidrs.all);
+    if version <= current_version
+        && current_runtime_fingerprint == Some(runtime_fingerprint.as_str())
+    {
+        return Ok(None);
+    }
+    debug_runtime_trusted_cidrs(&runtime_cidrs);
+    inject_runtime_trusted_cidrs(&mut snapshot, runtime_cidrs.inject);
     let geo_prefix_version = if supports_external_geo_prefixes {
         version
     } else {
@@ -1517,15 +1548,69 @@ async fn load_xds_snapshot(
     runtime_trusted_cidrs: &RuntimeTrustedCidrs,
     include_geo_prefixes: bool,
 ) -> Result<(firewall::PolicySnapshot, String)> {
-    let runtime_cidrs = runtime_trusted_cidrs.current().await;
-    let runtime_fingerprint = cidr_fingerprint(&runtime_cidrs);
+    let runtime_cidrs = runtime_trusted_cidrs.current_snapshot().await;
     let mut snapshot = if include_geo_prefixes {
         firewall::load_policy(db, firewall::DEFAULT_POLICY_NAME).await?
     } else {
         firewall::load_policy_without_geo_prefixes(db, firewall::DEFAULT_POLICY_NAME).await?
     };
-    inject_runtime_trusted_cidrs(&mut snapshot, runtime_cidrs);
+    let runtime_cidrs = compact_runtime_trusted_cidrs_with_snapshot(&snapshot, runtime_cidrs);
+    let runtime_fingerprint = cidr_fingerprint(&runtime_cidrs.all);
+    debug_runtime_trusted_cidrs(&runtime_cidrs);
+    inject_runtime_trusted_cidrs(&mut snapshot, runtime_cidrs.inject);
     Ok((snapshot, runtime_fingerprint))
+}
+
+fn debug_runtime_trusted_cidrs(snapshot: &RuntimeTrustedCidrSnapshot) {
+    if snapshot.all.is_empty() {
+        return;
+    }
+    debug!(
+        configured_runtime_trusted_cidrs = %cidr_fingerprint(&snapshot.configured),
+        configured_runtime_trusted_cidr_count = snapshot.configured.len(),
+        effective_runtime_trusted_cidrs = %cidr_fingerprint(&snapshot.all),
+        effective_runtime_trusted_cidr_count = snapshot.all.len(),
+        injected_runtime_trusted_cidrs = %cidr_fingerprint(&snapshot.inject),
+        injected_runtime_trusted_cidr_count = snapshot.inject.len(),
+        covered_runtime_trusted_cidr_count = snapshot.covered,
+        "prepared runtime trusted CIDRs for xDS policy snapshot"
+    );
+}
+
+fn compact_runtime_trusted_cidrs_with_snapshot(
+    snapshot: &firewall::PolicySnapshot,
+    runtime: RuntimeTrustedCidrSnapshot,
+) -> RuntimeTrustedCidrSnapshot {
+    if runtime.all.is_empty() {
+        return runtime;
+    }
+
+    let static_cidrs = snapshot
+        .trusted_cidrs
+        .iter()
+        .map(|trusted| trusted.cidr)
+        .collect::<Vec<_>>();
+    if static_cidrs.is_empty() {
+        return runtime;
+    }
+
+    let mut combined = static_cidrs.clone();
+    combined.extend(runtime.all.iter().copied());
+    let compacted = compact_covered_cidrs(combined);
+    let effective = compacted
+        .cidrs
+        .iter()
+        .copied()
+        .filter(|cidr| !static_cidrs.contains(cidr))
+        .collect::<Vec<_>>();
+    let effective_len = effective.len();
+
+    RuntimeTrustedCidrSnapshot {
+        configured: runtime.configured,
+        all: effective.clone(),
+        inject: effective,
+        covered: runtime.covered + runtime.all.len().saturating_sub(effective_len),
+    }
 }
 
 fn inject_runtime_trusted_cidrs(snapshot: &mut firewall::PolicySnapshot, cidrs: Vec<IpNet>) {
@@ -1545,11 +1630,41 @@ fn inject_runtime_trusted_cidrs(snapshot: &mut firewall::PolicySnapshot, cidrs: 
         }
     }
     if added > 0 {
-        info!(
+        debug!(
             added,
             total_trusted_cidrs = snapshot.trusted_cidrs.len(),
             "injected runtime trusted CIDRs into xDS policy snapshot"
         );
+    }
+}
+
+fn compact_covered_cidrs(cidrs: Vec<IpNet>) -> CidrCompaction {
+    let mut compacted = Vec::with_capacity(cidrs.len());
+    for (index, cidr) in cidrs.iter().enumerate() {
+        if cidrs
+            .iter()
+            .enumerate()
+            .any(|(other_index, other)| other_index != index && cidr_covers(*other, *cidr))
+        {
+            continue;
+        }
+        compacted.push(*cidr);
+    }
+    let covered = cidrs.len().saturating_sub(compacted.len());
+    CidrCompaction {
+        cidrs: compacted,
+        covered,
+    }
+}
+
+fn cidr_covers(cover: IpNet, cidr: IpNet) -> bool {
+    if cover == cidr || cover.prefix_len() > cidr.prefix_len() {
+        return false;
+    }
+    match (cover, cidr) {
+        (IpNet::V4(cover), IpNet::V4(cidr)) => cover.contains(&cidr.network()),
+        (IpNet::V6(cover), IpNet::V6(cidr)) => cover.contains(&cidr.network()),
+        _ => false,
     }
 }
 
@@ -1652,6 +1767,70 @@ mod tests {
         assert!(!hub.enabled_for_node("node-b"));
     }
 
+    #[test]
+    fn compact_covered_cidrs_removes_only_contained_prefixes() {
+        let compacted = compact_covered_cidrs(vec![
+            "172.30.133.54/32".parse().unwrap(),
+            "172.30.0.0/16".parse().unwrap(),
+            "10.0.0.0/24".parse().unwrap(),
+            "10.0.1.0/24".parse().unwrap(),
+            "fd00::1/128".parse().unwrap(),
+            "fd00::/64".parse().unwrap(),
+        ]);
+
+        assert_eq!(compacted.covered, 2);
+        assert_eq!(
+            compacted.cidrs,
+            vec![
+                "172.30.0.0/16".parse::<IpNet>().unwrap(),
+                "10.0.0.0/24".parse().unwrap(),
+                "10.0.1.0/24".parse().unwrap(),
+                "fd00::/64".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_compaction_uses_snapshot_trusted_cidrs() {
+        let snapshot = firewall::PolicySnapshot {
+            policy_name: firewall::DEFAULT_POLICY_NAME.to_string(),
+            version: 1,
+            rules: Vec::new(),
+            geo_countries: Vec::new(),
+            geo_prefixes: Vec::new(),
+            temp_bans: Vec::new(),
+            dynamic_defense: firewall::DynamicDefensePolicy::default(),
+            dynamic_rate_limits: Vec::new(),
+            trusted_cidrs: vec![firewall::TrustedCidrPolicy {
+                cidr: "172.30.0.0/16".parse().unwrap(),
+                comment: None,
+            }],
+            threat_sources: Vec::new(),
+            threat_prefixes: Vec::new(),
+        };
+        let runtime = RuntimeTrustedCidrSnapshot {
+            configured: vec!["172.30.133.54/32".parse().unwrap()],
+            all: vec![
+                "172.30.133.54/32".parse().unwrap(),
+                "198.51.100.0/24".parse().unwrap(),
+            ],
+            inject: vec![
+                "172.30.133.54/32".parse().unwrap(),
+                "198.51.100.0/24".parse().unwrap(),
+            ],
+            covered: 0,
+        };
+
+        let compacted = compact_runtime_trusted_cidrs_with_snapshot(&snapshot, runtime);
+
+        assert_eq!(
+            compacted.all,
+            vec!["198.51.100.0/24".parse::<IpNet>().unwrap()]
+        );
+        assert_eq!(compacted.inject, compacted.all);
+        assert_eq!(compacted.covered, 1);
+    }
+
     #[tokio::test]
     async fn temp_ban_cleanup_deletes_expired_rows_and_bumps_version() {
         let mut options = ConnectOptions::new("sqlite::memory:");
@@ -1662,7 +1841,7 @@ mod tests {
         let now = chrono::Utc::now().naive_utc();
         temp_ban::ActiveModel {
             policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
-            ip: Set("203.0.113.10".to_string()),
+            cidr: Set("203.0.113.10/32".to_string()),
             protocol: Set("any".to_string()),
             port: Set(None),
             expires_at: Set(now - chrono::Duration::seconds(1)),
@@ -1675,7 +1854,7 @@ mod tests {
         .unwrap();
         temp_ban::ActiveModel {
             policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
-            ip: Set("203.0.113.20".to_string()),
+            cidr: Set("203.0.113.20/32".to_string()),
             protocol: Set("tcp".to_string()),
             port: Set(Some(443)),
             expires_at: Set(now + chrono::Duration::seconds(300)),
@@ -1692,12 +1871,12 @@ mod tests {
 
         let rows = temp_ban::Entity::find().all(&db).await.unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].ip, "203.0.113.20");
+        assert_eq!(rows[0].cidr, "203.0.113.20/32");
         assert_eq!(latest_version(&db).await.unwrap(), 1);
 
         temp_ban::ActiveModel {
             policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
-            ip: Set("203.0.113.30".to_string()),
+            cidr: Set("203.0.113.30/32".to_string()),
             protocol: Set("udp".to_string()),
             port: Set(Some(53)),
             expires_at: Set(now - chrono::Duration::seconds(1)),

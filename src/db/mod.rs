@@ -147,6 +147,7 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
         schema.create_table_from_entity(entities::temp_ban::Entity),
     )
     .await?;
+    ensure_temp_ban_cidr_column(db).await?;
     ensure_firewall_rule_key_unique_index(db).await?;
     create_index(
         db,
@@ -327,6 +328,146 @@ async fn ensure_firewall_rule_key_column(db: &DatabaseConnection) -> Result<()> 
 
     backfill_firewall_rule_keys(db).await?;
     ensure_firewall_rule_key_not_null(db).await?;
+    Ok(())
+}
+
+async fn ensure_temp_ban_cidr_column(db: &DatabaseConnection) -> Result<()> {
+    let backend = db.get_database_backend();
+    if !column_exists(db, "firewall_temp_bans", "cidr").await? {
+        let sql = match backend {
+            DbBackend::Postgres => "ALTER TABLE firewall_temp_bans ADD COLUMN cidr VARCHAR(128)",
+            DbBackend::MySql => "ALTER TABLE firewall_temp_bans ADD COLUMN cidr VARCHAR(128)",
+            DbBackend::Sqlite => "ALTER TABLE firewall_temp_bans ADD COLUMN cidr TEXT",
+            _ => bail!("unsupported database backend for temporary ban migration"),
+        };
+        db.execute_raw(raw_sql(backend, sql)).await?;
+    }
+
+    backfill_temp_ban_cidrs(db).await?;
+    relax_or_remove_legacy_temp_ban_ip_column(db).await?;
+    Ok(())
+}
+
+async fn backfill_temp_ban_cidrs(db: &DatabaseConnection) -> Result<()> {
+    let backend = db.get_database_backend();
+    if !column_exists(db, "firewall_temp_bans", "ip").await? {
+        return Ok(());
+    }
+
+    let rows = db
+        .query_all_raw(raw_sql(
+            backend,
+            "SELECT id, cidr, ip FROM firewall_temp_bans WHERE cidr IS NULL OR TRIM(cidr) = ''",
+        ))
+        .await?;
+
+    for row in rows {
+        let id = row.try_get::<i32>("", "id")?;
+        let ip = row
+            .try_get::<Option<String>>("", "ip")?
+            .with_context(|| format!("temporary ban row {id} is missing legacy ip value"))?;
+        let addr = ip
+            .trim()
+            .parse::<std::net::IpAddr>()
+            .with_context(|| format!("invalid legacy temporary ban IP '{ip}'"))?;
+        let cidr = match addr {
+            std::net::IpAddr::V4(addr) => format!("{addr}/32"),
+            std::net::IpAddr::V6(addr) => format!("{addr}/128"),
+        };
+        db.execute_raw(Statement::from_sql_and_values(
+            backend,
+            format!(
+                "UPDATE firewall_temp_bans SET cidr = {} WHERE id = {}",
+                placeholder(backend, 1),
+                placeholder(backend, 2)
+            ),
+            vec![Value::String(Some(cidr)), Value::Int(Some(id))],
+        ))
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn relax_or_remove_legacy_temp_ban_ip_column(db: &DatabaseConnection) -> Result<()> {
+    if !column_exists(db, "firewall_temp_bans", "ip").await? {
+        return Ok(());
+    }
+
+    let backend = db.get_database_backend();
+    match backend {
+        DbBackend::Postgres => {
+            db.execute_raw(raw_sql(
+                backend,
+                "ALTER TABLE firewall_temp_bans ALTER COLUMN ip DROP NOT NULL",
+            ))
+            .await?;
+        }
+        DbBackend::MySql => {
+            db.execute_raw(raw_sql(
+                backend,
+                "ALTER TABLE firewall_temp_bans MODIFY ip VARCHAR(255) NULL",
+            ))
+            .await?;
+        }
+        DbBackend::Sqlite => {
+            if !sqlite_column_is_not_null(db, "firewall_temp_bans", "ip").await? {
+                return Ok(());
+            }
+            rebuild_sqlite_temp_bans_without_legacy_ip(db).await?;
+        }
+        _ => bail!("unsupported database backend for temporary ban legacy IP migration"),
+    }
+    Ok(())
+}
+
+async fn rebuild_sqlite_temp_bans_without_legacy_ip(db: &DatabaseConnection) -> Result<()> {
+    let backend = DbBackend::Sqlite;
+    db.execute_raw(raw_sql(
+        backend,
+        "CREATE TABLE firewall_temp_bans_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+            policy_name TEXT NOT NULL,
+            cidr TEXT NOT NULL,
+            protocol TEXT NOT NULL,
+            port INTEGER,
+            expires_at TIMESTAMP NOT NULL,
+            comment TEXT,
+            created_at TIMESTAMP NOT NULL
+        )",
+    ))
+    .await?;
+    db.execute_raw(raw_sql(
+        backend,
+        "INSERT INTO firewall_temp_bans_new (
+            id,
+            policy_name,
+            cidr,
+            protocol,
+            port,
+            expires_at,
+            comment,
+            created_at
+        )
+        SELECT
+            id,
+            policy_name,
+            cidr,
+            protocol,
+            port,
+            expires_at,
+            comment,
+            created_at
+        FROM firewall_temp_bans",
+    ))
+    .await?;
+    db.execute_raw(raw_sql(backend, "DROP TABLE firewall_temp_bans"))
+        .await?;
+    db.execute_raw(raw_sql(
+        backend,
+        "ALTER TABLE firewall_temp_bans_new RENAME TO firewall_temp_bans",
+    ))
+    .await?;
     Ok(())
 }
 
@@ -602,6 +743,7 @@ pub fn raw_sql(backend: DbBackend, sql: impl Into<String>) -> Statement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{ActiveModelTrait, Set};
 
     #[tokio::test]
     async fn migrate_backfills_and_requires_firewall_rule_key() {
@@ -743,5 +885,85 @@ mod tests {
             ))
             .await;
         assert!(insert_duplicate_rule_key.is_err());
+    }
+
+    #[tokio::test]
+    async fn migrate_backfills_temp_ban_cidr_and_removes_legacy_ip_constraint() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options).await.unwrap();
+        let backend = DbBackend::Sqlite;
+
+        db.execute_raw(raw_sql(
+            backend,
+            "CREATE TABLE firewall_temp_bans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                policy_name TEXT NOT NULL,
+                ip TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                port INTEGER,
+                expires_at TIMESTAMP NOT NULL,
+                comment TEXT,
+                created_at TIMESTAMP NOT NULL
+            )",
+        ))
+        .await
+        .unwrap();
+        db.execute_raw(raw_sql(
+            backend,
+            "INSERT INTO firewall_temp_bans (
+                policy_name,
+                ip,
+                protocol,
+                port,
+                expires_at,
+                comment,
+                created_at
+            ) VALUES (
+                'edge',
+                '203.0.113.10',
+                'any',
+                NULL,
+                '2026-01-01 00:05:00',
+                NULL,
+                '2026-01-01 00:00:00'
+            )",
+        ))
+        .await
+        .unwrap();
+
+        migrate(&db).await.unwrap();
+
+        assert!(
+            !column_exists(&db, "firewall_temp_bans", "ip")
+                .await
+                .unwrap()
+        );
+        let row = db
+            .query_one_raw(raw_sql(
+                backend,
+                "SELECT cidr FROM firewall_temp_bans WHERE id = 1",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<String>("", "cidr").unwrap(),
+            "203.0.113.10/32"
+        );
+
+        entities::temp_ban::ActiveModel {
+            policy_name: Set("edge".to_string()),
+            cidr: Set("203.0.113.11/32".to_string()),
+            protocol: Set("any".to_string()),
+            port: Set(None),
+            expires_at: Set(chrono::Utc::now().naive_utc()),
+            comment: Set(None),
+            created_at: Set(chrono::Utc::now().naive_utc()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .unwrap();
     }
 }

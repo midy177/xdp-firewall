@@ -454,6 +454,15 @@ fn log_policy_snapshot_summary(
         flood_block_seconds = dynamic.flood_block_seconds,
         "received xDS policy snapshot"
     );
+    if !snapshot.temp_bans.is_empty() {
+        debug!(
+            policy,
+            expected_version,
+            temp_bans = %snapshot_temp_ban_list(snapshot),
+            temp_ban_count = snapshot.temp_bans.len(),
+            "received xDS temporary ban list"
+        );
+    }
 }
 
 fn log_compiled_policy_summary(
@@ -474,6 +483,47 @@ fn log_compiled_policy_summary(
         dynamic_rate_limits = compiled.dynamic_rate_limits.len(),
         "compiled xDS policy for XDP maps"
     );
+    if !compiled.temp_bans.is_empty() {
+        debug!(
+            policy,
+            expected_version,
+            compiled_version = compiled.version,
+            temp_bans = %compiled_temp_ban_list(compiled),
+            temp_ban_count = compiled.temp_bans.len(),
+            "compiled temporary ban list for XDP maps"
+        );
+    }
+}
+
+fn snapshot_temp_ban_list(snapshot: &firewall::PolicySnapshot) -> String {
+    snapshot
+        .temp_bans
+        .iter()
+        .map(|ban| {
+            format!(
+                "{}/{:?}/{}@{}",
+                ban.cidr,
+                ban.protocol,
+                ban.port.unwrap_or(0),
+                ban.expires_at
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn compiled_temp_ban_list(compiled: &firewall::CompiledPolicy) -> String {
+    compiled
+        .temp_bans
+        .iter()
+        .map(|ban| {
+            format!(
+                "{}/{}/{:?}/{}@{}",
+                ban.addr, ban.prefix, ban.protocol, ban.port, ban.expires_at
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn add_control_plane_trusted_cidrs(

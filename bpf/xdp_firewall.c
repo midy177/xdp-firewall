@@ -103,6 +103,7 @@ struct custom_rate_value {
 };
 
 struct temp_ban_key {
+    __u32 prefixlen;
     __u8 family;
     __u8 proto;
     __be16 dport;
@@ -200,7 +201,8 @@ struct {
 } custom_rate_limits SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
     __uint(max_entries, 4096);
     __uint(pinning, LIBBPF_PIN_BY_NAME);
     __type(key, struct temp_ban_key);
@@ -370,6 +372,7 @@ static __always_inline int temp_ban_value_active(struct temp_ban_value *value, _
 static __always_inline int temp_ban_active(__u8 family, __u8 proto, __u16 dport, __u8 addr[16])
 {
     struct temp_ban_key key = {};
+    key.prefixlen = full_prefix_len(family);
     key.family = family;
     key.proto = proto;
     key.dport = dport;

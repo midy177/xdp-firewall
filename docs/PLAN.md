@@ -45,7 +45,7 @@
 - [completed] Let the embedded API documentation page remain readable without an API token by avoiding protected data loads when the active route is API docs.
 - [completed] Update BPF stats documentation to include the eighth `temp_ban_drop` counter and keep README map sizing aligned with `STAT_MAX`.
 - [completed] Add an embedded frontend API usage documentation page covering auth, pagination, policy, rules, countries, temporary bans, threat sources, dynamic defense, whitelist, nodes, and realtime Drop streams.
-- [completed] Add temporary source-IP bans with optional protocol and destination-port match.
+- [completed] Add temporary source-CIDR bans with optional protocol and destination-port match.
 - [completed] Persist temporary bans in the control-plane database with default 5-minute duration and paginated API CRUD.
 - [completed] Compile only unexpired temporary bans into xDS snapshots and agent XDP maps.
 - [completed] Enforce temporary bans after whitelist and before ordinary firewall/threat/country/dynamic-defense checks.
@@ -198,11 +198,11 @@
 - Added `firewall_dynamic_rate_limits` for protocol and/or destination-port token bucket rules.
 - Added BPF `custom_rate_limits` map and `custom_rate_drop` counter.
 - Added frontend custom dynamic rate-limit configuration to the dynamic defense page.
-- Added temporary source-IP ban API:
+- Added temporary source-CIDR ban API:
   - `GET /temp-bans`
   - `POST /temp-bans`
   - `DELETE /temp-bans/{id}`
-- Added `firewall_temp_bans` for default 5-minute temporary source-IP bans with optional protocol and destination-port match.
+- Added `firewall_temp_bans` for default 5-minute temporary source-CIDR bans with optional protocol and destination-port match.
 - Added BPF `temp_bans` map and `temp_ban_drop` counter/realtime reason.
 - Added frontend temporary ban page.
 - Added embedded frontend API usage documentation with bilingual endpoint examples and curl snippets.
@@ -247,7 +247,7 @@
 
 - Ordinary firewall rules are CIDR/protocol/port allow or deny rules.
 - Threat intelligence is compiled into deny prefix rules.
-- Temporary bans are exact source-IP deny entries with optional protocol and destination-port match.
+- Temporary bans are source-CIDR deny entries with optional protocol and destination-port match.
 - Temporary bans default to 300 seconds and are evaluated after trusted CIDR whitelist but before ordinary firewall rules and threat intelligence.
 - Country defense must only use country code plus allow/deny.
 - Country defense must not expose or use PPS/Burst rate-limit fields in the frontend.

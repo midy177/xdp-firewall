@@ -342,11 +342,11 @@
         </div>
         <div class="form-grid temp-ban-form">
           <label class="field">
-            <span>{{ t("sourceIp") }}</span>
+            <span>{{ t("sourceCidr") }}</span>
             <Input
-              v-model="tempBanForm.ip"
-              aria-label="Temporary ban source IP"
-              placeholder="203.0.113.10"
+              v-model="tempBanForm.cidr"
+              aria-label="Temporary ban source CIDR"
+              placeholder="203.0.113.10/32"
               :aria-invalid="Boolean(fieldErrors.tempBanIp)"
               @blur="validateField('tempBanIp')"
               @input="validateTouchedField('tempBanIp')"
@@ -389,8 +389,8 @@
         </div>
         <div class="form-grid temp-ban-filter-form">
           <label class="field">
-            <span>{{ t("sourceIp") }}</span>
-            <Input v-model="tempBanFilters.ip" aria-label="Temporary ban source IP filter" placeholder="203.0.113.10" />
+            <span>{{ t("sourceCidr") }}</span>
+            <Input v-model="tempBanFilters.cidr" aria-label="Temporary ban source CIDR filter" placeholder="203.0.113.10/32" />
           </label>
           <label class="field">
             <span>{{ t("protocol") }}</span>
@@ -414,7 +414,7 @@
         <table>
           <thead>
             <tr>
-              <th>{{ t("sourceIp") }}</th>
+              <th>{{ t("sourceCidr") }}</th>
               <th>{{ t("protocol") }}</th>
               <th>{{ t("port") }}</th>
               <th>{{ t("expiresAt") }}</th>
@@ -427,7 +427,7 @@
               <td colspan="6" class="empty">{{ t("emptyTempBans") }}</td>
             </tr>
             <tr v-for="ban in tempBans" :key="ban.id">
-              <td>{{ ban.ip }}</td>
+              <td>{{ ban.cidr }}</td>
               <td>{{ ban.protocol }}</td>
               <td>{{ ban.port ?? '*' }}</td>
               <td>{{ formatLocalTime(ban.expires_at) }}</td>
@@ -1034,7 +1034,7 @@ type GeoCountry = { id: number; country: string; action: string; packets_per_sec
 type ThreatSource = { id: number; enabled: boolean; name: string; url: string; format: string; min_score?: number };
 type TrustedCidr = { id: number; cidr: string; enabled: boolean; comment?: string };
 type DynamicRateLimit = { id: number; enabled: boolean; priority: number; protocol: string; port?: number | null; packets_per_second: number; burst: number; comment?: string | null };
-type TempBan = { id: number; ip: string; protocol: string; port?: number | null; expires_at: string; comment?: string | null; created_at: string };
+type TempBan = { id: number; cidr: string; protocol: string; port?: number | null; expires_at: string; comment?: string | null; created_at: string };
 type CountryOption = { code: string; name: string };
 type DynamicDefense = {
   enabled: boolean;
@@ -1131,8 +1131,8 @@ const trustedForm = reactive({ cidr: "10.0.0.0/8", comment: "" });
 const trustedFilters = reactive({ cidr: "", enabled: "all" });
 const dynamicRateForm = reactive({ priority: 10, protocol: "tcp", port: "443", packets_per_second: 1000, burst: 2000, comment: "" });
 const dynamicRateFilters = reactive({ priority: "", protocol: "all", port: "", packets_per_second: "", burst: "", enabled: "all" });
-const tempBanForm = reactive({ ip: "203.0.113.10", protocol: "any", port: "", duration_seconds: 300, comment: "" });
-const tempBanFilters = reactive({ ip: "", protocol: "all", port: "" });
+const tempBanForm = reactive({ cidr: "203.0.113.10/32", protocol: "any", port: "", duration_seconds: 300, comment: "" });
+const tempBanFilters = reactive({ cidr: "", protocol: "all", port: "" });
 const dynamicDefense = reactive<DynamicDefense>({
   enabled: true,
   ip_rate_limit_enabled: true,
@@ -1258,6 +1258,7 @@ const messages = {
     saved: "已保存",
     signIn: "登录",
     sourceIp: "源 IP",
+    sourceCidr: "源 CIDR",
     start: "开始",
     status: "状态",
     stop: "停止",
@@ -1388,6 +1389,7 @@ const messages = {
     saved: "Saved",
     signIn: "Sign in",
     sourceIp: "Source IP",
+    sourceCidr: "Source CIDR",
     start: "Start",
     status: "Status",
     stop: "Stop",
@@ -1541,15 +1543,15 @@ const apiDocsZh: ApiDocSection[] = [
   },
   {
     title: "临时封禁",
-    description: "临时封禁单个源 IP，可选协议和目的端口。duration_seconds 默认 300，必须大于 0，最大 31536000。",
+    description: "临时封禁源 CIDR，可用 /32 或 /128 表示单个源 IP，可选协议和目的端口。duration_seconds 默认 300，必须大于 0，最大 31536000。",
     endpoints: [
-      { method: "GET", path: "/temp-bans?page=1&page_size=20&ip=203.0.113.10&protocol=tcp&port=443", summary: "分页列出未过期临时封禁，可按 ip、protocol、port 过滤，条件按 AND 匹配。" },
+      { method: "GET", path: "/temp-bans?page=1&page_size=20&cidr=203.0.113.10/32&protocol=tcp&port=443", summary: "分页列出未过期临时封禁，可按 cidr、protocol、port 过滤，条件按 AND 匹配。" },
       {
         method: "POST",
         path: "/temp-bans",
         summary: "新增临时封禁。",
         body: `{
-  "ip": "203.0.113.10",
+  "cidr": "203.0.113.10/32",
   "protocol": "tcp",
   "port": 443,
   "duration_seconds": 300,
@@ -1558,7 +1560,7 @@ const apiDocsZh: ApiDocSection[] = [
         curl: `curl -X POST "$BASE/temp-bans" \\
   -H "X-API-Token: $TOKEN" \\
   -H "content-type: application/json" \\
-  -d '{"ip":"203.0.113.10","duration_seconds":300}'`
+  -d '{"cidr":"203.0.113.10/32","duration_seconds":300}'`
       },
       { method: "POST", path: "/temp-bans/batch", summary: "批量新增临时封禁；请求体为 {\"items\":[...]}，每项格式同 POST /temp-bans。" },
       { method: "DELETE", path: "/temp-bans/{id}", summary: "删除临时封禁，立即触发策略版本更新。" },
@@ -1777,15 +1779,15 @@ const apiDocsEn: ApiDocSection[] = [
   },
   {
     title: "Temporary Bans",
-    description: "Temporarily block one source IP with optional protocol and destination port. duration_seconds defaults to 300, must be greater than 0, and is capped at 31536000.",
+    description: "Temporarily block a source CIDR with optional protocol and destination port. Use /32 or /128 for a single source IP. duration_seconds defaults to 300, must be greater than 0, and is capped at 31536000.",
     endpoints: [
-      { method: "GET", path: "/temp-bans?page=1&page_size=20&ip=203.0.113.10&protocol=tcp&port=443", summary: "List unexpired temporary bans, optionally filtered by ip, protocol, and port with AND semantics." },
+      { method: "GET", path: "/temp-bans?page=1&page_size=20&cidr=203.0.113.10/32&protocol=tcp&port=443", summary: "List unexpired temporary bans, optionally filtered by cidr, protocol, and port with AND semantics." },
       {
         method: "POST",
         path: "/temp-bans",
         summary: "Create a temporary ban.",
         body: `{
-  "ip": "203.0.113.10",
+  "cidr": "203.0.113.10/32",
   "protocol": "tcp",
   "port": 443,
   "duration_seconds": 300,
@@ -1794,7 +1796,7 @@ const apiDocsEn: ApiDocSection[] = [
         curl: `curl -X POST "$BASE/temp-bans" \\
   -H "X-API-Token: $TOKEN" \\
   -H "content-type: application/json" \\
-  -d '{"ip":"203.0.113.10","duration_seconds":300}'`
+  -d '{"cidr":"203.0.113.10/32","duration_seconds":300}'`
       },
       { method: "POST", path: "/temp-bans/batch", summary: "Create temporary bans in one request; body is {\"items\":[...]} and each item matches POST /temp-bans." },
       { method: "DELETE", path: "/temp-bans/{id}", summary: "Delete a temporary ban and trigger a new policy version." },
@@ -2397,8 +2399,8 @@ function geoPageQuery(page: number): string {
 
 function tempBanPageQuery(page: number): string {
   const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
-  if (tempBanFilters.ip.trim()) {
-    params.set("ip", tempBanFilters.ip.trim());
+  if (tempBanFilters.cidr.trim()) {
+    params.set("cidr", tempBanFilters.cidr.trim());
   }
   if (tempBanFilters.protocol !== "all") {
     params.set("protocol", tempBanFilters.protocol);
@@ -2679,7 +2681,7 @@ async function clearGeoFilters() {
 }
 
 const hasTempBanFilters = computed(() => {
-  return Boolean(tempBanFilters.ip.trim() || tempBanFilters.port.trim()) || tempBanFilters.protocol !== "all";
+  return Boolean(tempBanFilters.cidr.trim() || tempBanFilters.port.trim()) || tempBanFilters.protocol !== "all";
 });
 
 async function queryTempBans() {
@@ -2687,7 +2689,7 @@ async function queryTempBans() {
 }
 
 async function clearTempBanFilters() {
-  tempBanFilters.ip = "";
+  tempBanFilters.cidr = "";
   tempBanFilters.protocol = "all";
   tempBanFilters.port = "";
   await loadTempBans(1);
@@ -3065,7 +3067,7 @@ function validateTempBanForm() {
     throwValidation(v("icmpPort"));
   }
   return {
-    ip: requireIp(t("sourceIp"), tempBanForm.ip),
+    cidr: requireCidr(t("sourceCidr"), tempBanForm.cidr),
     protocol,
     port,
     duration_seconds: requirePositiveInteger(t("durationSeconds"), tempBanForm.duration_seconds),
@@ -3170,7 +3172,7 @@ function validateField(key: FieldKey): boolean {
         requireIp(t("ipAddress"), geoLookupForm.ip);
         break;
       case "tempBanIp":
-        requireIp(t("sourceIp"), tempBanForm.ip);
+        requireCidr(t("sourceCidr"), tempBanForm.cidr);
         break;
       case "tempBanPort":
         validateProtocolPortField(tempBanForm.protocol, tempBanForm.port, true);
