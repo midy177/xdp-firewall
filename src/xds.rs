@@ -1508,7 +1508,11 @@ async fn build_policy_update(
     temp_ban_cleanup.maybe_run(db).await?;
     let version = latest_version(db).await?;
     let runtime_cidrs = runtime_trusted_cidrs.current_snapshot().await;
-    if version <= current_version && !runtime_trusted_cidrs.enabled() {
+    let runtime_fingerprint = cidr_fingerprint(&runtime_cidrs.all);
+    if version <= current_version
+        && (!runtime_trusted_cidrs.enabled()
+            || current_runtime_fingerprint == Some(runtime_fingerprint.as_str()))
+    {
         return Ok(None);
     }
     let mut snapshot = if supports_external_geo_prefixes {
@@ -1517,12 +1521,6 @@ async fn build_policy_update(
         firewall::load_policy(db, firewall::DEFAULT_POLICY_NAME).await?
     };
     let runtime_cidrs = compact_runtime_trusted_cidrs_with_snapshot(&snapshot, runtime_cidrs);
-    let runtime_fingerprint = cidr_fingerprint(&runtime_cidrs.all);
-    if version <= current_version
-        && current_runtime_fingerprint == Some(runtime_fingerprint.as_str())
-    {
-        return Ok(None);
-    }
     debug_runtime_trusted_cidrs(&runtime_cidrs);
     inject_runtime_trusted_cidrs(&mut snapshot, runtime_cidrs.inject);
     let geo_prefix_version = if supports_external_geo_prefixes {
@@ -1737,7 +1735,7 @@ fn unauthenticated_status() -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::{ActiveModelTrait, ConnectOptions, Database};
+    use sea_orm::{ActiveModelTrait, ConnectOptions, ConnectionTrait, Database, DbBackend};
 
     #[test]
     fn constant_time_eq_matches_equal_tokens() {
@@ -1892,6 +1890,38 @@ mod tests {
         let rows = temp_ban::Entity::find().all(&db).await.unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(latest_version(&db).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn build_policy_update_skips_policy_load_when_runtime_fingerprint_is_unchanged() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.sqlx_logging(false);
+        let db = Database::connect(options).await.unwrap();
+        crate::db::migrate(&db).await.unwrap();
+        let version = latest_version(&db).await.unwrap();
+        let runtime_trusted_cidrs =
+            RuntimeTrustedCidrs::new(vec!["198.51.100.10/32".parse().unwrap()], None);
+        let runtime_fingerprint =
+            cidr_fingerprint(&runtime_trusted_cidrs.current_snapshot().await.all);
+        db.execute_raw(crate::db::raw_sql(
+            DbBackend::Sqlite,
+            "DROP TABLE firewall_rules",
+        ))
+        .await
+        .unwrap();
+
+        let update = build_policy_update(
+            &db,
+            version,
+            Some(runtime_fingerprint.as_str()),
+            &runtime_trusted_cidrs,
+            &TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(update.is_none());
     }
 
     fn test_service(db: DatabaseConnection) -> XdsService {

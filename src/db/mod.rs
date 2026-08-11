@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use sea_orm::sea_query::{Index, Value};
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction, DbBackend,
-    DbErr, EntityName, Schema, Statement,
+    DbErr, EntityName, Schema, Statement, TransactionTrait,
 };
 use std::{env, time::Duration};
 
@@ -420,7 +420,8 @@ async fn drop_legacy_temp_ban_ip_column(db: &DatabaseConnection) -> Result<()> {
 
 async fn rebuild_sqlite_temp_bans_without_legacy_ip(db: &DatabaseConnection) -> Result<()> {
     let backend = DbBackend::Sqlite;
-    db.execute_raw(raw_sql(
+    let txn = db.begin().await?;
+    txn.execute_raw(raw_sql(
         backend,
         "CREATE TABLE firewall_temp_bans_new (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -434,7 +435,7 @@ async fn rebuild_sqlite_temp_bans_without_legacy_ip(db: &DatabaseConnection) -> 
         )",
     ))
     .await?;
-    db.execute_raw(raw_sql(
+    txn.execute_raw(raw_sql(
         backend,
         "INSERT INTO firewall_temp_bans_new (
             id,
@@ -458,13 +459,14 @@ async fn rebuild_sqlite_temp_bans_without_legacy_ip(db: &DatabaseConnection) -> 
         FROM firewall_temp_bans",
     ))
     .await?;
-    db.execute_raw(raw_sql(backend, "DROP TABLE firewall_temp_bans"))
+    txn.execute_raw(raw_sql(backend, "DROP TABLE firewall_temp_bans"))
         .await?;
-    db.execute_raw(raw_sql(
+    txn.execute_raw(raw_sql(
         backend,
         "ALTER TABLE firewall_temp_bans_new RENAME TO firewall_temp_bans",
     ))
     .await?;
+    txn.commit().await?;
     Ok(())
 }
 
