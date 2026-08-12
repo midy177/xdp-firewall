@@ -156,10 +156,9 @@
   - `voipbl`
 - Added `voipbl` threat source format support for CIDR-line feeds such as `https://voipbl.org/update/`.
 - Added threat source safety checks:
-  - no URL credentials
-  - allowed hosts
+  - http/https URLs only
   - timeout
-  - limited redirects to allowed hosts
+  - limited redirects
   - response size limit
 - Added redaction for node error messages exposed through the API.
 - Fixed BPF rule lookup so `protocol=any` with a specific port can match.

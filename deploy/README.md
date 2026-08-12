@@ -160,7 +160,7 @@ Notes:
 - API token authentication is required for non-loopback API binds unless `XDP_FIREWALL_ALLOW_UNAUTHENTICATED=true` is explicitly set. Change the template token before deploying.
 - xDS agent authentication is required for non-loopback xDS binds. Change the template token before deploying.
 - The single firewall policy is initialized with default dynamic defense and built-in `ipsum` and `spamhaus-drop` threat intelligence feeds.
-- Custom threat feed hosts must be added to `XDP_FIREWALL_ALLOWED_THREAT_HOSTS`; built-in feed hosts are allowed by default.
+- Custom threat feed URLs may use any `http` or `https` host, including URL credentials when needed.
 - The DaemonSet is privileged and uses `hostNetwork` because XDP attach is a host-network operation.
 - The agent auto-selects the default-route interface when `--interface` is omitted.
 - If the configured xDS host is an IP literal, the agent adds a local in-memory trusted CIDR for that controller IP before applying each policy snapshot. Hostnames are not resolved for this bypass. The current XDP program is ingress-only, so egress from the agent to the controller is not limited by this firewall.

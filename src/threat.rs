@@ -22,7 +22,6 @@ use std::{
 };
 use tracing::warn;
 
-const ALLOWED_THREAT_HOSTS_ENV: &str = "XDP_FIREWALL_ALLOWED_THREAT_HOSTS";
 const MAX_THREAT_BODY_BYTES: usize = 16 * 1024 * 1024;
 const THREAT_HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const THREAT_HTTP_MAX_REDIRECTS: usize = 3;
@@ -30,7 +29,6 @@ const THREAT_LOOKUP_VERSION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const REFRESH_LOCK_POLICY_NAME: &str = "__threat_refresh_lock__";
 const REFRESH_LOCK_SOURCE_NAME: &str = firewall::DEFAULT_POLICY_NAME;
 const REFRESH_LOCK_STALE_SECONDS: i64 = 900;
-const DEFAULT_ALLOWED_THREAT_HOSTS: &[&str] = &["voipbl.org", "www.voipbl.org"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BuiltinThreatSource {
@@ -677,7 +675,14 @@ async fn fetch_threat_source_prefixes(
         .get(&source.url)
         .send()
         .await
-        .with_context(|| format!("failed to fetch threat source {}", source.name))?
+        .with_context(|| format!("failed to fetch threat source {}", source.name))?;
+    if response.status().is_redirection() {
+        bail!(
+            "threat source {} returned an unsupported redirect",
+            source.name
+        );
+    }
+    let response = response
         .error_for_status()
         .with_context(|| format!("threat source {} returned HTTP error", source.name))?;
     match &source.format {
@@ -727,7 +732,7 @@ fn threat_redirect_policy() -> reqwest::redirect::Policy {
         if let Err(err) = validate_source_url_parts(attempt.url()) {
             return attempt.error(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("threat source redirect target is not allowed: {err}"),
+                format!("threat source redirect target is unsupported: {err}"),
             ));
         }
         attempt.follow()
@@ -737,25 +742,15 @@ fn threat_redirect_policy() -> reqwest::redirect::Policy {
 pub fn validate_source_url(value: &str) -> Result<()> {
     let url = reqwest::Url::parse(value)
         .with_context(|| format!("invalid threat source URL '{value}'"))?;
-    validate_source_url_parts(&url)
+    validate_source_url_parts(&url)?;
+    Ok(())
 }
 
 fn validate_source_url_parts(url: &reqwest::Url) -> Result<()> {
     match url.scheme() {
-        "http" | "https" => {}
+        "http" | "https" => Ok(()),
         _ => bail!("threat source URL must use http or https"),
     }
-    if !url.username().is_empty() || url.password().is_some() {
-        bail!("threat source URL must not contain credentials");
-    }
-    let host = url
-        .host_str()
-        .context("threat source URL must include a host")?
-        .to_ascii_lowercase();
-    if !allowed_threat_hosts().contains(&host) {
-        bail!("threat source host '{host}' is not allowed; add it to {ALLOWED_THREAT_HOSTS_ENV}");
-    }
-    Ok(())
 }
 
 async fn read_limited_body(mut response: reqwest::Response, max_bytes: usize) -> Result<String> {
@@ -820,29 +815,6 @@ where
         }
     }
     Ok(parsed)
-}
-
-fn allowed_threat_hosts() -> HashSet<String> {
-    let mut hosts = BUILTIN_THREAT_SOURCES
-        .iter()
-        .filter_map(|source| reqwest::Url::parse(source.url).ok())
-        .filter_map(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
-        .collect::<HashSet<_>>();
-    hosts.extend(
-        DEFAULT_ALLOWED_THREAT_HOSTS
-            .iter()
-            .map(|host| host.to_ascii_lowercase()),
-    );
-    if let Ok(configured) = std::env::var(ALLOWED_THREAT_HOSTS_ENV) {
-        hosts.extend(
-            configured
-                .split(',')
-                .map(str::trim)
-                .filter(|host| !host.is_empty())
-                .map(str::to_ascii_lowercase),
-        );
-    }
-    hosts
 }
 
 fn parse_lenient_line_prefix(line: &str, format: &str) -> Result<Option<ThreatPrefix>> {
@@ -1094,20 +1066,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_threat_url_credentials() {
-        let err = validate_source_url("https://user:secret@raw.githubusercontent.com/feed.txt")
-            .unwrap_err();
-        assert!(err.to_string().contains("must not contain credentials"));
+    fn accepts_threat_url_credentials() {
+        validate_source_url("https://user:secret@raw.githubusercontent.com/feed.txt").unwrap();
     }
 
     #[test]
-    fn accepts_voipbl_source_url_by_default() {
+    fn accepts_http_threat_source_urls_without_host_restrictions() {
         validate_source_url("https://voipbl.org/update/").unwrap();
-        validate_source_url("http://www.voipbl.org/update/").unwrap();
+        validate_source_url(
+            "https://operations-toolbox.oss-cn-hongkong.aliyuncs.com/threat-source/ban.txt",
+        )
+        .unwrap();
+        validate_source_url("https://user:secret@raw.githubusercontent.com/feed.txt").unwrap();
+    }
+
+    #[test]
+    fn rejects_non_http_threat_source_urls() {
+        let err = validate_source_url("file:///tmp/threat-source.txt").unwrap_err();
+        assert!(err.to_string().contains("must use http or https"));
     }
 
     #[tokio::test]
-    async fn follows_allowed_307_threat_source_redirects() {
+    async fn follows_307_threat_source_redirects() {
         use axum::{
             Router,
             http::{StatusCode, header},
@@ -1162,6 +1142,52 @@ mod tests {
                 prefix: 24,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_non_http_307_threat_source_redirects() {
+        use axum::{
+            Router,
+            http::{StatusCode, header},
+            routing::get,
+        };
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route(
+            "/start",
+            get(|| async {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [(header::LOCATION, "file:///tmp/threat-source.txt")],
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(THREAT_HTTP_TIMEOUT)
+            .redirect(threat_redirect_policy())
+            .build()
+            .unwrap();
+        let err = fetch_threat_source_prefixes(
+            &client,
+            &ThreatSource {
+                name: "test-feed".to_string(),
+                url: format!("http://127.0.0.1:{port}/start"),
+                format: ThreatFormat::Cidr,
+                min_score: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        server.abort();
+        assert!(err.to_string().contains("unsupported redirect"));
     }
 
     #[test]
