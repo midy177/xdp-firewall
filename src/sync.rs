@@ -30,6 +30,7 @@ pub async fn sync_once(args: SyncOnceArgs) -> Result<()> {
         xdp_attach_options_for_sync_once(&args),
     )?;
     let interface = xdp.interface_name().to_string();
+    let interface_ips = xdp.interface_ips();
     let mut client = xds::XdsClient::connect(xds::XdsClientConfig {
         control_url: args.control_url.clone(),
         agent_token: args.agent_token.clone(),
@@ -41,7 +42,14 @@ pub async fn sync_once(args: SyncOnceArgs) -> Result<()> {
     let applied = apply_latest(&mut xdp, snapshot, &args.control_url, version).await?;
     let (status, error) = sync_once_status();
     client
-        .report_heartbeat(&node_id, &interface, applied, status, error.as_deref())
+        .report_heartbeat(
+            &node_id,
+            &interface,
+            &interface_ips,
+            applied,
+            status,
+            error.as_deref(),
+        )
         .await?;
     info!(
         node_id = %node_id,
@@ -87,10 +95,12 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
         xdp_attach_options_for_agent(&args),
     )?;
     let interface = xdp.interface_name().to_string();
+    let interface_ips = xdp.interface_ips();
     info!(
         node_id = %node_id,
         policy,
         interface = %interface,
+        interface_ips = %format_interface_ips(&interface_ips),
         "agent attached XDP"
     );
     let mut applied_version = -1_i64;
@@ -102,7 +112,7 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
     })
     .await?;
     client
-        .report_heartbeat(&node_id, &interface, 0, "starting", None)
+        .report_heartbeat(&node_id, &interface, &interface_ips, 0, "starting", None)
         .await?;
     let mut drop_monitor: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -119,6 +129,7 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
                     .report_heartbeat(
                         &node_id,
                         &interface,
+                        &interface_ips,
                         applied_version.max(0),
                         "error",
                         Some(&details),
@@ -148,6 +159,7 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
                                         client.report_heartbeat(
                                             &node_id,
                                             &interface,
+                                            &interface_ips,
                                             applied_version.max(0),
                                             "error",
                                             Some(&details),
@@ -169,12 +181,12 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
                                     Ok(applied) => {
                                         applied_version = applied;
                                         log_xdp_stats(&xdp);
-                                        client.report_heartbeat(&node_id, &interface, applied_version, "ok", None).await?;
+                                        client.report_heartbeat(&node_id, &interface, &interface_ips, applied_version, "ok", None).await?;
                                     }
                                     Err(err) => {
                                         let details = format!("{err:#}");
                                         error!(error = %details, "failed to apply firewall policy");
-                                        client.report_heartbeat(&node_id, &interface, applied_version.max(0), "error", Some(&details)).await?;
+                                        client.report_heartbeat(&node_id, &interface, &interface_ips, applied_version.max(0), "error", Some(&details)).await?;
                                         tokio::time::sleep(reconnect_delay).await;
                                         break;
                                     }
@@ -194,7 +206,7 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
                         Err(err) => {
                             let details = format!("{err:#}");
                             error!(error = %details, "xDS policy stream failed; reconnecting");
-                            let _ = client.report_heartbeat(&node_id, &interface, applied_version.max(0), "error", Some(&details)).await;
+                            let _ = client.report_heartbeat(&node_id, &interface, &interface_ips, applied_version.max(0), "error", Some(&details)).await;
                             tokio::time::sleep(reconnect_delay).await;
                             break;
                         }
@@ -202,11 +214,11 @@ pub async fn run_agent(args: AgentArgs) -> Result<()> {
                 }
                 _ = heartbeat_tick.tick() => {
                     log_xdp_stats(&xdp);
-                    client.report_heartbeat(&node_id, &interface, applied_version.max(0), "ok", None).await?;
+                    client.report_heartbeat(&node_id, &interface, &interface_ips, applied_version.max(0), "ok", None).await?;
                 }
                 result = tokio::signal::ctrl_c() => {
                     result?;
-                    client.report_heartbeat(&node_id, &interface, applied_version.max(0), "stopped", None).await?;
+                    client.report_heartbeat(&node_id, &interface, &interface_ips, applied_version.max(0), "stopped", None).await?;
                     return Ok(());
                 }
             }
@@ -309,6 +321,13 @@ fn log_xdp_stats(xdp: &xdp::XdpManager) {
             error!(error = %err, "failed to read xdp stats");
         }
     }
+}
+
+fn format_interface_ips(ips: &[IpAddr]) -> String {
+    ips.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn validate_positive_interval(name: &str, seconds: u64) -> Result<()> {

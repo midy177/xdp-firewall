@@ -63,6 +63,7 @@ message HeartbeatRequest {
   int64 last_applied_version = 3;
   string status = 4;
   string error = 5;
+  repeated string interface_ips = 6;
 }
 
 message HeartbeatResponse {

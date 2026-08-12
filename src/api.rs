@@ -14,6 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, delete, get, post, put},
 };
+use ipnet::IpNet;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
     PaginatorTrait, QueryFilter, QueryOrder, Set, TransactionTrait, sea_query::OnConflict,
@@ -22,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     convert::Infallible,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
@@ -309,6 +310,7 @@ struct Page<T> {
 struct NodeResponse {
     node_id: String,
     interface_name: String,
+    interface_ips: Vec<String>,
     last_seen_at: chrono::NaiveDateTime,
     last_applied_version: i64,
     current_policy_version: i64,
@@ -779,6 +781,9 @@ async fn create_rule(
     State(state): State<ApiState>,
     Json(request): Json<CreateRuleRequest>,
 ) -> ApiResult<(StatusCode, Json<Versioned<firewall_rule::Model>>)> {
+    if let Some(cidr) = deny_rule_cidr(&request)? {
+        reject_node_ip_block(&state.db, cidr, "deny rule").await?;
+    }
     let row = rule_active_model(request)?
         .insert(&state.db)
         .await
@@ -792,6 +797,11 @@ async fn create_rules(
     Json(request): Json<BatchRequest<CreateRuleRequest>>,
 ) -> ApiResult<(StatusCode, Json<Versioned<Vec<firewall_rule::Model>>>)> {
     validate_batch_len(request.items.len())?;
+    for item in &request.items {
+        if let Some(cidr) = deny_rule_cidr(item)? {
+            reject_node_ip_block(&state.db, cidr, "deny rule").await?;
+        }
+    }
     let models = request
         .items
         .into_iter()
@@ -846,6 +856,14 @@ fn rule_active_model(request: CreateRuleRequest) -> ApiResult<firewall_rule::Act
         updated_at: Set(chrono::Utc::now().naive_utc()),
         ..Default::default()
     })
+}
+
+fn deny_rule_cidr(request: &CreateRuleRequest) -> ApiResult<Option<IpNet>> {
+    let action = normalize_action(&request.action)?;
+    if action != "deny" {
+        return Ok(None);
+    }
+    Ok(Some(parse_normalized_cidr(&request.cidr)?))
 }
 
 async fn delete_rule(
@@ -1931,6 +1949,12 @@ async fn create_temp_ban(
     State(state): State<ApiState>,
     Json(request): Json<CreateTempBanRequest>,
 ) -> ApiResult<(StatusCode, Json<Versioned<temp_ban::Model>>)> {
+    reject_node_ip_block(
+        &state.db,
+        parse_normalized_cidr(&request.cidr)?,
+        "temporary ban",
+    )
+    .await?;
     let row = temp_ban_active_model(request)?.insert(&state.db).await?;
     let version = db::next_policy_version(&state.db, firewall::DEFAULT_POLICY_NAME).await?;
     Ok((StatusCode::CREATED, Json(Versioned { version, data: row })))
@@ -1941,6 +1965,14 @@ async fn create_temp_bans(
     Json(request): Json<BatchRequest<CreateTempBanRequest>>,
 ) -> ApiResult<(StatusCode, Json<Versioned<Vec<temp_ban::Model>>>)> {
     validate_batch_len(request.items.len())?;
+    for item in &request.items {
+        reject_node_ip_block(
+            &state.db,
+            parse_normalized_cidr(&item.cidr)?,
+            "temporary ban",
+        )
+        .await?;
+    }
     let models = request
         .items
         .into_iter()
@@ -2510,6 +2542,11 @@ impl NodeResponse {
         Self {
             node_id: value.node_id,
             interface_name: value.interface_name,
+            interface_ips: parse_node_interface_ips(&value.interface_ips)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|ip| ip.to_string())
+                .collect(),
             last_seen_at: value.last_seen_at,
             last_applied_version: value.last_applied_version,
             current_policy_version,
@@ -2689,6 +2726,63 @@ fn normalize_cidr(value: &str) -> Result<String> {
         ipnet::IpNet::V4(net) => format!("{}/{}", net.network(), net.prefix_len()),
         ipnet::IpNet::V6(net) => format!("{}/{}", net.network(), net.prefix_len()),
     })
+}
+
+fn parse_normalized_cidr(value: &str) -> Result<IpNet> {
+    normalize_cidr(value)?
+        .parse::<IpNet>()
+        .with_context(|| format!("invalid normalized CIDR '{value}'"))
+}
+
+async fn reject_node_ip_block(
+    db: &DatabaseConnection,
+    cidr: IpNet,
+    resource: &str,
+) -> ApiResult<()> {
+    let rows = node::Entity::find()
+        .filter(node::Column::PolicyName.eq(firewall::DEFAULT_POLICY_NAME))
+        .all(db)
+        .await?;
+    for row in rows {
+        for ip in parse_node_interface_ips(&row.interface_ips)? {
+            if cidr_contains_ip(cidr, ip) {
+                warn!(
+                    resource,
+                    cidr = %cidr,
+                    node_id = %row.node_id,
+                    interface = %row.interface_name,
+                    ip = %ip,
+                    "rejected configuration because it would block a node interface IP"
+                );
+                return Err(ApiError::bad_request(format!(
+                    "{resource} CIDR {cidr} contains node {} interface {} IP {ip}",
+                    row.node_id, row.interface_name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_node_interface_ips(value: &str) -> Result<Vec<IpAddr>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<IpAddr>()
+                .with_context(|| format!("invalid persisted node interface IP '{value}'"))
+        })
+        .collect()
+}
+
+fn cidr_contains_ip(cidr: IpNet, ip: IpAddr) -> bool {
+    match (cidr, ip) {
+        (IpNet::V4(cidr), IpAddr::V4(ip)) => cidr.contains(&ip),
+        (IpNet::V6(cidr), IpAddr::V6(ip)) => cidr.contains(&ip),
+        _ => false,
+    }
 }
 
 fn normalize_rule_key(value: Option<String>) -> Result<Option<String>> {
@@ -2936,6 +3030,22 @@ mod tests {
         (app, db)
     }
 
+    async fn insert_test_node(db: &DatabaseConnection, node_id: &str, interface_ips: &str) {
+        node::ActiveModel {
+            node_id: Set(node_id.to_string()),
+            policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
+            interface_name: Set("eth0".to_string()),
+            interface_ips: Set(interface_ips.to_string()),
+            last_seen_at: Set(chrono::Utc::now().naive_utc()),
+            last_applied_version: Set(1),
+            status: Set("ok".to_string()),
+            error: Set(None),
+        }
+        .insert(db)
+        .await
+        .unwrap();
+    }
+
     fn assert_generated_rule_key(value: &Value) -> &str {
         let rule_key = value.as_str().expect("rule_key must be a string");
         assert_eq!(rule_key.len(), 36);
@@ -3092,6 +3202,7 @@ mod tests {
                 node_id: Set("fresh-ok".to_string()),
                 policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
                 interface_name: Set("eth0".to_string()),
+                interface_ips: Set("198.51.100.10".to_string()),
                 last_seen_at: Set(now),
                 last_applied_version: Set(2),
                 status: Set("ok".to_string()),
@@ -3101,6 +3212,7 @@ mod tests {
                 node_id: Set("fresh-stale".to_string()),
                 policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
                 interface_name: Set("eth0".to_string()),
+                interface_ips: Set("198.51.100.11".to_string()),
                 last_seen_at: Set(now),
                 last_applied_version: Set(1),
                 status: Set("ok".to_string()),
@@ -3110,6 +3222,7 @@ mod tests {
                 node_id: Set("old-ok".to_string()),
                 policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
                 interface_name: Set("eth0".to_string()),
+                interface_ips: Set("198.51.100.12".to_string()),
                 last_seen_at: Set(now - chrono::Duration::seconds(600)),
                 last_applied_version: Set(2),
                 status: Set("ok".to_string()),
@@ -3371,6 +3484,45 @@ mod tests {
             response_json(send_empty(&app, Method::DELETE, "/rules?rule_key=edge-web-deny").await)
                 .await;
         assert_eq!(deleted["data"]["deleted"], 1);
+    }
+
+    #[tokio::test]
+    async fn deny_rule_rejects_cidr_containing_node_interface_ip() {
+        let (app, db) = test_router().await;
+        insert_test_node(&db, "node-a", "10.0.0.10,2001:db8::10").await;
+
+        let deny_error = response_error(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules",
+                json!({
+                    "priority": 10,
+                    "action": "deny",
+                    "cidr": "10.0.0.0/24",
+                    "protocol": "any"
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(deny_error.contains("contains node node-a interface eth0 IP 10.0.0.10"));
+
+        response_json(
+            send_json(
+                &app,
+                Method::POST,
+                "/rules",
+                json!({
+                    "priority": 10,
+                    "action": "allow",
+                    "cidr": "10.0.0.0/24",
+                    "protocol": "any"
+                }),
+            )
+            .await,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -4119,6 +4271,30 @@ mod tests {
         )
         .await;
         assert_eq!(filtered["total"], 1);
+    }
+
+    #[tokio::test]
+    async fn temporary_ban_rejects_cidr_containing_node_interface_ip() {
+        let (app, db) = test_router().await;
+        insert_test_node(&db, "node-a", "10.0.0.10").await;
+
+        let error = response_error(
+            send_json(
+                &app,
+                Method::POST,
+                "/temp-bans",
+                json!({
+                    "cidr": "10.0.0.10/32",
+                    "protocol": "any",
+                    "duration_seconds": 300
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(error.contains(
+            "temporary ban CIDR 10.0.0.10/32 contains node node-a interface eth0 IP 10.0.0.10"
+        ));
     }
 
     #[tokio::test]

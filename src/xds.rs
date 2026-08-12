@@ -10,7 +10,7 @@ use sea_orm::{
 use serde::Serialize;
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
@@ -281,7 +281,15 @@ impl GeoIpRefresh {
                     .is_some_and(|elapsed| elapsed < self.interval),
             )
         };
-        if running || retry_throttled {
+        if running {
+            info!("skipping country IP background refresh because a refresh is already running");
+            return Ok(());
+        }
+        if retry_throttled {
+            info!(
+                retry_interval_seconds = GEO_IP_REFRESH_RETRY_INTERVAL.as_secs(),
+                "skipping country IP background refresh because the retry interval has not elapsed"
+            );
             return Ok(());
         }
         let missing_lists = if !within_interval {
@@ -290,12 +298,19 @@ impl GeoIpRefresh {
             geo_ip_lists_missing(db).await?
         };
         if within_interval && !missing_lists {
+            info!(
+                refresh_interval_seconds = self.interval.as_secs(),
+                "skipping country IP background refresh because the refresh interval has not elapsed"
+            );
             return Ok(());
         }
 
         {
             let mut state = self.state.lock().expect("geo IP refresh mutex poisoned");
             if state.running {
+                info!(
+                    "skipping country IP background refresh because a refresh is already running"
+                );
                 return Ok(());
             }
             if state
@@ -303,6 +318,10 @@ impl GeoIpRefresh {
                 .and_then(|last| started_at.checked_duration_since(last))
                 .is_some_and(|elapsed| elapsed < GEO_IP_REFRESH_RETRY_INTERVAL)
             {
+                info!(
+                    retry_interval_seconds = GEO_IP_REFRESH_RETRY_INTERVAL.as_secs(),
+                    "skipping country IP background refresh because the retry interval has not elapsed"
+                );
                 return Ok(());
             }
             let within_interval = state
@@ -310,11 +329,20 @@ impl GeoIpRefresh {
                 .and_then(|last| started_at.checked_duration_since(last))
                 .is_some_and(|elapsed| elapsed < self.interval);
             if within_interval && !missing_lists {
+                info!(
+                    refresh_interval_seconds = self.interval.as_secs(),
+                    "skipping country IP background refresh because the refresh interval has not elapsed"
+                );
                 return Ok(());
             }
             state.running = true;
             state.last_attempt = Some(started_at);
         }
+        info!(
+            missing_lists,
+            refresh_interval_seconds = self.interval.as_secs(),
+            "starting country IP background refresh"
+        );
         let state = self.state.clone();
         let db = db.clone();
         let geo_lookup = self.geo_lookup.clone();
@@ -332,6 +360,15 @@ impl GeoIpRefresh {
                         version,
                         "refreshed changed country IP lists during xDS push tick"
                     );
+                } else {
+                    info!(
+                        status = %report.refresh_status,
+                        checked_countries = report.checked_country_count,
+                        changed_countries = report.changed_country_count,
+                        failed_countries = report.failed_country_count,
+                        prefixes = report.prefix_count,
+                        "completed country IP background refresh without changes"
+                    );
                 }
                 Ok(report)
             }
@@ -343,7 +380,7 @@ impl GeoIpRefresh {
                     guard.last_success = Some(started_at);
                 }
                 Ok(report) if report.running => {
-                    debug!(
+                    info!(
                         status = %report.refresh_status,
                         "country IP refresh is already running elsewhere; skipping automatic xDS refresh"
                     );
@@ -395,7 +432,17 @@ impl ThreatSourceRefresh {
                     .is_some_and(|elapsed| elapsed < self.interval),
             )
         };
-        if running || retry_throttled {
+        if running {
+            info!(
+                "skipping threat intelligence background refresh because a refresh is already running"
+            );
+            return Ok(());
+        }
+        if retry_throttled {
+            info!(
+                retry_interval_seconds = THREAT_REFRESH_RETRY_INTERVAL.as_secs(),
+                "skipping threat intelligence background refresh because the retry interval has not elapsed"
+            );
             return Ok(());
         }
         let missing_states = if !within_interval {
@@ -404,6 +451,10 @@ impl ThreatSourceRefresh {
             threat::enabled_threat_source_states_missing(db).await?
         };
         if within_interval && !missing_states {
+            info!(
+                refresh_interval_seconds = self.interval.as_secs(),
+                "skipping threat intelligence background refresh because the refresh interval has not elapsed"
+            );
             return Ok(());
         }
 
@@ -413,6 +464,9 @@ impl ThreatSourceRefresh {
                 .lock()
                 .expect("threat source refresh mutex poisoned");
             if state.running {
+                info!(
+                    "skipping threat intelligence background refresh because a refresh is already running"
+                );
                 return Ok(());
             }
             if state
@@ -420,6 +474,10 @@ impl ThreatSourceRefresh {
                 .and_then(|last| started_at.checked_duration_since(last))
                 .is_some_and(|elapsed| elapsed < THREAT_REFRESH_RETRY_INTERVAL)
             {
+                info!(
+                    retry_interval_seconds = THREAT_REFRESH_RETRY_INTERVAL.as_secs(),
+                    "skipping threat intelligence background refresh because the retry interval has not elapsed"
+                );
                 return Ok(());
             }
             let within_interval = state
@@ -427,12 +485,21 @@ impl ThreatSourceRefresh {
                 .and_then(|last| started_at.checked_duration_since(last))
                 .is_some_and(|elapsed| elapsed < self.interval);
             if within_interval && !missing_states {
+                info!(
+                    refresh_interval_seconds = self.interval.as_secs(),
+                    "skipping threat intelligence background refresh because the refresh interval has not elapsed"
+                );
                 return Ok(());
             }
             state.running = true;
             state.last_attempt = Some(started_at);
         }
 
+        info!(
+            missing_states,
+            refresh_interval_seconds = self.interval.as_secs(),
+            "starting threat intelligence background refresh"
+        );
         let result = threat::refresh_enabled_threat_sources(db).await;
         match result {
             Ok(report) => {
@@ -449,13 +516,17 @@ impl ThreatSourceRefresh {
                     self.threat_lookup.spawn_rebuild(db.clone());
                     info!(
                         enabled_threat_sources = report.enabled_source_count,
-                        version, "refreshed threat intelligence sources during xDS push tick"
+                        changed_threat_sources = report.changed_source_count,
+                        prefixes = report.prefix_count,
+                        version,
+                        "refreshed threat intelligence sources during xDS push tick"
                     );
                 } else {
-                    debug!(
+                    info!(
                         status = %report.refresh_status,
                         enabled_threat_sources = report.enabled_source_count,
-                        "skipping threat intelligence refresh"
+                        prefixes = report.prefix_count,
+                        "completed threat intelligence background refresh without changes"
                     );
                 }
                 Ok(())
@@ -996,6 +1067,7 @@ impl XdsClient {
         &mut self,
         node_id: &str,
         interface_name: &str,
+        interface_ips: &[IpAddr],
         last_applied_version: i64,
         status: &str,
         error: Option<&str>,
@@ -1003,6 +1075,7 @@ impl XdsClient {
         let request = self.with_auth(HeartbeatRequest {
             node_id: node_id.to_string(),
             interface_name: interface_name.to_string(),
+            interface_ips: interface_ips.iter().map(ToString::to_string).collect(),
             last_applied_version,
             status: status.to_string(),
             error: error.unwrap_or_default().to_string(),
@@ -1693,6 +1766,7 @@ fn normalize_runtime_trusted_cidrs(values: &[String]) -> Result<Vec<IpNet>> {
 
 async fn upsert_heartbeat(db: &DatabaseConnection, request: HeartbeatRequest) -> Result<()> {
     let now = chrono::Utc::now().naive_utc();
+    let interface_ips = normalize_heartbeat_interface_ips(request.interface_ips)?;
     let public_error = if request.error.trim().is_empty() {
         None
     } else {
@@ -1702,6 +1776,7 @@ async fn upsert_heartbeat(db: &DatabaseConnection, request: HeartbeatRequest) ->
         node_id: Set(request.node_id),
         policy_name: Set(firewall::DEFAULT_POLICY_NAME.to_string()),
         interface_name: Set(request.interface_name),
+        interface_ips: Set(interface_ips),
         last_seen_at: Set(now),
         last_applied_version: Set(request.last_applied_version),
         status: Set(request.status),
@@ -1712,6 +1787,7 @@ async fn upsert_heartbeat(db: &DatabaseConnection, request: HeartbeatRequest) ->
             .update_columns([
                 node::Column::PolicyName,
                 node::Column::InterfaceName,
+                node::Column::InterfaceIps,
                 node::Column::LastSeenAt,
                 node::Column::LastAppliedVersion,
                 node::Column::Status,
@@ -1722,6 +1798,32 @@ async fn upsert_heartbeat(db: &DatabaseConnection, request: HeartbeatRequest) ->
     .exec_without_returning(db)
     .await?;
     Ok(())
+}
+
+fn normalize_heartbeat_interface_ips(values: Vec<String>) -> Result<String> {
+    let mut ips = values
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .map(|value| {
+            value
+                .parse::<IpAddr>()
+                .with_context(|| format!("invalid heartbeat interface IP '{value}'"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ips.sort();
+    ips.dedup();
+    Ok(ips
+        .into_iter()
+        .map(|ip| ip.to_string())
+        .collect::<Vec<_>>()
+        .join(","))
 }
 
 fn internal_status(error: impl std::fmt::Display) -> Status {

@@ -258,6 +258,7 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
     )
     .await?;
     create_table(db, schema.create_table_from_entity(entities::node::Entity)).await?;
+    ensure_node_interface_ips_column(db).await?;
     Ok(())
 }
 
@@ -345,6 +346,27 @@ async fn ensure_temp_ban_cidr_column(db: &DatabaseConnection) -> Result<()> {
 
     backfill_temp_ban_cidrs(db).await?;
     drop_legacy_temp_ban_ip_column(db).await?;
+    Ok(())
+}
+
+async fn ensure_node_interface_ips_column(db: &DatabaseConnection) -> Result<()> {
+    let backend = db.get_database_backend();
+    if column_exists(db, "firewall_nodes", "interface_ips").await? {
+        return Ok(());
+    }
+    let sql = match backend {
+        DbBackend::Postgres => {
+            "ALTER TABLE firewall_nodes ADD COLUMN interface_ips VARCHAR(1024) NOT NULL DEFAULT ''"
+        }
+        DbBackend::MySql => {
+            "ALTER TABLE firewall_nodes ADD COLUMN interface_ips VARCHAR(1024) NOT NULL DEFAULT ''"
+        }
+        DbBackend::Sqlite => {
+            "ALTER TABLE firewall_nodes ADD COLUMN interface_ips TEXT NOT NULL DEFAULT ''"
+        }
+        _ => bail!("unsupported database backend for node migration"),
+    };
+    db.execute_raw(raw_sql(backend, sql)).await?;
     Ok(())
 }
 
@@ -964,5 +986,67 @@ mod tests {
         .insert(&db)
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrate_adds_node_interface_ips_column() {
+        let mut options = ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1);
+        let db = Database::connect(options).await.unwrap();
+        let backend = DbBackend::Sqlite;
+
+        db.execute_raw(raw_sql(
+            backend,
+            "CREATE TABLE firewall_nodes (
+                node_id TEXT PRIMARY KEY NOT NULL,
+                policy_name TEXT NOT NULL,
+                interface_name TEXT NOT NULL,
+                last_seen_at TIMESTAMP NOT NULL,
+                last_applied_version BIGINT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT
+            )",
+        ))
+        .await
+        .unwrap();
+        db.execute_raw(raw_sql(
+            backend,
+            "INSERT INTO firewall_nodes (
+                node_id,
+                policy_name,
+                interface_name,
+                last_seen_at,
+                last_applied_version,
+                status,
+                error
+            ) VALUES (
+                'node-a',
+                'default',
+                'eth0',
+                '2026-01-01 00:00:00',
+                1,
+                'ok',
+                NULL
+            )",
+        ))
+        .await
+        .unwrap();
+
+        migrate(&db).await.unwrap();
+
+        assert!(
+            column_exists(&db, "firewall_nodes", "interface_ips")
+                .await
+                .unwrap()
+        );
+        let row = db
+            .query_one_raw(raw_sql(
+                backend,
+                "SELECT interface_ips FROM firewall_nodes WHERE node_id = 'node-a'",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<String>("", "interface_ips").unwrap(), "");
     }
 }

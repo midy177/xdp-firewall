@@ -7,7 +7,6 @@ use crate::firewall::{
 #[cfg(any(target_os = "linux", test))]
 use crate::firewall::{RuleAction, XdpPrefixRule, XdpTempBan, XdpTrustedPrefix};
 use anyhow::{Result, bail};
-#[cfg(any(target_os = "linux", test))]
 use std::net::IpAddr;
 #[cfg(target_os = "linux")]
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -322,6 +321,17 @@ impl XdpManager {
         #[cfg(not(target_os = "linux"))]
         {
             "noop"
+        }
+    }
+
+    pub fn interface_ips(&self) -> Vec<IpAddr> {
+        #[cfg(target_os = "linux")]
+        {
+            return self.inner.interface_ips();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Vec::new()
         }
     }
 
@@ -1136,6 +1146,13 @@ mod linux {
 
         pub fn interface_name(&self) -> &str {
             &self.interface
+        }
+
+        pub fn interface_ips(&self) -> Vec<IpAddr> {
+            self.local_interface_cidrs
+                .iter()
+                .map(|cidr| cidr.ip)
+                .collect()
         }
 
         pub fn apply(&mut self, policy: &CompiledPolicy) -> Result<()> {

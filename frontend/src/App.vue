@@ -816,11 +816,12 @@
             <Button variant="danger" :title="t('maintainNodes')" :disabled="actionBusy" @click="runAction(maintainNodes)"><Wrench :size="16" /><span>{{ t("maintainNodes") }}</span></Button>
           </div>
         </div>
-        <ResizableTable storage-key="nodes" :default-widths="[260, 140, 150, 120, 180, 260]">
+        <ResizableTable storage-key="nodes" :default-widths="[220, 120, 220, 150, 120, 180, 260]">
           <thead>
             <tr>
               <th>{{ t("node") }}</th>
               <th>{{ t("interface") }}</th>
+              <th>{{ t("interfaceIps") }}</th>
               <th>{{ t("version") }}</th>
               <th>{{ t("status") }}</th>
               <th>{{ t("seen") }}</th>
@@ -829,11 +830,12 @@
           </thead>
           <tbody>
             <tr v-if="!loading && nodes.length === 0">
-              <td colspan="6" class="empty">{{ t("emptyNodes") }}</td>
+              <td colspan="7" class="empty">{{ t("emptyNodes") }}</td>
             </tr>
             <tr v-for="node in nodes" :key="node.node_id">
               <td>{{ node.node_id }}</td>
               <td>{{ node.interface_name }}</td>
+              <td class="clip">{{ node.interface_ips.join(", ") }}</td>
               <td>{{ node.last_applied_version }}/{{ node.current_policy_version }}</td>
               <td><Badge :tone="nodeSyncTone(node)">{{ nodeSyncStatusLabel(node.sync_status) }}</Badge></td>
               <td>{{ formatLocalTime(node.last_seen_at) }}</td>
@@ -1047,7 +1049,7 @@ type DynamicDefense = {
   flood_burst?: number | null;
   flood_block_seconds?: number | null;
 };
-type NodeState = { node_id: string; interface_name: string; last_applied_version: number; current_policy_version: number; status: string; sync_status: string; healthy: boolean; seconds_since_seen: number; last_seen_at: string; error?: string };
+type NodeState = { node_id: string; interface_name: string; interface_ips: string[]; last_applied_version: number; current_policy_version: number; status: string; sync_status: string; healthy: boolean; seconds_since_seen: number; last_seen_at: string; error?: string };
 type DropEvent = { local_id: number; node_id: string; interface_name: string; time: string; event_time_ns: number; cpu: number; reason: string; src: string; family: number; proto: string; dport: number; country?: string; threat_source?: string; action: string };
 type Snapshot = { version: number };
 type Page<T> = { items: T[]; total: number; page: number; page_size: number; total_pages: number };
@@ -1218,6 +1220,7 @@ const messages = {
     ipAddress: "IP 地址",
     ipPps: "IP PPS",
     interface: "网卡",
+    interfaceIps: "网卡 IP",
     maintainNodes: "节点维护",
     name: "名称",
     node: "节点",
@@ -1349,6 +1352,7 @@ const messages = {
     ipAddress: "IP address",
     ipPps: "IP PPS",
     interface: "Interface",
+    interfaceIps: "Interface IPs",
     maintainNodes: "Maintain nodes",
     name: "Name",
     node: "Node",
