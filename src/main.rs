@@ -1,12 +1,28 @@
-use anyhow::{Context, Result, bail};
+mod server_commands;
+
+use anyhow::{Result, bail};
 use clap::Parser;
-use tracing::{error, info};
+use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
-use xdp_firewall::cli::{Cli, Command, PolicyCommand, XdpCommand, XdsArgs};
-use xdp_firewall::{api, db, firewall, geo, monitor, sync, xdp, xds};
+use xdp_firewall::cli::{Cli, Command, DatabaseArgs, PolicyCommand, XdpCommand};
+use xdp_firewall::{
+    agent::{monitor, sync},
+    data_plane::xdp,
+    db,
+    policy::{model::DEFAULT_POLICY_NAME, seed},
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
+
+    let cli = Cli::parse();
+    info!("starting xdp-firewall");
+    reject_control_plane_commands_in_agent_only_mode(&cli.command)?;
+    run_command(cli.command).await
+}
+
+fn init_tracing() {
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -14,82 +30,13 @@ async fn main() -> Result<()> {
         )
         .with_target(false)
         .init();
+}
 
-    let cli = Cli::parse();
-    info!("starting xdp-firewall");
-    reject_control_plane_commands_in_agent_only_mode(&cli.command)?;
-
-    match cli.command {
-        Command::Migrate(args) => {
-            info!("running database migrations");
-            let db = db::connect(&args.database_url).await?;
-            db::migrate(&db).await
-        }
-        Command::Api(args) => {
-            info!(
-                api_configured_runtime_trusted_cidr_args = args.trusted_cidrs.len(),
-                "starting api command"
-            );
-            let db = db::connect(&args.database.database_url).await?;
-            db::migrate(&db).await?;
-            firewall::ensure_builtin_policy(&db, firewall::DEFAULT_POLICY_NAME).await?;
-            let xds_args = XdsArgs {
-                database: args.database.clone(),
-                k8s: args.k8s.clone(),
-                bind: args.xds_bind.clone(),
-                push_interval_seconds: args.xds_push_interval_seconds,
-                agent_token: args.agent_token.clone(),
-                trusted_cidrs: args.trusted_cidrs.clone(),
-            };
-            let drop_events = xds::DropEventHub::new();
-            let geo_lookup = geo::GeoIpLookup::default();
-            let loaded_geo_prefixes = geo_lookup.rebuild_from_db(&db).await?;
-            info!(
-                geo_prefixes = loaded_geo_prefixes,
-                "loaded country IP lookup database"
-            );
-            let api_server = api::serve(db.clone(), args, drop_events.clone(), geo_lookup.clone());
-            let xds_server = xds::serve(db, xds_args, drop_events, geo_lookup);
-            tokio::select! {
-                result = api_server => {
-                    match result {
-                        Ok(()) => {
-                            error!("API HTTP server exited unexpectedly without error");
-                            bail!("API HTTP server exited unexpectedly");
-                        }
-                        Err(err) => {
-                            error!(error = %format!("{err:#}"), "API HTTP server exited with error");
-                            return Err(err).context("API HTTP server exited");
-                        }
-                    }
-                }
-                result = xds_server => {
-                    match result {
-                        Ok(()) => {
-                            error!("xDS gRPC server exited unexpectedly without error");
-                            bail!("xDS gRPC server exited unexpectedly");
-                        }
-                        Err(err) => {
-                            error!(error = %format!("{err:#}"), "xDS gRPC server exited with error");
-                            return Err(err).context("xDS gRPC server exited");
-                        }
-                    }
-                }
-            }
-        }
-        Command::Xds(args) => {
-            info!("starting xds command");
-            let db = db::connect(&args.database.database_url).await?;
-            db::migrate(&db).await?;
-            firewall::ensure_builtin_policy(&db, firewall::DEFAULT_POLICY_NAME).await?;
-            let geo_lookup = geo::GeoIpLookup::default();
-            let loaded_geo_prefixes = geo_lookup.rebuild_from_db(&db).await?;
-            info!(
-                geo_prefixes = loaded_geo_prefixes,
-                "loaded country IP lookup database"
-            );
-            xds::serve(db, args, xds::DropEventHub::new(), geo_lookup).await
-        }
+async fn run_command(command: Command) -> Result<()> {
+    match command {
+        Command::Migrate(args) => run_migrate_command(args).await,
+        Command::Api(args) => server_commands::run_api_command(args).await,
+        Command::Xds(args) => server_commands::run_xds_command(args).await,
         Command::Agent(args) => {
             info!("starting agent command");
             sync::run_agent(args).await
@@ -102,37 +49,51 @@ async fn main() -> Result<()> {
             info!("starting monitor command");
             monitor::run(args).await
         }
-        Command::Xdp { command } => match command {
-            XdpCommand::Status(args) => {
-                info!("starting xdp status command");
-                xdp::dispatcher_status(args)
-            }
-            XdpCommand::TempBans(args) => {
-                info!("starting xdp temp-bans command");
-                xdp::dispatcher_temp_bans(args)
-            }
-            XdpCommand::Unload(args) => {
-                info!("starting xdp unload command");
-                xdp::dispatcher_unload(args)
-            }
-            XdpCommand::Replace(args) => {
-                info!("starting xdp replace command");
-                xdp::dispatcher_replace(args)
-            }
-        },
-        Command::Policy { database, command } => match command {
-            PolicyCommand::SeedExample(args) => {
-                let db = db::connect(&database.database_url).await?;
-                db::migrate(&db).await?;
-                firewall::seed_example_policy(&db, args).await
-            }
-            PolicyCommand::Show(args) => {
-                let db = db::connect(&database.database_url).await?;
-                db::migrate(&db).await?;
-                firewall::ensure_builtin_policy(&db, firewall::DEFAULT_POLICY_NAME).await?;
-                firewall::show_policy(&db, args).await
-            }
-        },
+        Command::Xdp { command } => run_xdp_command(command),
+        Command::Policy { database, command } => run_policy_command(database, command).await,
+    }
+}
+
+async fn run_migrate_command(args: DatabaseArgs) -> Result<()> {
+    info!("running database migrations");
+    let db = db::connect(&args.database_url).await?;
+    db::migrate(&db).await
+}
+
+fn run_xdp_command(command: XdpCommand) -> Result<()> {
+    match command {
+        XdpCommand::Status(args) => {
+            info!("starting xdp status command");
+            xdp::dispatcher_status(args)
+        }
+        XdpCommand::TempBans(args) => {
+            info!("starting xdp temp-bans command");
+            xdp::dispatcher_temp_bans(args)
+        }
+        XdpCommand::Unload(args) => {
+            info!("starting xdp unload command");
+            xdp::dispatcher_unload(args)
+        }
+        XdpCommand::Replace(args) => {
+            info!("starting xdp replace command");
+            xdp::dispatcher_replace(args)
+        }
+    }
+}
+
+async fn run_policy_command(database: DatabaseArgs, command: PolicyCommand) -> Result<()> {
+    match command {
+        PolicyCommand::SeedExample(args) => {
+            let db = db::connect(&database.database_url).await?;
+            db::migrate(&db).await?;
+            seed::seed_example_policy(&db, args).await
+        }
+        PolicyCommand::Show(args) => {
+            let db = db::connect(&database.database_url).await?;
+            db::migrate(&db).await?;
+            seed::ensure_builtin_policy(&db, DEFAULT_POLICY_NAME).await?;
+            seed::show_policy(&db, args).await
+        }
     }
 }
 

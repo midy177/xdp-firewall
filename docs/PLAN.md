@@ -2,6 +2,25 @@
 
 ## Active Plan
 
+- [pending] Refactor large backend modules by domain boundary: split `api.rs`, `xdp.rs`, `xds.rs`, `geo.rs`, and `threat.rs` into smaller submodules that mirror control-plane, agent, data-plane, policy, and intelligence responsibilities.
+- [pending] Refactor the frontend console so `App.vue` is decomposed into route/view components, reusable composables, API client helpers, validation helpers, i18n text, and shared types.
+- [pending] Keep functions focused and reasonably short during new development and refactors; extract validation, request parsing, persistence, compilation, and rendering branches into named helpers when a function starts mixing responsibilities or becomes difficult to scan.
+- [pending] Continue data-plane refinement by splitting `data_plane/xdp/mod.rs` into focused `maps.rs`, `dispatcher.rs`, attach lifecycle, policy-apply, and monitor/event helpers.
+- [pending] Continue API resource-module refinement by moving remaining resource handlers out of `control_plane/api.rs`, starting with temporary bans, dynamic rate limits, and firewall rules.
+- [completed] Start the data-plane XDP split by extracting public XDP constants/types into `data_plane/xdp/types.rs` and map capacity/resize helpers into `data_plane/xdp/maps.rs`.
+- [completed] Extract XDP dispatcher public commands and bpffs pin-path helpers into `data_plane/xdp/dispatcher.rs`, keeping the Linux implementation available behind the existing module boundary.
+- [completed] Extract XDP attach orchestration and interface resolution into `data_plane/xdp/attach.rs`, and move the cross-platform `XdpManager` facade into `data_plane/xdp/manager.rs`.
+- [completed] Extract XDP BPF map ABI encoding into `data_plane/xdp/encoding.rs`, including map key/value structs, action/protocol/source codes, and key/id conversion helpers.
+- [completed] Extract local-interface CIDR guard and discovery logic into `data_plane/xdp/local.rs`, keeping trusted-prefix compaction, temporary-ban compaction, interface address parsing, and self-deny protection outside the XDP lifecycle implementation.
+- [completed] Shorten the XDP policy apply path by splitting policy key preparation into focused temp-ban, custom-rate-limit, trusted-prefix, rule, geo-prefix, and country-rule collection helpers.
+- [completed] Start the API module refactor by extracting authentication, embedded frontend asset serving, and pagination primitives from `api.rs` into focused `control_plane/api/` submodules.
+- [completed] Continue the API module refactor by extracting API error/response conversion into `control_plane/api/error.rs` and node list/maintenance/detail handlers into `control_plane/api/nodes.rs`.
+- [completed] Extract the trusted CIDR CRUD API into `control_plane/api/trusted_cidrs.rs` as the first complete resource-module split from `api.rs`.
+- [completed] Extract temporary-ban API handlers into `control_plane/api/temp_bans.rs`, including request/query structs, active model construction, duration validation, and batch delete behavior.
+- [completed] Extract custom dynamic-rate-limit API handlers into `control_plane/api/dynamic_rate_limits.rs`, including query filters, match delete, batch create/delete, and active model construction.
+- [completed] Extract firewall-rule API handlers into `control_plane/api/firewall_rules.rs`, including rule-key validation, generated key conflict mapping, query filters, deny-rule self-protection, and batch delete by ids or rule keys.
+- [completed] Add agent offline mode controls: default `--offline-mode unload-rules` with `--offline-failure-limit 5` clears XDP policy maps after consecutive xDS/API connectivity failures and forces a full policy reload after reconnect.
+- [completed] Reorganize the Rust source tree around explicit runtime boundaries: `control_plane`, `agent`, `data_plane`, `policy`, `intelligence`, and `db`, with `db/connection.rs` and `db/migrations.rs` split behind a small DB facade.
 - [completed] Reduce country GeoIP lookup memory pressure under 512Mi Kubernetes limits by building the generated MMDB as an IPv4 tree for the IPdeny aggregated IPv4 feed, documenting the remaining full-MMDB memory tradeoffs, and adding debug memory snapshots after GeoIP DB/MMDB writes.
 - [completed] Add the first XDP dispatcher integration phase: document direct vs dispatcher attach strategy, add CLI flags, detect existing XDP programs before direct attach, expose XDP attach state in monitor output, and fail dispatcher mode explicitly until libxdp/pinned-map integration is implemented.
 - [completed] Complete dispatcher integration by adding libbpf map pin metadata to the BPF object, loading through `xdp-loader` when `--xdp-attach-strategy dispatcher` is selected, and reopening the pinned maps from the agent so control-plane policy updates modify the live dispatcher-owned program maps.
@@ -244,6 +263,8 @@
 
 ## Current Design Decisions
 
+- Source files should reflect the main runtime boundaries: control plane, agent, data plane, policy model/compilation, threat intelligence, GeoIP, and persistence.
+- Single functions should stay focused on one responsibility. Long orchestration functions are acceptable only when they read as a simple sequence of named steps; detailed validation, mapping, DB mutation, policy compilation, and UI rendering logic should be extracted into smaller helpers or components.
 - Ordinary firewall rules are CIDR/protocol/port allow or deny rules.
 - Threat intelligence is compiled into deny prefix rules.
 - Temporary bans are source-CIDR deny entries with optional protocol and destination-port match.

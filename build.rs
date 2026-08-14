@@ -22,14 +22,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by cargo"));
     let out_file = out_dir.join("frontend_assets.rs");
     let mut file = File::create(out_file)?;
+    let index_html = frontend_index_html();
 
-    writeln!(
-        file,
-        "pub fn get(path: &str) -> Option<(&'static str, &'static [u8])> {{"
-    )?;
-    writeln!(file, "    match path {{")?;
+    writeln!(file, "pub const INDEX_HTML: &str = {index_html:?};")?;
 
     let assets_dir = Path::new("frontend/dist/assets");
+    let mut asset_entries = Vec::new();
     if assets_dir.is_dir() {
         let mut assets = fs::read_dir(assets_dir)?
             .filter_map(Result::ok)
@@ -55,10 +53,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .replace('\\', "\\\\")
                 .replace('"', "\\\"");
 
-            writeln!(
-                file,
+            asset_entries.push(format!(
                 "        {route_path:?} => Some(({content_type:?}, include_bytes!(\"{include_path}\").as_slice())),"
-            )?;
+            ));
         }
     } else {
         println!(
@@ -66,10 +63,45 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    writeln!(file, "        _ => None,")?;
-    writeln!(file, "    }}")?;
+    writeln!(
+        file,
+        "pub fn get(path: &str) -> Option<(&'static str, &'static [u8])> {{"
+    )?;
+    if asset_entries.is_empty() {
+        writeln!(file, "    let _ = path;")?;
+        writeln!(file, "    None")?;
+    } else {
+        writeln!(file, "    match path {{")?;
+        for entry in asset_entries {
+            writeln!(file, "{entry}")?;
+        }
+        writeln!(file, "        _ => None,")?;
+        writeln!(file, "    }}")?;
+    }
     writeln!(file, "}}")?;
     Ok(())
+}
+
+fn frontend_index_html() -> String {
+    fs::read_to_string("frontend/dist/index.html").unwrap_or_else(|_| {
+        println!(
+            "cargo:warning=frontend/dist/index.html not found; run make frontend-build before cargo build"
+        );
+        r#"<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>xdp-firewall</title>
+  </head>
+  <body>
+    <main>
+      <h1>xdp-firewall frontend is not built</h1>
+      <p>Run make frontend-build before building the API binary to embed the console.</p>
+    </main>
+  </body>
+</html>"#
+            .to_string()
+    })
 }
 
 fn content_type_for(path: &Path) -> &'static str {

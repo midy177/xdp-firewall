@@ -1469,9 +1469,9 @@ const apiDocsZh: ApiDocSection[] = [
     description: "除 /health、/countries 和前端静态资源外都需要 API 令牌；请求头支持 Authorization: Bearer <token> 或 X-API-Token。错误响应为 {\"error\":\"...\"}。",
     endpoints: [
       { method: "GET", path: "分页接口", summary: "列表响应统一为 {items,total,page,page_size,total_pages}；page 默认 1，page_size 默认 20，最大 500。" },
-      { method: "POST", path: "批量新增", summary: "批量新增请求体为 {\"items\":[...]}，items 必须非空且最多 500 项；每项格式同单条 POST。" },
+      { method: "POST", path: "批量新增", summary: "批量新增请求体为 {\"items\":[...]}，items 必须非空且最多 500 项；每项格式同单条 POST，只有实际变更策略状态时才递增版本。" },
       { method: "DELETE", path: "批量删除", summary: "批量删除请求体通常为 {\"ids\":[1,2]}，普通规则也可改用 {\"rule_keys\":[\"edge-web-deny\"]}；有效 ids 和 rule_keys 不能同时提供，最多 500 项。" },
-      { method: "POST", path: "写操作响应", summary: "大多数写操作返回 {version,data}；POST /policy/seed-example 返回策略快照本身。配置类 enabled 省略时默认 true。" },
+      { method: "POST", path: "写操作响应", summary: "会改变策略状态的写操作返回 {version,data}。配置类 enabled 省略时默认 true；仅变更 disabled 配置不会递增版本。" },
       { method: "ANY", path: "字段约束", summary: "action 支持 allow、deny，drop 会归一化为 deny；protocol 支持 any、tcp、udp、icmp；port 范围 1-65535，icmp 不能设置 port。" },
       { method: "ANY", path: "/policies", summary: "多策略 API 已移除，/policies 和 /policies/{path} 会返回 404；请使用单策略资源接口。" }
     ]
@@ -1500,7 +1500,7 @@ const apiDocsZh: ApiDocSection[] = [
       {
         method: "POST",
         path: "/rules",
-        summary: "新增普通规则。",
+        summary: "新增普通规则；相同 rule_key 且字段一致时返回 200，字段不同返回 409。",
         body: `{
   "rule_key": "edge-web-deny",
   "priority": 10,
@@ -1581,7 +1581,7 @@ const apiDocsZh: ApiDocSection[] = [
       {
         method: "POST",
         path: "/threat-sources",
-        summary: "新增威胁情报源；format 可为 cidr、ips、ipsum、voipbl、spamhaus_drop，也接受 voipbl_cidr、voipbl-cidr、spamhaus-drop 别名；启用的源会排队刷新并在前缀持久化后更新策略版本。",
+        summary: "新增威胁情报源；format 可为 cidr、ips、ipsum、voipbl、spamhaus_drop，也接受 voipbl_cidr、voipbl-cidr、spamhaus-drop 别名；启用的源会先为配置更新策略版本、排队刷新，并仅在前缀变化时再次更新版本。",
         body: `{
   "name": "ipsum",
   "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt",
@@ -1593,7 +1593,7 @@ const apiDocsZh: ApiDocSection[] = [
       {
         method: "PUT",
         path: "/threat-sources/{id}",
-        summary: "修改威胁源启用状态；关闭时会清理该源已持久化的状态和前缀并更新策略版本，开启时会排队刷新。",
+        summary: "修改威胁源启用状态；状态变化会更新策略版本，关闭时清理该源已持久化的状态和前缀，开启时排队刷新。",
         body: `{
   "enabled": false
 }`
@@ -1705,9 +1705,9 @@ const apiDocsEn: ApiDocSection[] = [
     description: "All APIs except /health, /countries, and frontend assets require an API token. Send either Authorization: Bearer <token> or X-API-Token. Error responses are {\"error\":\"...\"}.",
     endpoints: [
       { method: "GET", path: "Paginated APIs", summary: "List responses are {items,total,page,page_size,total_pages}; page defaults to 1, page_size defaults to 20, and the maximum page_size is 500." },
-      { method: "POST", path: "Batch create", summary: "Batch create bodies are {\"items\":[...]}; items must be non-empty and contain at most 500 entries. Each item matches the single-row POST shape." },
+      { method: "POST", path: "Batch create", summary: "Batch create bodies are {\"items\":[...]}; items must be non-empty and contain at most 500 entries. Each item matches the single-row POST shape, and the version only changes when active policy state changes." },
       { method: "DELETE", path: "Batch delete", summary: "Batch delete bodies are {\"ids\":[1,2]}; ids must be non-empty and contain at most 500 entries." },
-      { method: "POST", path: "Write responses", summary: "Most write APIs return {version,data}; POST /policy/seed-example returns the policy snapshot directly. Configuration enabled fields default to true when omitted." },
+      { method: "POST", path: "Write responses", summary: "Write APIs that change policy state return {version,data}. Configuration enabled fields default to true; disabled-only changes do not increment the version." },
       { method: "ANY", path: "Field rules", summary: "action supports allow and deny; drop is normalized to deny. protocol supports any, tcp, udp, and icmp. port must be 1-65535, and icmp cannot set a port." },
       { method: "ANY", path: "/policies", summary: "Multi-policy APIs are removed. /policies and /policies/{path} return 404; use the single-policy resource endpoints." }
     ]
@@ -1736,7 +1736,7 @@ const apiDocsEn: ApiDocSection[] = [
       {
         method: "POST",
         path: "/rules",
-        summary: "Create a firewall rule.",
+        summary: "Create a firewall rule. The same rule_key with identical fields returns 200; different fields return 409.",
         body: `{
   "rule_key": "edge-web-deny",
   "priority": 10,
@@ -1817,7 +1817,7 @@ const apiDocsEn: ApiDocSection[] = [
       {
         method: "POST",
         path: "/threat-sources",
-        summary: "Create a threat feed; format can be cidr, ips, ipsum, voipbl, or spamhaus_drop, with aliases voipbl_cidr, voipbl-cidr, and spamhaus-drop. Enabled feeds queue a refresh and update the policy version after prefixes are persisted.",
+        summary: "Create a threat feed; format can be cidr, ips, ipsum, voipbl, or spamhaus_drop, with aliases voipbl_cidr, voipbl-cidr, and spamhaus-drop. Enabled feeds bump the policy version for the source config, queue a refresh, and bump again only if prefixes change.",
         body: `{
   "name": "ipsum",
   "url": "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt",
@@ -1829,7 +1829,7 @@ const apiDocsEn: ApiDocSection[] = [
       {
         method: "PUT",
         path: "/threat-sources/{id}",
-        summary: "Update a threat feed enabled state. Disabling clears the persisted state and prefixes for that source and bumps the policy version; enabling queues a refresh.",
+        summary: "Update a threat feed enabled state. State changes bump the policy version; disabling clears persisted state and prefixes, and enabling queues a refresh.",
         body: `{
   "enabled": false
 }`

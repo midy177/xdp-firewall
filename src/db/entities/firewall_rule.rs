@@ -35,7 +35,7 @@ pub fn generated_rule_key(
     port: Option<i32>,
 ) -> String {
     let protocol = protocol.unwrap_or("any");
-    let port = port.map(|value| value.to_string()).unwrap_or_default();
+    let port = port.map_or_else(String::new, |value| value.to_string());
     let canonical = format!(
         "priority={priority}\naction={action}\ncidr={cidr}\nprotocol={protocol}\nport={port}\n"
     );
