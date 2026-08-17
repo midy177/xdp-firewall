@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
-    "build": "vite build"
+    "build": "vite build",
+    "typecheck": "vue-tsc --noEmit",
+    "check": "vue-tsc --noEmit && vite build"
   },
   "dependencies": {
     "@vitejs/plugin-vue": "^6.0.8",
@@ -18,7 +20,7 @@
   },
   "devDependencies": {
     "shadcn-vue": "^2.8.0",
-    "typescript": "^7.0.2",
+    "typescript": "^5.9.3",
     "vue-tsc": "^3.3.8"
   }
 }

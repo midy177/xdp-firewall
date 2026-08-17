@@ -26,6 +26,10 @@ frontend-install:
 frontend-build:
 	cd $(FRONTEND_DIR) && $(FRONTEND_PM) run build
 
+.PHONY: frontend-check
+frontend-check:
+	cd $(FRONTEND_DIR) && $(FRONTEND_PM) run typecheck
+
 .PHONY: release
 release: frontend-build
 	cargo build --release --bin $(BIN)
@@ -79,6 +83,9 @@ fmt:
 .PHONY: clippy
 clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
+
+.PHONY: check
+check: fmt clippy test frontend-check frontend-build
 
 .PHONY: docker-build
 docker-build: zig-build
