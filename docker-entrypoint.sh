@@ -16,8 +16,16 @@ fi
 if [ "$#" -eq 0 ]; then
     : "${DATABASE_URL:=$DEFAULT_DATABASE_URL}"
     export DATABASE_URL
-    echo "xdp-firewall entrypoint: command=api bind=${API_BIND} xds_bind=${XDS_BIND} api_token_configured=${API_TOKEN_CONFIGURED} rust_log=${RUST_LOG}"
-    /usr/local/bin/xdp-firewall migrate
+    standby_enabled=false
+    case "$(printf '%s' "${XDP_FIREWALL_STANDBY:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|true|yes) standby_enabled=true ;;
+    esac
+    echo "xdp-firewall entrypoint: command=api bind=${API_BIND} xds_bind=${XDS_BIND} api_token_configured=${API_TOKEN_CONFIGURED} standby=${standby_enabled} rust_log=${RUST_LOG}"
+    if [ "$standby_enabled" = "false" ]; then
+        /usr/local/bin/xdp-firewall migrate
+    else
+        echo "xdp-firewall entrypoint: standby read-only mode, skipping migrations (the primary control plane must have migrated the database)"
+    fi
     exec /usr/local/bin/xdp-firewall api --bind "$API_BIND" --xds-bind "$XDS_BIND"
 fi
 
