@@ -46,6 +46,13 @@ pub struct ApiArgs {
         help = "Runtime-only highest-priority source CIDR whitelist injected into xDS snapshots. Can be repeated or comma-separated. These prefixes are not persisted to the policy database."
     )]
     pub trusted_cidrs: Vec<String>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_STANDBY",
+        default_value_t = false,
+        help = "Run the control plane in standby read-only mode. Disables all database writes: skips startup migrations and builtin policy seed, rejects mutating API endpoints, disables xDS background refresh and maintenance loops, and does not persist agent heartbeats."
+    )]
+    pub standby: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -77,6 +84,13 @@ pub struct XdsArgs {
         help = "Runtime-only highest-priority source CIDR whitelist injected into xDS snapshots. Can be repeated or comma-separated. These prefixes are not persisted to the policy database."
     )]
     pub trusted_cidrs: Vec<String>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_STANDBY",
+        default_value_t = false,
+        help = "Run the control plane in standby read-only mode. Disables all database writes: skips startup migrations and builtin policy seed, rejects mutating API endpoints, disables xDS background refresh and maintenance loops, and does not persist agent heartbeats."
+    )]
+    pub standby: bool,
 }
 
 #[derive(Debug, Args, Clone)]

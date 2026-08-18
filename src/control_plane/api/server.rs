@@ -34,6 +34,7 @@ pub async fn serve(
         geo_lookup,
         geo_refresh_limiter: GeoRefreshLimiter::default(),
         threat_refresh_limiter: ThreatRefreshLimiter::default(),
+        standby: args.standby,
     });
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -49,6 +50,7 @@ pub async fn serve(
         %bind,
         auth_enabled,
         allow_unauthenticated,
+        standby = args.standby,
         "API server listening"
     );
     axum::serve(listener, app)

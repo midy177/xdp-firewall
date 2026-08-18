@@ -3,8 +3,10 @@ use super::runtime_cidrs::{
     compact_runtime_trusted_cidrs_with_snapshot,
 };
 use super::*;
-use crate::control_plane::xds::proto::{FetchGeoPrefixesRequest, firewall_xds_server::FirewallXds};
-use crate::db::entities::{geo_country_policy, geo_ip_prefix, temp_ban};
+use crate::control_plane::xds::proto::{
+    FetchGeoPrefixesRequest, HeartbeatRequest, firewall_xds_server::FirewallXds,
+};
+use crate::db::entities::{geo_country_policy, geo_ip_prefix, node, temp_ban};
 use crate::policy::model::{
     DEFAULT_POLICY_NAME, DynamicDefensePolicy, PolicySnapshot, TrustedCidrPolicy,
 };
@@ -157,7 +159,7 @@ async fn temp_ban_cleanup_deletes_expired_rows_and_bumps_version() {
     .await
     .unwrap();
 
-    let cleanup = TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL);
+    let cleanup = TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL, false);
     cleanup.maybe_run(&db).await.unwrap();
 
     let rows = temp_ban::Entity::find().all(&db).await.unwrap();
@@ -207,7 +209,7 @@ async fn build_policy_update_skips_policy_load_when_runtime_fingerprint_is_uncha
         version,
         Some(runtime_fingerprint.as_str()),
         &runtime_trusted_cidrs,
-        &TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL),
+        &TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL, false),
         false,
     )
     .await
@@ -223,9 +225,10 @@ fn test_service(db: DatabaseConnection) -> XdsService {
         push_interval: Duration::from_secs(1),
         drop_events: DropEventHub::new(),
         runtime_trusted_cidrs: RuntimeTrustedCidrs::new(Vec::new(), None),
-        temp_ban_cleanup: TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL),
+        temp_ban_cleanup: TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL, false),
         geo_lookup: geo::GeoIpLookup::default(),
         threat_lookup: threat::ThreatIntelLookup::default(),
+        standby: false,
     }
 }
 
@@ -294,4 +297,70 @@ async fn fetch_geo_prefixes_rejects_stale_version() {
         .await
         .unwrap_err();
     assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn temp_ban_cleanup_in_standby_skips_cleanup() {
+    let mut options = ConnectOptions::new("sqlite::memory:");
+    options.sqlx_logging(false);
+    let db = Database::connect(options).await.unwrap();
+    crate::db::migrate(&db).await.unwrap();
+
+    let now = chrono::Utc::now().naive_utc();
+    temp_ban::ActiveModel {
+        policy_name: Set(DEFAULT_POLICY_NAME.to_string()),
+        cidr: Set("203.0.113.10/32".to_string()),
+        protocol: Set("any".to_string()),
+        port: Set(None),
+        expires_at: Set(now - chrono::Duration::seconds(1)),
+        comment: Set(Some("expired".to_string())),
+        created_at: Set(now),
+        ..Default::default()
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let version_before = latest_version(&db).await.unwrap();
+    let cleanup = TempBanCleanup::new(TEMP_BAN_CLEANUP_INTERVAL, true);
+    cleanup.maybe_run(&db).await.unwrap();
+
+    let rows = temp_ban::Entity::find().all(&db).await.unwrap();
+    assert_eq!(rows.len(), 1, "standby must not clean up expired temp bans");
+    assert_eq!(
+        latest_version(&db).await.unwrap(),
+        version_before,
+        "standby must not bump the policy version"
+    );
+}
+
+#[tokio::test]
+async fn report_heartbeat_in_standby_accepts_without_persisting() {
+    let mut options = ConnectOptions::new("sqlite::memory:");
+    options.sqlx_logging(false);
+    let db = Database::connect(options).await.unwrap();
+    crate::db::migrate(&db).await.unwrap();
+
+    let mut service = test_service(db.clone());
+    service.standby = true;
+
+    let request = Request::new(HeartbeatRequest {
+        node_id: "node-standby".to_string(),
+        interface_name: "eth0".to_string(),
+        last_applied_version: 1,
+        status: "ok".to_string(),
+        error: String::new(),
+        interface_ips: vec!["10.0.0.1".to_string()],
+    });
+    let response = service.report_heartbeat(request).await.unwrap();
+    assert!(
+        response.into_inner().accepted,
+        "standby should still accept heartbeats"
+    );
+
+    let node_count = node::Entity::find().all(&db).await.unwrap().len();
+    assert_eq!(
+        node_count, 0,
+        "standby must not persist heartbeats to firewall_nodes"
+    );
 }

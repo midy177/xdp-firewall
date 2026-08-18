@@ -12,6 +12,7 @@ use tracing::info;
 pub(in crate::control_plane::xds) struct TempBanCleanup {
     state: Arc<Mutex<TempBanCleanupState>>,
     interval: Duration,
+    standby: bool,
 }
 
 #[derive(Default)]
@@ -21,10 +22,11 @@ struct TempBanCleanupState {
 }
 
 impl TempBanCleanup {
-    pub(in crate::control_plane::xds) fn new(interval: Duration) -> Self {
+    pub(in crate::control_plane::xds) fn new(interval: Duration, standby: bool) -> Self {
         Self {
             state: Arc::new(Mutex::new(TempBanCleanupState::default())),
             interval,
+            standby,
         }
     }
 
@@ -32,6 +34,9 @@ impl TempBanCleanup {
         &self,
         db: &DatabaseConnection,
     ) -> Result<()> {
+        if self.standby {
+            return Ok(());
+        }
         let started_at = Instant::now();
         if !self.try_start(started_at).await {
             return Ok(());

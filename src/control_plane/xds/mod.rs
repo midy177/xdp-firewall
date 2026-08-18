@@ -57,6 +57,7 @@ struct XdsService {
     temp_ban_cleanup: TempBanCleanup,
     geo_lookup: geo::GeoIpLookup,
     threat_lookup: threat::ThreatIntelLookup,
+    standby: bool,
 }
 
 fn internal_status(error: impl std::fmt::Display) -> Status {

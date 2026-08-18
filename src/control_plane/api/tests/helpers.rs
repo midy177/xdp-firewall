@@ -41,6 +41,7 @@ pub(super) async fn test_router() -> (Router, DatabaseConnection) {
         geo_lookup: geo::GeoIpLookup::default(),
         geo_refresh_limiter: GeoRefreshLimiter::default(),
         threat_refresh_limiter: ThreatRefreshLimiter::default(),
+        standby: false,
     });
     (app, db)
 }

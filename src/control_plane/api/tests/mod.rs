@@ -17,6 +17,7 @@ mod firewall_rules_tests;
 mod helpers;
 mod limiter_tests;
 mod nodes_tests;
+mod standby_tests;
 mod temp_bans_tests;
 mod threat_sources_tests;
 

@@ -11,11 +11,16 @@ use xdp_firewall::{
 pub(crate) async fn run_api_command(args: ApiArgs) -> Result<()> {
     info!(
         api_configured_runtime_trusted_cidr_args = args.trusted_cidrs.len(),
+        standby = args.standby,
         "starting api command"
     );
     let db = db::connect(&args.database.database_url).await?;
-    db::migrate(&db).await?;
-    seed::ensure_builtin_policy(&db, DEFAULT_POLICY_NAME).await?;
+    if args.standby {
+        info!("standby read-only mode: skipping database migrations and builtin policy seed");
+    } else {
+        db::migrate(&db).await?;
+        seed::ensure_builtin_policy(&db, DEFAULT_POLICY_NAME).await?;
+    }
     let xds_args = xds_args_from_api(&args);
     let drop_events = xds::DropEventHub::new();
     let geo_lookup = load_geo_lookup(&db).await?;
@@ -28,10 +33,14 @@ pub(crate) async fn run_api_command(args: ApiArgs) -> Result<()> {
 }
 
 pub(crate) async fn run_xds_command(args: XdsArgs) -> Result<()> {
-    info!("starting xds command");
+    info!(standby = args.standby, "starting xds command");
     let db = db::connect(&args.database.database_url).await?;
-    db::migrate(&db).await?;
-    seed::ensure_builtin_policy(&db, DEFAULT_POLICY_NAME).await?;
+    if args.standby {
+        info!("standby read-only mode: skipping database migrations and builtin policy seed");
+    } else {
+        db::migrate(&db).await?;
+        seed::ensure_builtin_policy(&db, DEFAULT_POLICY_NAME).await?;
+    }
     let geo_lookup = load_geo_lookup(&db).await?;
     xds::serve(db, args, xds::DropEventHub::new(), geo_lookup).await
 }
@@ -44,6 +53,7 @@ fn xds_args_from_api(args: &ApiArgs) -> XdsArgs {
         push_interval_seconds: args.xds_push_interval_seconds,
         agent_token: args.agent_token.clone(),
         trusted_cidrs: args.trusted_cidrs.clone(),
+        standby: args.standby,
     }
 }
 

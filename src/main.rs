@@ -19,6 +19,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     info!("starting xdp-firewall");
     reject_control_plane_commands_in_agent_only_mode(&cli.command)?;
+    reject_writes_in_standby_mode(&cli.command)?;
     run_command(cli.command).await
 }
 
@@ -111,5 +112,28 @@ fn reject_control_plane_commands_in_agent_only_mode(command: &Command) -> Result
     }
     bail!(
         "control-plane database commands are disabled in this agent-only container; use the API/control-plane container or HTTP API to inspect policy"
+    )
+}
+
+fn reject_writes_in_standby_mode(command: &Command) -> Result<()> {
+    let standby = std::env::var("XDP_FIREWALL_STANDBY")
+        .ok()
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    if !standby {
+        return Ok(());
+    }
+    let is_write_command = matches!(
+        command,
+        Command::Migrate(_)
+            | Command::Policy {
+                command: PolicyCommand::SeedExample(_),
+                ..
+            }
+    );
+    if !is_write_command {
+        return Ok(());
+    }
+    bail!(
+        "control-plane writes are disabled in standby read-only mode; use a non-standby control plane to migrate or seed policy"
     )
 }

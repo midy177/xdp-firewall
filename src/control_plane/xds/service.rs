@@ -72,6 +72,9 @@ impl FirewallXds for XdsService {
             return Err(unauthenticated_status());
         }
         let request = request.into_inner();
+        if self.standby {
+            return Ok(Response::new(HeartbeatResponse { accepted: true }));
+        }
         upsert_heartbeat(&self.db, request)
             .await
             .map_err(internal_status)?;

@@ -13,24 +13,25 @@ use tracing::{info, warn};
 pub(super) fn start_background_tasks(
     db: &DatabaseConnection,
     geo_lookup: &geo::GeoIpLookup,
+    standby: bool,
 ) -> threat::ThreatIntelLookup {
-    let geo_ip_refresh = GeoIpRefresh::new(AUTO_REFRESH_INTERVAL, geo_lookup.clone());
-    spawn_geo_refresh_loop(db.clone(), geo_ip_refresh, AUTO_REFRESH_INTERVAL);
-
     let threat_lookup = threat::ThreatIntelLookup::default();
     threat_lookup.spawn_rebuild(db.clone());
-    let threat_source_refresh =
-        ThreatSourceRefresh::new(AUTO_REFRESH_INTERVAL, threat_lookup.clone());
-    spawn_threat_refresh_loop(
-        db.clone(),
-        threat_source_refresh,
-        THREAT_MISSING_PREFIX_POLL_INTERVAL,
-    );
-
-    spawn_node_maintenance_loop(
-        db.clone(),
-        Duration::from_secs(node_maintenance::NODE_MAINTENANCE_INTERVAL_SECONDS),
-    );
+    if !standby {
+        let geo_ip_refresh = GeoIpRefresh::new(AUTO_REFRESH_INTERVAL, geo_lookup.clone());
+        spawn_geo_refresh_loop(db.clone(), geo_ip_refresh, AUTO_REFRESH_INTERVAL);
+        let threat_source_refresh =
+            ThreatSourceRefresh::new(AUTO_REFRESH_INTERVAL, threat_lookup.clone());
+        spawn_threat_refresh_loop(
+            db.clone(),
+            threat_source_refresh,
+            THREAT_MISSING_PREFIX_POLL_INTERVAL,
+        );
+        spawn_node_maintenance_loop(
+            db.clone(),
+            Duration::from_secs(node_maintenance::NODE_MAINTENANCE_INTERVAL_SECONDS),
+        );
+    }
     threat_lookup
 }
 

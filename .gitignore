@@ -4,3 +4,5 @@ target/
 frontend/dist/
 heap*.pb.gz
 prom-*-6h.json
+CLAUDE.md
+tools

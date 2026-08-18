@@ -432,6 +432,33 @@ xdp-firewall xdp replace --interface ens5 --id 55
 
 `unload` always requires an explicit `--interface` plus either `--all` or `--id <program-id>` so removal is intentional. `replace` also requires an explicit `--interface`; `--all` or `--id` are optional and only needed when you want an explicit pre-unload step before the new dispatcher attach. The normal replace path unloads existing entries with the same program name before loading the new one. `--all` removes every dispatcher-managed XDP program on that interface, not just xdp-firewall; prefer `--id` when replacing only one program in a shared chain. `--remove-pins` is accepted only with `--all`, because pinned maps may still be used by another dispatcher program when only one program ID is removed.
 
+## Standby Mode
+
+`--standby` runs the control plane in a read-only mode that performs no database writes. It is intended for a standby/replica control plane that shares the same database as the primary but must not compete with it for writes.
+
+```bash
+XDP_FIREWALL_API_TOKEN='...' XDP_FIREWALL_AGENT_TOKEN='...' \
+xdp-firewall api --standby
+```
+
+Equivalent environment form:
+
+```bash
+XDP_FIREWALL_STANDBY=true xdp-firewall api
+```
+
+In standby mode the control plane:
+
+- Skips startup database migrations and builtin policy seeding — the primary control plane is expected to have already migrated and seeded the shared database.
+- Rejects every mutating API endpoint (POST/PUT/DELETE/PATCH) with HTTP 503; read endpoints (`GET /rules`, `GET /geo-countries`, `GET /policy/version`, `GET /nodes`, `/health`, `/countries`, `/geo/lookup`), the realtime Drop SSE stream, and the embedded frontend remain available.
+- Disables the xDS background country-IP refresh, threat-intelligence refresh, and node-maintenance loops; the in-memory threat lookup rebuild (read-only) still runs.
+- Skips temporary-ban cleanup during xDS push ticks.
+- Accepts agent heartbeats (returns `accepted: true`) but does not persist them to `firewall_nodes`, so agent state is not durable while the standby plane is the only reachable control plane.
+
+The `XDP_FIREWALL_STANDBY` environment variable is also honored by one-shot commands: `xdp-firewall migrate` and `xdp-firewall policy seed-example` are rejected with an error in standby mode, while `xdp-firewall policy show` (read-only) still works. Use the primary control plane to migrate or seed.
+
+A standby control plane can still serve agents: it loads and pushes policy snapshots from the shared database over xDS. Because realtime Drop subscription state is held in process memory, run only one active control plane (primary or standby) as the reachable xDS endpoint per agent, or add sticky routing / a shared pub/sub backend before running multiple replicas concurrently.
+
 ## XDP Map Sizing
 
 The BPF object has conservative built-in defaults, and the agent can override map capacities before loading the object with Aya:

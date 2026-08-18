@@ -22,6 +22,7 @@ mod policy_meta;
 mod response;
 mod routes;
 mod server;
+mod standby;
 mod state;
 mod temp_bans;
 mod threat_sources;

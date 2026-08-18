@@ -1,7 +1,7 @@
 use super::{
     ApiState, auth, drop_events, dynamic_defense, dynamic_rate_limits, firewall_rules, frontend,
     geo_countries, get_policy_version, health, log_request, nodes, removed_multi_policy_api,
-    seed_example_policy, temp_bans, threat_sources, trusted_cidrs,
+    seed_example_policy, standby, temp_bans, threat_sources, trusted_cidrs,
 };
 use axum::{
     Router,
@@ -10,10 +10,15 @@ use axum::{
 };
 
 pub(super) fn router(state: ApiState) -> Router {
-    let api_routes = api_routes().route_layer(middleware::from_fn_with_state(
-        state.clone(),
-        auth::require_api_token,
-    ));
+    let api_routes = api_routes()
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            standby::reject_writes_in_standby,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_api_token,
+        ));
 
     Router::new()
         .route("/", get(frontend::index))

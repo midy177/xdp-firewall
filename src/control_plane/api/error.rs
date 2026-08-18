@@ -47,6 +47,13 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    pub(super) fn read_only(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {

@@ -14,6 +14,7 @@ pub(super) struct ApiState {
     pub(super) geo_lookup: geo::GeoIpLookup,
     pub(super) geo_refresh_limiter: GeoRefreshLimiter,
     pub(super) threat_refresh_limiter: ThreatRefreshLimiter,
+    pub(super) standby: bool,
 }
 
 #[derive(Clone)]
