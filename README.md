@@ -399,15 +399,20 @@ Control plane (both `api` and the standalone `xds` command):
 - `--xds-tls-cert` / `XDP_FIREWALL_XDS_TLS_CERT`: PEM server certificate. Setting this together with `--xds-tls-key` enables TLS.
 - `--xds-tls-key` / `XDP_FIREWALL_XDS_TLS_KEY`: PEM server private key. Must be paired with `--xds-tls-cert`.
 - `--xds-tls-client-ca` / `XDP_FIREWALL_XDS_TLS_CLIENT_CA`: PEM CA used to verify agent client certificates. Setting this upgrades TLS to mutual TLS; agents must then present a client certificate signed by this CA.
+- `--xds-tls-auto` / `XDP_FIREWALL_XDS_TLS_AUTO`: generate the whole PKI automatically in `--xds-tls-dir` (default `/var/lib/xdp-firewall/tls`): a private CA (`ca.pem`/`ca.key`), a server certificate (`server.pem`/`server.key`), and one agent client certificate (`client.pem`/`client.key`). Auto mode always enables mutual TLS, reuses existing files on restart, and cannot be combined with the explicit PEM flags. Distribute `ca.pem` plus `client.pem`/`client.key` to agents; single-host agents can reference the directory directly.
+- `--xds-tls-san` / `XDP_FIREWALL_XDS_TLS_SAN`: comma-separated DNS names or IPs for the auto-generated server certificate SANs. Defaults to `localhost,127.0.0.1,::1`.
 
-Cert and key must be configured as a pair, and `--xds-tls-client-ca` requires server TLS; mismatches abort startup. With none of the flags set the listener stays plaintext, so existing deployments keep working unchanged. The agent token still applies on top of TLS.
+Cert and key must be configured as a pair, `--xds-tls-client-ca` requires server TLS, and `--xds-tls-auto` excludes the explicit PEM flags; mismatches abort startup. With none of the flags set the listener stays plaintext, so existing deployments keep working unchanged. The agent token still applies on top of TLS.
 
 Agent side (same flags apply to `agent`, `sync-once`, and `monitor`):
 
 - `--control-url https://host:50051` enables TLS on the client; `http://` stays plaintext.
 - `--xds-ca-cert` / `XDP_FIREWALL_XDS_CA_CERT`: PEM CA used to verify the control plane. Required for private/self-signed CAs; system root certificates are used when omitted.
 - `--xds-client-cert` + `--xds-client-key` / `XDP_FIREWALL_XDS_CLIENT_CERT`, `XDP_FIREWALL_XDS_CLIENT_KEY`: client certificate pair for mutual TLS. Must be configured as a pair.
+- `--xds-tls-insecure` / `XDP_FIREWALL_XDS_TLS_INSECURE`: skip control-plane certificate verification for https URLs (like `curl -k`). The connection stays encrypted but the server identity is not authenticated. Cannot be combined with `--xds-ca-cert`.
 - An `http://` control URL combined with any TLS option is rejected at startup instead of silently connecting in plaintext.
+
+HTTP API TLS (optional): `--api-tls` / `XDP_FIREWALL_API_TLS` serves the HTTP API and web console over HTTPS with the same server certificate (file-based or auto-generated). It requires xDS TLS to be configured and aborts startup otherwise; the API stays on plain HTTP when omitted. The bundled Docker Compose healthchecks probe both `https` and `http`.
 
 Example with a private CA:
 
@@ -421,6 +426,21 @@ xdp-firewall agent --control-url https://control.example:50051 \
   --xds-ca-cert /etc/xdp-firewall/tls/ca.pem \
   --xds-client-cert /etc/xdp-firewall/tls/client.pem \
   --xds-client-key /etc/xdp-firewall/tls/client.key
+```
+
+Fully automatic mode — no certificates to prepare, everything generated on first start and reused afterwards:
+
+```bash
+xdp-firewall api --xds-bind 0.0.0.0:50051 \
+  --xds-tls-auto \
+  --xds-tls-dir /var/lib/xdp-firewall/tls \
+  --xds-tls-san control.example,127.0.0.1 \
+  --api-tls
+
+xdp-firewall agent --control-url https://control.example:50051 \
+  --xds-ca-cert /var/lib/xdp-firewall/tls/ca.pem \
+  --xds-client-cert /var/lib/xdp-firewall/tls/client.pem \
+  --xds-client-key /var/lib/xdp-firewall/tls/client.key
 ```
 
 Quick self-signed CA for testing:

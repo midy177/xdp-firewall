@@ -398,7 +398,7 @@ xdp-firewall 自身不做告警判定与通知，提供的是数据源：实时 
 HTTP API 全部 token 鉴权，非回环绑定强制 token；单一策略 + 版本号天然是审计线（谁改的、改了什么、推到哪版）。可对接现有变更流程。自动化联动（如告警触发自动封禁）只需给脚本发放 API token，机器动作与人工操作落同一条版本线，可审计、可追溯。
 
 **Q7：控制面与 agent 之间的链路安全吗？**
-默认为明文 gRPC + agent token 认证（token 在非回环绑定时强制启用），适合私网/VPC 内部署。有更高安全要求时可开启 TLS/双向认证（mTLS）：控制面通过 `--xds-tls-cert/--xds-tls-key` 启用 TLS，再配 `--xds-tls-client-ca` 即升级为 mTLS（强制校验 agent 客户端证书）；agent 侧只需把控制地址改为 `https://` 并指定 CA 证书即可自动启用。TLS 默认关闭，不影响现有部署；私网 CA、公网证书均支持。
+默认为明文 gRPC + agent token 认证（token 在非回环绑定时强制启用），适合私网/VPC 内部署。有更高安全要求时可开启 TLS/双向认证（mTLS），且无需预先准备证书：控制面 `--xds-tls-auto` 会在数据目录自动生成整套私有 CA、服务端证书与 agent 客户端证书（重启复用），也可用 `--xds-tls-cert/--xds-tls-key/--xds-tls-client-ca` 指定自有证书；agent 侧把控制地址改为 `https://` 并指定 CA（或 `--xds-tls-insecure` 跳过服务端校验）即自动启用。HTTP API 控制台可通过 `--api-tls` 复用同一张服务端证书提供 https。以上均默认关闭，不影响现有部署。
 
 ---
 

@@ -37,6 +37,7 @@ mod runtime_cidrs;
 mod server;
 mod service;
 mod state;
+mod tls;
 
 pub use client::{PolicyUpdateError, XdsClient, XdsClientConfig, XdsClientTls};
 pub use drop_events::{DropEventHub, DropEventSubscription, DropEventView};
@@ -44,6 +45,7 @@ use refresh::TempBanCleanup;
 use runtime_cidrs::RuntimeTrustedCidrs;
 pub use server::serve;
 use state::{build_policy_update, cleanup_expired_temp_bans, geo_ip_lists_missing, latest_version};
+pub use tls::{ControlPlaneTls, build_control_plane_tls};
 
 const GEO_PREFIX_PAGE_SIZE: u32 = 4096;
 

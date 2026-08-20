@@ -40,7 +40,7 @@ use response::{
     created_status,
 };
 use routes::router;
-pub use server::serve;
+pub use server::{ApiTlsMaterial, serve};
 use state::{
     ApiState, CachedGeoRefresh, CachedThreatRefresh, GeoRefreshDecision, GeoRefreshLimiter,
     ThreatRefreshDecision, ThreatRefreshLimiter,

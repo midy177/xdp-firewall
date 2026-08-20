@@ -21,6 +21,27 @@ pub struct XdsTlsServerArgs {
         help = "PEM CA used to verify agent client certificates. Setting this upgrades TLS to mutual TLS: agents must present a certificate signed by this CA. Requires --xds-tls-cert and --xds-tls-key."
     )]
     pub xds_tls_client_ca: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDS_TLS_AUTO",
+        default_value_t = false,
+        help = "Automatically generate a private CA, a server certificate, and an agent client certificate in --xds-tls-dir and enable mutual TLS. Existing files are reused on restart. Mutually exclusive with --xds-tls-cert/--xds-tls-key/--xds-tls-client-ca."
+    )]
+    pub xds_tls_auto: bool,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDS_TLS_DIR",
+        default_value = "/var/lib/xdp-firewall/tls",
+        help = "Directory holding auto-generated xDS TLS material (ca.pem, ca.key, server.pem, server.key, client.pem, client.key). Agents need ca.pem plus client.pem/client.key from this directory."
+    )]
+    pub xds_tls_dir: PathBuf,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDS_TLS_SAN",
+        value_delimiter = ',',
+        help = "Comma-separated SANs (DNS names or IPs) for the auto-generated server certificate. Defaults to localhost,127.0.0.1,::1."
+    )]
+    pub xds_tls_san: Vec<String>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -76,6 +97,13 @@ pub struct ApiArgs {
         help = "Run the control plane in standby read-only mode. Disables all database writes: skips startup migrations and builtin policy seed, rejects mutating API endpoints, disables xDS background refresh and maintenance loops, and does not persist agent heartbeats."
     )]
     pub standby: bool,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_API_TLS",
+        default_value_t = false,
+        help = "Serve the HTTP API and web console over HTTPS, reusing the xDS server certificate. Requires xDS TLS to be configured (--xds-tls-cert/--xds-tls-key or --xds-tls-auto); the API stays on plain HTTP when omitted."
+    )]
+    pub api_tls: bool,
     #[command(flatten)]
     pub xds_tls: XdsTlsServerArgs,
 }

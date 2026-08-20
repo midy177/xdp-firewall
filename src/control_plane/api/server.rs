@@ -3,15 +3,27 @@ use super::{
 };
 use crate::{cli::ApiArgs, intelligence::geo};
 use anyhow::{Context, Result};
+use axum_server::tls_rustls::RustlsConfig;
 use sea_orm::DatabaseConnection;
-use std::{collections::HashSet, net::SocketAddr};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 use tracing::{debug, info, warn};
+
+#[derive(Debug)]
+pub struct ApiTlsMaterial {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
 
 pub async fn serve(
     db: DatabaseConnection,
     args: ApiArgs,
     drop_events: xds::DropEventHub,
     geo_lookup: geo::GeoIpLookup,
+    tls: Option<ApiTlsMaterial>,
 ) -> Result<()> {
     let bind = args
         .bind
@@ -50,12 +62,46 @@ pub async fn serve(
         %bind,
         auth_enabled,
         allow_unauthenticated,
+        tls = tls.is_some(),
         standby = args.standby,
         "API server listening"
     );
-    axum::serve(listener, app)
+    match tls {
+        None => axum::serve(listener, app)
+            .await
+            .context("API server failed"),
+        Some(tls) => serve_tls(listener, app, &tls).await,
+    }
+}
+
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    tls: &ApiTlsMaterial,
+) -> Result<()> {
+    let rustls_config = rustls_config(tls).await?;
+    let std_listener = listener
+        .into_std()
+        .context("failed to detach API TCP listener")?;
+    axum_server::tls_rustls::from_tcp_rustls(std_listener, rustls_config)
+        .context("failed to build API TLS server from listener")?
+        .serve(app.into_make_service())
         .await
-        .context("API server failed")
+        .context("API TLS server failed")
+}
+
+async fn rustls_config(tls: &ApiTlsMaterial) -> Result<RustlsConfig> {
+    let cert_path: &Path = tls.cert_path.as_path();
+    let key_path: &Path = tls.key_path.as_path();
+    RustlsConfig::from_pem_file(cert_path, key_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to build API TLS config from {} and {}",
+                cert_path.display(),
+                key_path.display()
+            )
+        })
 }
 
 fn log_runtime_trusted_cidr_config(args: &ApiArgs) {

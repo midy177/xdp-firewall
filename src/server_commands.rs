@@ -21,11 +21,19 @@ pub(crate) async fn run_api_command(args: ApiArgs) -> Result<()> {
         db::migrate(&db).await?;
         seed::ensure_builtin_policy(&db, DEFAULT_POLICY_NAME).await?;
     }
+    let tls = xds::build_control_plane_tls(&args.xds_tls)?;
+    let api_tls = resolve_api_tls(args.api_tls, &tls)?;
     let xds_args = xds_args_from_api(&args);
     let drop_events = xds::DropEventHub::new();
     let geo_lookup = load_geo_lookup(&db).await?;
-    let api_server = api::serve(db.clone(), args, drop_events.clone(), geo_lookup.clone());
-    let xds_server = xds::serve(db, xds_args, drop_events, geo_lookup);
+    let api_server = api::serve(
+        db.clone(),
+        args,
+        drop_events.clone(),
+        geo_lookup.clone(),
+        api_tls,
+    );
+    let xds_server = xds::serve(db, xds_args, drop_events, geo_lookup, tls);
     tokio::select! {
         result = api_server => handle_server_exit("API HTTP server", result),
         result = xds_server => handle_server_exit("xDS gRPC server", result),
@@ -41,8 +49,27 @@ pub(crate) async fn run_xds_command(args: XdsArgs) -> Result<()> {
         db::migrate(&db).await?;
         seed::ensure_builtin_policy(&db, DEFAULT_POLICY_NAME).await?;
     }
+    let tls = xds::build_control_plane_tls(&args.xds_tls)?;
     let geo_lookup = load_geo_lookup(&db).await?;
-    xds::serve(db, args, xds::DropEventHub::new(), geo_lookup).await
+    xds::serve(db, args, xds::DropEventHub::new(), geo_lookup, tls).await
+}
+
+fn resolve_api_tls(
+    api_tls: bool,
+    tls: &Option<xds::ControlPlaneTls>,
+) -> Result<Option<api::ApiTlsMaterial>> {
+    if !api_tls {
+        return Ok(None);
+    }
+    let tls = tls.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--api-tls requires xDS TLS material; configure --xds-tls-cert/--xds-tls-key or --xds-tls-auto"
+        )
+    })?;
+    Ok(Some(api::ApiTlsMaterial {
+        cert_path: tls.server_cert_path.clone(),
+        key_path: tls.server_key_path.clone(),
+    }))
 }
 
 fn xds_args_from_api(args: &ApiArgs) -> XdsArgs {
@@ -78,5 +105,41 @@ fn handle_server_exit(name: &str, result: Result<()>) -> Result<()> {
             error!(error = %format!("{err:#}"), "{name} exited with error");
             Err(err).with_context(|| format!("{name} exited"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_tls_disabled_by_default() {
+        assert!(
+            resolve_api_tls(false, &None)
+                .expect("disabled api TLS must not error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn api_tls_requires_xds_tls_material() {
+        let err =
+            resolve_api_tls(true, &None).expect_err("--api-tls without xDS TLS material must fail");
+        assert!(format!("{err:#}").contains("--api-tls"));
+    }
+
+    #[test]
+    fn api_tls_reuses_xds_server_material_paths() {
+        let tls = xds::ControlPlaneTls {
+            server_tls: tonic::transport::ServerTlsConfig::new(),
+            mutual_tls: true,
+            server_cert_path: std::path::PathBuf::from("server.pem"),
+            server_key_path: std::path::PathBuf::from("server.key"),
+        };
+        let material = resolve_api_tls(true, &Some(tls))
+            .expect("api TLS with xDS material must not error")
+            .expect("api TLS must resolve");
+        assert_eq!(material.cert_path, std::path::PathBuf::from("server.pem"));
+        assert_eq!(material.key_path, std::path::PathBuf::from("server.key"));
     }
 }

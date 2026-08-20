@@ -29,7 +29,7 @@ services:
       - "${XDP_FIREWALL_API_PORT:-8080}:8080"
       - "${XDP_FIREWALL_XDS_PORT:-50051}:50051"
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health || exit 1"]
+      test: ["CMD-SHELL", "curl -kfsS https://127.0.0.1:8080/health || curl -fsS http://127.0.0.1:8080/health || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 12

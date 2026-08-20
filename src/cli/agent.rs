@@ -29,6 +29,13 @@ pub struct XdsTlsClientArgs {
         help = "PEM client private key for mutual TLS against the xDS control plane. Must be paired with --xds-client-cert."
     )]
     pub xds_client_key: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDS_TLS_INSECURE",
+        default_value_t = false,
+        help = "Skip xDS control-plane certificate verification for https:// control URLs (like curl -k). The connection stays encrypted but the server identity is not authenticated. Cannot be combined with --xds-ca-cert."
+    )]
+    pub xds_tls_insecure: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
