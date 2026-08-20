@@ -47,6 +47,8 @@ XDP_FIREWALL_XDP_RUN_PRIORITY=10
 # XDP_FIREWALL_XDS_TLS_AUTO=true
 # XDP_FIREWALL_XDS_TLS_DIR=/var/lib/xdp-firewall/tls
 # XDP_FIREWALL_XDS_TLS_SAN=localhost,127.0.0.1,::1
+# Certificate validity for auto-generated CA/server/client material. Default 36500 days (~100 years).
+# XDP_FIREWALL_XDS_TLS_VALIDITY_DAYS=36500
 # Agent side: switch XDP_FIREWALL_XDS_URL to https:// and point the CA at the same CA PEM.
 # XDP_FIREWALL_XDS_CA_CERT=/etc/xdp-firewall/tls/ca.pem
 # XDP_FIREWALL_XDS_CLIENT_CERT=/etc/xdp-firewall/tls/client.pem

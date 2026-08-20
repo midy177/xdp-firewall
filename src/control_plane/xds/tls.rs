@@ -170,7 +170,7 @@ fn generate_auto_tls(dir: &Path, files: &AutoTlsFiles, args: &XdsTlsServerArgs) 
         .push(DnType::CommonName, "xdp-firewall-ca");
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
-    set_validity(&mut ca_params, 3650);
+    set_validity(&mut ca_params, args.xds_tls_validity_days);
     let ca = CertifiedIssuer::self_signed(ca_params, ca_key)
         .context("failed to self-sign xDS TLS CA")?;
     write_pem(&files.ca_cert, ca.pem(), false)?;
@@ -182,7 +182,7 @@ fn generate_auto_tls(dir: &Path, files: &AutoTlsFiles, args: &XdsTlsServerArgs) 
     server_params
         .distinguished_name
         .push(DnType::CommonName, "xdp-firewall-control-plane");
-    set_validity(&mut server_params, 1825);
+    set_validity(&mut server_params, args.xds_tls_validity_days);
     let server_cert = server_params
         .signed_by(&server_key, &ca)
         .context("failed to sign xDS server certificate")?;
@@ -194,7 +194,7 @@ fn generate_auto_tls(dir: &Path, files: &AutoTlsFiles, args: &XdsTlsServerArgs) 
     client_params
         .distinguished_name
         .push(DnType::CommonName, "xdp-agent");
-    set_validity(&mut client_params, 1825);
+    set_validity(&mut client_params, args.xds_tls_validity_days);
     let client_cert = client_params
         .signed_by(&client_key, &ca)
         .context("failed to sign xDS agent client certificate")?;
@@ -267,6 +267,7 @@ mod tests {
             xds_tls_auto: false,
             xds_tls_dir: PathBuf::from("/tmp/xdp-firewall-tls-test-unused"),
             xds_tls_san: Vec::new(),
+            xds_tls_validity_days: 36_500,
         }
     }
 
@@ -278,6 +279,7 @@ mod tests {
             xds_tls_auto: true,
             xds_tls_dir: dir.to_path_buf(),
             xds_tls_san: sans,
+            xds_tls_validity_days: 36_500,
         }
     }
 
@@ -376,6 +378,34 @@ mod tests {
         assert_eq!(
             sanitize_sans(&["control.example".to_string(), " 10.0.0.5 ".to_string()]),
             vec!["control.example".to_string(), "10.0.0.5".to_string()]
+        );
+    }
+
+    #[test]
+    fn validity_days_default_to_100_years_and_are_bounded() {
+        use clap::Parser as _;
+        let cli = crate::cli::Cli::try_parse_from([
+            "xdp-firewall",
+            "xds",
+            "--database-url",
+            "sqlite://unused.db",
+        ])
+        .expect("xds command must parse");
+        let crate::cli::Command::Xds(args) = cli.command else {
+            panic!("expected xds command");
+        };
+        assert_eq!(args.xds_tls.xds_tls_validity_days, 36_500);
+        assert!(
+            crate::cli::Cli::try_parse_from([
+                "xdp-firewall",
+                "xds",
+                "--database-url",
+                "sqlite://unused.db",
+                "--xds-tls-validity-days",
+                "0",
+            ])
+            .is_err(),
+            "zero validity must be rejected"
         );
     }
 }

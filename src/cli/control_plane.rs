@@ -42,6 +42,14 @@ pub struct XdsTlsServerArgs {
         help = "Comma-separated SANs (DNS names or IPs) for the auto-generated server certificate. Defaults to localhost,127.0.0.1,::1."
     )]
     pub xds_tls_san: Vec<String>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDS_TLS_VALIDITY_DAYS",
+        default_value_t = 36_5000,
+        value_parser = clap::value_parser!(i64).range(1..),
+        help = "Validity in days for auto-generated certificates (CA, server, and agent client). Defaults to 36500 days (100 years)."
+    )]
+    pub xds_tls_validity_days: i64,
 }
 
 #[derive(Debug, Args, Clone)]

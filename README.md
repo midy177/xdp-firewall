@@ -401,6 +401,7 @@ Control plane (both `api` and the standalone `xds` command):
 - `--xds-tls-client-ca` / `XDP_FIREWALL_XDS_TLS_CLIENT_CA`: PEM CA used to verify agent client certificates. Setting this upgrades TLS to mutual TLS; agents must then present a client certificate signed by this CA.
 - `--xds-tls-auto` / `XDP_FIREWALL_XDS_TLS_AUTO`: generate the whole PKI automatically in `--xds-tls-dir` (default `/var/lib/xdp-firewall/tls`): a private CA (`ca.pem`/`ca.key`), a server certificate (`server.pem`/`server.key`), and one agent client certificate (`client.pem`/`client.key`). Auto mode always enables mutual TLS, reuses existing files on restart, and cannot be combined with the explicit PEM flags. Distribute `ca.pem` plus `client.pem`/`client.key` to agents; single-host agents can reference the directory directly.
 - `--xds-tls-san` / `XDP_FIREWALL_XDS_TLS_SAN`: comma-separated DNS names or IPs for the auto-generated server certificate SANs. Defaults to `localhost,127.0.0.1,::1`.
+- `--xds-tls-validity-days` / `XDP_FIREWALL_XDS_TLS_VALIDITY_DAYS`: validity in days for the auto-generated CA, server, and agent client certificates. Defaults to `36500` days (about 100 years); values below 1 are rejected.
 
 Cert and key must be configured as a pair, `--xds-tls-client-ca` requires server TLS, and `--xds-tls-auto` excludes the explicit PEM flags; mismatches abort startup. With none of the flags set the listener stays plaintext, so existing deployments keep working unchanged. The agent token still applies on top of TLS.
 
