@@ -15,12 +15,23 @@ use xdp_firewall::{
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+    install_rustls_crypto_provider();
 
     let cli = Cli::parse();
     info!("starting xdp-firewall");
     reject_control_plane_commands_in_agent_only_mode(&cli.command)?;
     reject_writes_in_standby_mode(&cli.command)?;
     run_command(cli.command).await
+}
+
+fn install_rustls_crypto_provider() {
+    // The dependency graph enables both the ring and aws-lc-rs rustls providers
+    // (tonic tls-ring plus sqlx/reqwest rustls links), so rustls cannot pick a
+    // process-level provider automatically. Pin ring explicitly; aws-lc would
+    // add a cmake/nasm build dependency to the agent image.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
 }
 
 fn init_tracing() {

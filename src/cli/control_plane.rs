@@ -1,4 +1,27 @@
 use clap::Args;
+use std::path::PathBuf;
+
+#[derive(Debug, Args, Clone, Default)]
+pub struct XdsTlsServerArgs {
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDS_TLS_CERT",
+        help = "PEM server certificate for the gRPC xDS listener. Together with --xds-tls-key this enables TLS; both are required when either is set. Omitted by default (plaintext gRPC)."
+    )]
+    pub xds_tls_cert: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDS_TLS_KEY",
+        help = "PEM private key for the gRPC xDS listener. Must be paired with --xds-tls-cert."
+    )]
+    pub xds_tls_key: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDS_TLS_CLIENT_CA",
+        help = "PEM CA used to verify agent client certificates. Setting this upgrades TLS to mutual TLS: agents must present a certificate signed by this CA. Requires --xds-tls-cert and --xds-tls-key."
+    )]
+    pub xds_tls_client_ca: Option<PathBuf>,
+}
 
 #[derive(Debug, Args, Clone)]
 pub struct DatabaseArgs {
@@ -53,6 +76,8 @@ pub struct ApiArgs {
         help = "Run the control plane in standby read-only mode. Disables all database writes: skips startup migrations and builtin policy seed, rejects mutating API endpoints, disables xDS background refresh and maintenance loops, and does not persist agent heartbeats."
     )]
     pub standby: bool,
+    #[command(flatten)]
+    pub xds_tls: XdsTlsServerArgs,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -91,6 +116,8 @@ pub struct XdsArgs {
         help = "Run the control plane in standby read-only mode. Disables all database writes: skips startup migrations and builtin policy seed, rejects mutating API endpoints, disables xDS background refresh and maintenance loops, and does not persist agent heartbeats."
     )]
     pub standby: bool,
+    #[command(flatten)]
+    pub xds_tls: XdsTlsServerArgs,
 }
 
 #[derive(Debug, Args, Clone)]

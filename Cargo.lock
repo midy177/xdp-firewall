@@ -2841,6 +2841,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -3829,9 +3830,11 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
+ "rustls-native-certs",
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",
@@ -4450,7 +4453,7 @@ dependencies = [
 
 [[package]]
 name = "xdp-firewall"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4467,6 +4470,7 @@ dependencies = [
  "prost",
  "protoc-bin-vendored",
  "reqwest",
+ "rustls",
  "sea-orm",
  "serde",
  "serde_json",

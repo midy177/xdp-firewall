@@ -54,6 +54,7 @@ fn xds_args_from_api(args: &ApiArgs) -> XdsArgs {
         agent_token: args.agent_token.clone(),
         trusted_cidrs: args.trusted_cidrs.clone(),
         standby: args.standby,
+        xds_tls: args.xds_tls.clone(),
     }
 }
 

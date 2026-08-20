@@ -1,6 +1,6 @@
 use clap::Args;
 
-use super::AgentXdpArgs;
+use super::{AgentXdpArgs, XdsTlsClientArgs};
 
 #[derive(Debug, Args, Clone)]
 pub struct SyncOnceArgs {
@@ -37,4 +37,6 @@ pub struct SyncOnceArgs {
     pub xdp_run_priority: i32,
     #[command(flatten)]
     pub xdp: AgentXdpArgs,
+    #[command(flatten)]
+    pub xds_tls: XdsTlsClientArgs,
 }

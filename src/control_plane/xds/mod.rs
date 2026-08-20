@@ -38,7 +38,7 @@ mod server;
 mod service;
 mod state;
 
-pub use client::{PolicyUpdateError, XdsClient, XdsClientConfig};
+pub use client::{PolicyUpdateError, XdsClient, XdsClientConfig, XdsClientTls};
 pub use drop_events::{DropEventHub, DropEventSubscription, DropEventView};
 use refresh::TempBanCleanup;
 use runtime_cidrs::RuntimeTrustedCidrs;

@@ -6,8 +6,8 @@ mod policy;
 mod xdp;
 mod xdp_maps;
 
-pub use agent::{AgentArgs, AgentOfflineMode, MonitorArgs, SyncOnceArgs};
-pub use control_plane::{ApiArgs, DatabaseArgs, K8sDiscoveryArgs, XdsArgs};
+pub use agent::{AgentArgs, AgentOfflineMode, MonitorArgs, SyncOnceArgs, XdsTlsClientArgs};
+pub use control_plane::{ApiArgs, DatabaseArgs, K8sDiscoveryArgs, XdsArgs, XdsTlsServerArgs};
 pub use policy::{PolicyCommand, SeedExampleArgs, ShowPolicyArgs};
 pub use xdp::{XdpCommand, XdpReplaceArgs, XdpStatusArgs, XdpTempBansArgs, XdpUnloadArgs};
 pub use xdp_maps::XdpMapCapacityArgs;

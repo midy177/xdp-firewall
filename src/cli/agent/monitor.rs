@@ -1,5 +1,7 @@
 use clap::Args;
 
+use super::XdsTlsClientArgs;
+
 #[derive(Debug, Args, Clone)]
 pub struct MonitorArgs {
     #[arg(
@@ -43,4 +45,6 @@ pub struct MonitorArgs {
         help = "Pinned drop_events map path. Defaults to /sys/fs/bpf/xdp-firewall/<interface>/drop_events."
     )]
     pub drop_events_path: Option<String>,
+    #[command(flatten)]
+    pub xds_tls: XdsTlsClientArgs,
 }

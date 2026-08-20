@@ -1,4 +1,5 @@
 use clap::Args;
+use std::path::PathBuf;
 
 mod monitor;
 mod sync_once;
@@ -7,6 +8,28 @@ mod xdp;
 pub use monitor::MonitorArgs;
 pub use sync_once::SyncOnceArgs;
 pub use xdp::AgentXdpArgs;
+
+#[derive(Debug, Args, Clone, Default)]
+pub struct XdsTlsClientArgs {
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDS_CA_CERT",
+        help = "PEM CA certificate used to verify the xDS control plane when the control URL starts with https://. Required for private/self-signed CAs; system root certificates are used when omitted."
+    )]
+    pub xds_ca_cert: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDS_CLIENT_CERT",
+        help = "PEM client certificate for mutual TLS against the xDS control plane. Must be paired with --xds-client-key; only used when the control URL starts with https://."
+    )]
+    pub xds_client_cert: Option<PathBuf>,
+    #[arg(
+        long,
+        env = "XDP_FIREWALL_XDS_CLIENT_KEY",
+        help = "PEM client private key for mutual TLS against the xDS control plane. Must be paired with --xds-client-cert."
+    )]
+    pub xds_client_key: Option<PathBuf>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum AgentOfflineMode {
@@ -76,4 +99,6 @@ pub struct AgentArgs {
     pub offline_failure_limit: u32,
     #[command(flatten)]
     pub xdp: AgentXdpArgs,
+    #[command(flatten)]
+    pub xds_tls: XdsTlsClientArgs,
 }

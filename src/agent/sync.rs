@@ -39,6 +39,7 @@ pub async fn sync_once(args: SyncOnceArgs) -> Result<()> {
     let mut client = xds::XdsClient::connect(xds::XdsClientConfig {
         control_url: args.control_url.clone(),
         agent_token: args.agent_token.clone(),
+        tls: xds::XdsClientTls::from(&args.xds_tls),
     })
     .await?;
     let Some((version, snapshot)) = client.fetch_policy(&node_id, &interface, -1).await? else {

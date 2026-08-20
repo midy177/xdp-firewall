@@ -390,6 +390,51 @@ xDS runs in the same control-plane process as the HTTP API. It reads policy snap
 
 `xdp-firewall xds` is still available for debugging or intentionally split control-plane deployments, but the provided Docker Compose and Kubernetes templates run xDS inside the API service to keep production configuration smaller.
 
+### xDS TLS / mutual TLS (optional, disabled by default)
+
+The gRPC xDS listener is plaintext HTTP/2 protected by the agent token by default. TLS and mutual TLS are opt-in through certificate flags on the control plane; agents enable TLS automatically when their control URL starts with `https://`.
+
+Control plane (both `api` and the standalone `xds` command):
+
+- `--xds-tls-cert` / `XDP_FIREWALL_XDS_TLS_CERT`: PEM server certificate. Setting this together with `--xds-tls-key` enables TLS.
+- `--xds-tls-key` / `XDP_FIREWALL_XDS_TLS_KEY`: PEM server private key. Must be paired with `--xds-tls-cert`.
+- `--xds-tls-client-ca` / `XDP_FIREWALL_XDS_TLS_CLIENT_CA`: PEM CA used to verify agent client certificates. Setting this upgrades TLS to mutual TLS; agents must then present a client certificate signed by this CA.
+
+Cert and key must be configured as a pair, and `--xds-tls-client-ca` requires server TLS; mismatches abort startup. With none of the flags set the listener stays plaintext, so existing deployments keep working unchanged. The agent token still applies on top of TLS.
+
+Agent side (same flags apply to `agent`, `sync-once`, and `monitor`):
+
+- `--control-url https://host:50051` enables TLS on the client; `http://` stays plaintext.
+- `--xds-ca-cert` / `XDP_FIREWALL_XDS_CA_CERT`: PEM CA used to verify the control plane. Required for private/self-signed CAs; system root certificates are used when omitted.
+- `--xds-client-cert` + `--xds-client-key` / `XDP_FIREWALL_XDS_CLIENT_CERT`, `XDP_FIREWALL_XDS_CLIENT_KEY`: client certificate pair for mutual TLS. Must be configured as a pair.
+- An `http://` control URL combined with any TLS option is rejected at startup instead of silently connecting in plaintext.
+
+Example with a private CA:
+
+```bash
+xdp-firewall api --xds-bind 0.0.0.0:50051 \
+  --xds-tls-cert /etc/xdp-firewall/tls/server.pem \
+  --xds-tls-key /etc/xdp-firewall/tls/server.key \
+  --xds-tls-client-ca /etc/xdp-firewall/tls/ca.pem
+
+xdp-firewall agent --control-url https://control.example:50051 \
+  --xds-ca-cert /etc/xdp-firewall/tls/ca.pem \
+  --xds-client-cert /etc/xdp-firewall/tls/client.pem \
+  --xds-client-key /etc/xdp-firewall/tls/client.key
+```
+
+Quick self-signed CA for testing:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key -out ca.pem -days 3650 -subj "/CN=xdp-firewall-ca"
+openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr -subj "/CN=control.example"
+printf "subjectAltName=DNS:control.example\nextendedKeyUsage=serverAuth\n" > server.ext
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out server.pem -days 3650 -extfile server.ext
+openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr -subj "/CN=xdp-agent"
+printf "extendedKeyUsage=clientAuth\n" > client.ext
+openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -CAcreateserial -out client.pem -days 3650 -extfile client.ext
+```
+
 XDP attach mode is selected with `--xdp-mode` or `XDP_FIREWALL_XDP_MODE`:
 
 - `auto` is the default. It tries driver/native XDP first and falls back to skb/generic XDP when the NIC or MTU does not support driver mode.

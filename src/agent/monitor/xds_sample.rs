@@ -10,6 +10,7 @@ pub(super) async fn sample_xds(
     let mut client = match xds::XdsClient::connect(xds::XdsClientConfig {
         control_url: args.control_url.clone(),
         agent_token: args.agent_token.clone(),
+        tls: xds::XdsClientTls::from(&args.xds_tls),
     })
     .await
     {

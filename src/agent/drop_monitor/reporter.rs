@@ -12,6 +12,7 @@ pub(super) fn spawn_reporter(
     let client_config = xds::XdsClientConfig {
         control_url: args.control_url.clone(),
         agent_token: args.agent_token.clone(),
+        tls: xds::XdsClientTls::from(&args.xds_tls),
     };
     let node_id = node_id.to_string();
     let interface = interface.to_string();

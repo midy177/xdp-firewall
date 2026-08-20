@@ -36,4 +36,15 @@ XDP_FIREWALL_XDP_ATTACH_STRATEGY=dispatcher
 # XDP_FIREWALL_XDP_ALLOW_REPLACE is only meaningful for direct attach mode.
 XDP_FIREWALL_XDP_RUN_PRIORITY=10
 
+# Optional xDS gRPC TLS / mutual TLS. Disabled when the cert/key paths are unset.
+# Control plane (api service): set all three and mount the PEM files into the container.
+# XDP_FIREWALL_XDS_TLS_CERT=/etc/xdp-firewall/tls/server.pem
+# XDP_FIREWALL_XDS_TLS_KEY=/etc/xdp-firewall/tls/server.key
+# Setting the client CA upgrades TLS to mutual TLS; agents must present a client certificate.
+# XDP_FIREWALL_XDS_TLS_CLIENT_CA=/etc/xdp-firewall/tls/ca.pem
+# Agent side: switch XDP_FIREWALL_XDS_URL to https:// and point the CA at the same CA PEM.
+# XDP_FIREWALL_XDS_CA_CERT=/etc/xdp-firewall/tls/ca.pem
+# XDP_FIREWALL_XDS_CLIENT_CERT=/etc/xdp-firewall/tls/client.pem
+# XDP_FIREWALL_XDS_CLIENT_KEY=/etc/xdp-firewall/tls/client.key
+
 RUST_LOG=xdp_firewall=info

@@ -21,6 +21,7 @@ impl AgentRuntime {
         match xds::XdsClient::connect(xds::XdsClientConfig {
             control_url: self.args.control_url.clone(),
             agent_token: self.args.agent_token.clone(),
+            tls: xds::XdsClientTls::from(&self.args.xds_tls),
         })
         .await
         {
