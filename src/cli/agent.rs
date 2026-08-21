@@ -83,8 +83,8 @@ pub struct AgentArgs {
     #[arg(
         long,
         env = "XDP_FIREWALL_XDP_RUN_PRIORITY",
-        default_value_t = 0,
-        help = "Dispatcher run priority. Lower values run earlier in the libxdp dispatcher chain."
+        default_value_t = 10,
+        help = "Dispatcher run priority. Lower values run earlier in the libxdp dispatcher chain. xdp-loader cannot express 0; use 1 for the earliest position."
     )]
     pub xdp_run_priority: i32,
     #[arg(long, default_value_t = 30)]

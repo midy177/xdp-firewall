@@ -96,6 +96,15 @@ fn run_xdp_loader_load_mode(
     let pin_dir = pin_dir
         .to_str()
         .context("XDP map pin directory is not valid UTF-8")?;
+    // xdp-loader treats `--prio 0` as "not specified" and falls back to the
+    // libxdp default (50), so an explicit 0 cannot be honored; warn instead of
+    // silently attaching later than requested.
+    if options.run_priority == 0 {
+        warn!(
+            interface,
+            "xdp-loader cannot express run priority 0; attaching at the libxdp default (50). Use 1 for the earliest position."
+        );
+    }
     let priority = options.run_priority.to_string();
     let output = std::process::Command::new(&options.loader_path)
         .args([
