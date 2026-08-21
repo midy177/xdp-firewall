@@ -7,3 +7,5 @@ prom-*-6h.json
 CLAUDE.md
 .zcode
 .DS_Store
+tools/btmp-monitor/target/
+tools/btmp-monitor/dist/
