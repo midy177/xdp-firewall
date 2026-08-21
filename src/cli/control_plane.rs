@@ -45,7 +45,7 @@ pub struct XdsTlsServerArgs {
     #[arg(
         long,
         env = "XDP_FIREWALL_XDS_TLS_VALIDITY_DAYS",
-        default_value_t = 36_5000,
+        default_value_t = 36_500,
         value_parser = clap::value_parser!(i64).range(1..),
         help = "Validity in days for auto-generated certificates (CA, server, and agent client). Defaults to 36500 days (100 years)."
     )]
