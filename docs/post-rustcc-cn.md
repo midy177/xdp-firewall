@@ -1,7 +1,7 @@
 # 开源 | xdp-firewall:用 Rust 写的分布式 XDP/eBPF 内核级防火墙(单二进制,内置 Web 控制台)
 
-> 项目地址:<https://github.com/midy177/xdp-firewall>(镜像同步中,欢迎 issue/PR)
-> crates.io:`cargo install xdp-firewall`(搜索 xdp-firewall)
+> 项目地址:<https://github.com/midy177/xdp-firewall>(欢迎 issue/PR)
+> crates.io:<https://crates.io/crates/xdp-firewall> · `cargo install xdp-firewall`
 
 **一句话介绍:把"放行还是丢弃"的判断从应用层/日志层前移到网卡驱动层——一个 Rust 单二进制同时提供控制面(REST API + 内嵌 Vue 控制台 + gRPC xDS)和数据面 agent(Aya 加载 XDP 程序写 BPF map),策略存在 SQLite/PostgreSQL/MySQL 里,一次配置、全集群秒级生效。**
 
@@ -76,7 +76,7 @@ XDP_FIREWALL_XDS_URL=http://控制面:50051 xdp-firewall agent
 ## 链接
 
 - GitHub:<https://github.com/midy177/xdp-firewall>
-- crates.io:搜索 `xdp-firewall`
+- crates.io:<https://crates.io/crates/xdp-firewall>(`cargo install xdp-firewall`)
 - 内置威胁源:ipsum / Spamhaus DROP / VoIPBL
 - BPF 程序源码:`bpf/xdp_firewall.c`(README 有完整的 map 容量表与判定优先级文档)
 
