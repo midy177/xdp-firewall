@@ -9,13 +9,13 @@ use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::info;
 
-/// 监控 btmp 失败登录(直接解析 /var/log/btmp 二进制),
-/// 对暴力破解 IP 自动调用 xdp-firewall API 封禁。
-/// 所有参数均可通过环境变量覆盖,见各项说明。
+/// Monitor failed SSH logins by parsing `/var/log/btmp` binary records directly
+/// and auto-ban brute-force source IPs through the xdp-firewall API.
+/// Every option can also be provided through environment variables; see each item.
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    /// xdp-firewall 控制平面 API 地址。
+    /// xdp-firewall control-plane API base URL.
     #[arg(
         long,
         env = "BTMP_MONITOR_API_URL",
@@ -23,31 +23,31 @@ struct Cli {
     )]
     api_url: String,
 
-    /// 与 xdp-firewall 的 XDP_FIREWALL_API_TOKEN 一致。
+    /// Must match xdp-firewall's XDP_FIREWALL_API_TOKEN.
     #[arg(long, env = "XDP_FIREWALL_API_TOKEN")]
     api_token: Option<String>,
 
-    /// 触发封禁所需的失败登录次数。
+    /// Failed logins required before banning an IP.
     #[arg(long, env = "BTMP_MONITOR_THRESHOLD", default_value_t = 5)]
     threshold: u64,
 
-    /// 统计窗口(秒)。
+    /// Counting window in seconds.
     #[arg(long, env = "BTMP_MONITOR_WINDOW_SECONDS", default_value_t = 86_400)]
     window_seconds: u64,
 
-    /// 封禁持续时长(秒),xdp-firewall API 上限为 31_536_000(约 1 年)。
+    /// Ban duration in seconds; the xdp-firewall API caps it at 31_536_000 (~1 year).
     #[arg(long, env = "BTMP_MONITOR_DURATION_SECONDS", default_value_t = 86_400)]
     duration_seconds: i64,
 
-    /// 封禁协议:"any" | "tcp" | "udp";any 表示屏蔽该 IP 所有协议。
+    /// Ban protocol: "any" | "tcp" | "udp"; "any" blocks every protocol for the IP.
     #[arg(long, env = "BTMP_MONITOR_PROTOCOL", default_value = "any")]
     protocol: String,
 
-    /// 仅当 protocol != "any" 时生效,取值 1..=65535。
+    /// Only used when protocol != "any"; range 1..=65535.
     #[arg(long, env = "BTMP_MONITOR_PORT", default_value_t = 0)]
     port: i32,
 
-    /// 写入 temp-ban 记录的备注。
+    /// Comment written to the temp-ban record.
     #[arg(
         long,
         env = "BTMP_MONITOR_COMMENT",
@@ -55,11 +55,12 @@ struct Cli {
     )]
     comment: String,
 
-    /// btmp 文件路径。
+    /// Path to the btmp file.
     #[arg(long, env = "BTMP_MONITOR_BTMP_PATH", default_value = "/var/log/btmp")]
     btmp_path: String,
 
-    /// 永不封禁的可信网段(自身节点、内网等);可多次指定,环境变量用逗号分隔。
+    /// CIDRs that are never banned (own nodes, internal networks);
+    /// repeat the flag, or use a comma-separated value in the env variable.
     #[arg(
         long,
         env = "BTMP_MONITOR_TRUSTED_CIDRS",
@@ -68,21 +69,21 @@ struct Cli {
     )]
     trusted_cidr: Vec<String>,
 
-    /// 单次运行后退出(适合 cron)。
+    /// Run one scan and exit (for cron).
     #[arg(long)]
     once: bool,
 
-    /// 只解析并打印候选 IP,不调用封禁 API。
+    /// Parse and print candidate IPs only; do not call the ban API.
     #[arg(long)]
     dry_run: bool,
 
-    /// daemon 轮询间隔(秒)。
+    /// Daemon poll interval in seconds.
     #[arg(long, env = "BTMP_MONITOR_INTERVAL", default_value_t = 60)]
     interval: u64,
 }
 
 impl Cli {
-    /// 组装运行配置并校验。
+    /// Assemble and validate the runtime config.
     fn to_config(&self) -> Result<config::Config> {
         let trusted_cidrs = self
             .trusted_cidr
@@ -124,7 +125,7 @@ async fn main() -> Result<()> {
     let config = cli.to_config()?;
 
     if !cli.dry_run && config.api_token.trim().is_empty() {
-        bail!("--api-token (或环境变量 XDP_FIREWALL_API_TOKEN) 是必需的;仅 --dry-run 可省略");
+        bail!("--api-token (or env XDP_FIREWALL_API_TOKEN) is required unless --dry-run is set");
     }
 
     info!(
@@ -151,7 +152,7 @@ async fn main() -> Result<()> {
     run_daemon(monitor, cli.dry_run, cli.interval).await
 }
 
-/// daemon 模式:按间隔循环,收到 SIGTERM/SIGINT 优雅退出。
+/// Daemon mode: loop on the interval, exit gracefully on SIGTERM/SIGINT.
 async fn run_daemon(
     mut monitor: monitor::Monitor,
     dry_run: bool,

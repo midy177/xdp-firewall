@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use ipnet::IpNet;
 
-/// 运行参数,由 main 从 CLI 参数/环境变量组装。
+/// Runtime parameters assembled by `main` from CLI flags / environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub api_url: String,
@@ -26,16 +26,17 @@ pub struct MonitorConfig {
     pub trusted_cidrs: Vec<IpNet>,
 }
 
-/// API 接受的最大封禁时长(秒),见 xdp-firewall `temp_bans/input.rs`。
+/// Maximum ban duration accepted by the xdp-firewall API, see `temp_bans/input.rs`.
 const MAX_TEMP_BAN_SECONDS: i64 = 31_536_000;
 
 impl Config {
-    /// 校验由 CLI/环境变量组装出的参数组合。
+    /// Validate the flag/env combination.
     ///
-    /// token 为空不在本校验范围:dry-run 允许无 token,是否放行由 main 决定。
+    /// Token emptiness is deliberately not checked here: dry-run may run
+    /// without a token; `main` decides whether to allow that.
     pub fn validate(&self) -> Result<()> {
         if self.api_url.is_empty() {
-            bail!("api_url must not be empty");
+            bail!("api-url must not be empty");
         }
         if self.ban.threshold < 1 {
             bail!("threshold must be >= 1");
@@ -68,7 +69,7 @@ impl Config {
         Ok(())
     }
 
-    /// 当 protocol == "any" 时返回 None,与 API 的 `Option<i32>` 对齐。
+    /// Return `None` when protocol == "any", aligning with the API's `Option<i32>`.
     pub fn ban_port(&self) -> Option<i32> {
         if self.ban.protocol == "any" {
             None

@@ -1,12 +1,14 @@
-//! 直接解析 `/var/log/btmp` 中的二进制 utmp 记录。
+//! Directly parse the binary utmp records inside `/var/log/btmp`.
 //!
-//! glibc(x86_64/aarch64)的 `struct utmp` 是 384 字节定长记录,本模块按偏移读取
-//! `ut_host`(来源 IP 字符串,与 `lastb` 显示同源)与 `ut_tv`(时间戳),
-//! 不依赖外部 `lastb` 二进制及其文本输出格式,也因此不受新版 util-linux
-//! 移除 last/lastb 的影响。
+//! On glibc (x86_64/aarch64) `struct utmp` is a fixed 384-byte record. This
+//! module reads `ut_host` (source IP string, the same field `lastb` displays)
+//! and `ut_tv` (timestamp) by offset, without depending on an external `lastb`
+//! binary or its text output format — which also makes it immune to newer
+//! util-linux releases dropping last/lastb.
 //!
-//! 崩溃等原因导致的尾部半条记录(size % 384 != 0)会被跳过,游标停在最后
-//! 一条完整记录之后,写入方补全后下一轮自然读到。
+//! A trailing partial record (size % 384 != 0, e.g. after a crash) is skipped;
+//! the cursor stops after the last complete record and picks the rest up once
+//! the writer completes it.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -15,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-/// glibc `struct utmp` 的定长大小(x86_64/aarch64 一致)。
+/// Fixed size of glibc `struct utmp` (identical on x86_64/aarch64).
 pub const UTMP_RECORD_SIZE: usize = 384;
 
 const UT_HOST_OFFSET: usize = 76;
@@ -24,25 +26,28 @@ const UT_TV_SEC_OFFSET: usize = 340;
 const UT_ADDR_V6_OFFSET: usize = 348;
 const UT_ADDR_V6_LEN: usize = 16;
 
-/// 一条解析后的失败登录记录。
+/// One parsed failed-login record.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FailedAttempt {
     pub ip: IpAddr,
     pub time: DateTime<Utc>,
 }
 
-/// 增量读取游标:已读到的字节偏移与文件 inode。
-/// inode 变化或文件变短(logrotate 轮转)时从头重读新文件。
+/// Incremental read cursor: byte offset already read plus the file inode.
+/// An inode change or a file shorter than the offset (logrotate rotation)
+/// restarts reading from the beginning of the new file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReadCursor {
     pub inode: u64,
     pub offset: u64,
 }
 
-/// 从游标位置增量读取 btmp,返回(新解析的记录, 新游标)。
+/// Incrementally read btmp from the cursor position; returns
+/// (newly parsed records, new cursor).
 ///
-/// 文件不存在时返回错误——btmp 缺失通常意味着系统没有失败登录记账
-/// (最小化安装或 musl 环境),应当显式暴露而不是静默当作零记录。
+/// A missing file is an error — an absent btmp usually means the system has no
+/// failed-login accounting at all (minimal install or musl), which should be
+/// surfaced explicitly instead of silently treated as zero records.
 pub fn read_attempts(
     path: &Path,
     cursor: Option<ReadCursor>,
@@ -57,7 +62,8 @@ pub fn read_attempts(
     }
     let inode = meta.ino();
 
-    // 轮转检测:inode 变化说明换了新文件;文件比游标短说明被截断/轮转。
+    // Rotation detection: a different inode means a new file; a file shorter
+    // than the offset means it was truncated or rotated.
     let start = match cursor {
         Some(c) if c.inode == inode && c.offset <= meta.len() => c.offset,
         _ => 0,
@@ -71,7 +77,7 @@ pub fn read_attempts(
     file.read_to_end(&mut buf)
         .with_context(|| format!("failed to read btmp file: {}", path.display()))?;
 
-    // 丢弃尾部不完整记录,游标停在最后一条完整记录之后。
+    // Drop a trailing partial record; the cursor stops after the last complete one.
     let complete = buf.len() / UTMP_RECORD_SIZE * UTMP_RECORD_SIZE;
     let attempts = buf[..complete]
         .chunks_exact(UTMP_RECORD_SIZE)
@@ -87,12 +93,13 @@ pub fn read_attempts(
     ))
 }
 
-/// 解析单条 384 字节记录;取不到合法 IP 或时间戳时丢弃该条。
+/// Parse one 384-byte record; drop it when no valid IP or timestamp can be read.
 fn parse_record(record: &[u8]) -> Option<FailedAttempt> {
     let host = field_str(&record[UT_HOST_OFFSET..UT_HOST_OFFSET + UT_HOST_LEN]);
     let ip = match host.trim().parse::<IpAddr>() {
         Ok(ip) => ip,
-        // ut_host 为空或非法(个别写入方只填二进制地址)时回退 ut_addr_v6。
+        // Empty or invalid ut_host (some writers fill only the binary address):
+        // fall back to ut_addr_v6.
         Err(_) => ip_from_addr_v6(&record[UT_ADDR_V6_OFFSET..UT_ADDR_V6_OFFSET + UT_ADDR_V6_LEN])?,
     };
     let sec = i32::from_ne_bytes(
@@ -109,14 +116,16 @@ fn parse_record(record: &[u8]) -> Option<FailedAttempt> {
     Some(FailedAttempt { ip, time })
 }
 
-/// 读取 NUL 结尾的定长字符字段,非法 UTF-8 以替换字符解码。
+/// Read a NUL-terminated fixed-size character field; invalid UTF-8 decodes
+/// with replacement characters.
 fn field_str(bytes: &[u8]) -> &str {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     std::str::from_utf8(&bytes[..end]).unwrap_or("")
 }
 
-/// 解析 `ut_addr_v6` 二进制地址。历史数据对 IPv4 的存法不统一:
-/// 可能是 IPv4-mapped(::ffff:a.b.c.d),也可能只填低 4 字节;全零视为无地址。
+/// Parse the binary `ut_addr_v6` address. Historical data stores IPv4
+/// inconsistently: either IPv4-mapped (::ffff:a.b.c.d) or only the low 4 bytes;
+/// all-zero means "no address".
 fn ip_from_addr_v6(bytes: &[u8]) -> Option<IpAddr> {
     if bytes.iter().all(|&b| b == 0) {
         return None;
@@ -137,7 +146,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// 构造一条 384 字节 utmp 记录。
+    /// Build one 384-byte utmp record.
     fn build_record(host: &str, addr_v6: Option<[u8; 16]>, sec: i32, usec: i32) -> [u8; 384] {
         let mut record = [0u8; UTMP_RECORD_SIZE];
         record[UT_HOST_OFFSET..UT_HOST_OFFSET + host.len()].copy_from_slice(host.as_bytes());
@@ -149,7 +158,8 @@ mod tests {
         record
     }
 
-    /// 写入临时 btmp 文件并返回路径。文件名带进程号避免并行测试冲突。
+    /// Write a temporary btmp file and return its path; the name embeds the
+    /// process id so parallel tests never collide.
     fn write_btmp(name: &str, records: &[[u8; 384]]) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!("btmp-monitor-test-{}-{name}", std::process::id()));
@@ -168,7 +178,7 @@ mod tests {
     }
 
     fn ts() -> i32 {
-        // 2026-08-21T00:00:00Z 附近,远离 2038 溢出与负值边界。
+        // Around 2026-08-21T00:00:00Z, far from the 2038 overflow and negative bounds.
         1_787_328_000
     }
 
@@ -194,7 +204,8 @@ mod tests {
 
     #[test]
     fn drops_record_without_ip() {
-        // ut_host 非法且 ut_addr_v6 全零:记录被跳过,但游标照常前进。
+        // Invalid ut_host and all-zero ut_addr_v6: the record is skipped but
+        // the cursor still advances past it.
         let path = write_btmp("noip", &[build_record("localhost", None, ts(), 0)]);
         let (attempts, cursor) = read_attempts(&path, None).unwrap();
         assert!(attempts.is_empty());
@@ -205,7 +216,7 @@ mod tests {
     #[test]
     fn drops_trailing_partial_record() {
         let path = write_btmp("partial", &[build_record("1.2.3.4", None, ts(), 0)]);
-        // 追加 100 字节半条记录。
+        // Append 100 bytes of a partial record.
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
@@ -245,7 +256,8 @@ mod tests {
         let path = write_btmp("rotate", &[build_record("1.1.1.1", None, ts(), 0)]);
         let (_, cursor) = read_attempts(&path, None).unwrap();
 
-        // 模拟轮转:换一个新文件写入同一路径(inode 变化、内容从头开始)。
+        // Simulate rotation: write a fresh file and rename it over the path
+        // (inode changes, content restarts from the beginning).
         let path2 = write_btmp("rotate-new", &[build_record("9.9.9.9", None, ts(), 0)]);
         std::fs::rename(&path2, &path).unwrap();
 

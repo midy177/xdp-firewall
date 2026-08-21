@@ -10,11 +10,12 @@ use crate::api::{ApiClient, CreateTempBanItem};
 use crate::btmp::{self, FailedAttempt, ReadCursor};
 use crate::config::Config;
 
-/// 单轮监控结果摘要。
+/// Summary of one monitoring round.
 ///
-/// 增量模式下 `parsed` 是本轮新读取的记录数(非文件累计总量);
-/// `in_window` 是当前窗口内的失败总次数(跨轮维护)。
-/// 两者仅在 main 的 `info!(?summary)` 中通过 Debug 输出,故允许 dead_code。
+/// In incremental mode `parsed` counts the records newly read this round (not
+/// the file total); `in_window` counts total failures inside the current
+/// window (maintained across rounds). Both are only printed through the
+/// `info!(?summary)` in main, hence the dead_code allowance.
 #[derive(Debug, Default)]
 #[allow(dead_code)]
 pub struct RunSummary {
@@ -29,9 +30,9 @@ pub struct RunSummary {
 pub struct Monitor {
     config: Config,
     api: ApiClient,
-    /// btmp 增量读取游标;首轮读取从文件头开始。
+    /// Incremental btmp read cursor; the first read starts at the file head.
     cursor: Option<ReadCursor>,
-    /// 窗口内失败时间戳(按 IP),跨轮增量维护。
+    /// Failure timestamps inside the window keyed by IP, maintained across rounds.
     counts: HashMap<IpAddr, VecDeque<DateTime<Utc>>>,
 }
 
@@ -46,22 +47,25 @@ impl Monitor {
         })
     }
 
-    /// 执行一轮扫描与(可选)封禁。
+    /// Run one scan and (optional) ban round.
     pub async fn run_once(&mut self, dry_run: bool) -> Result<RunSummary> {
         let attempts = self.collect_attempts()?;
         let parsed = attempts.len();
 
         let cutoff = Utc::now() - chrono::Duration::seconds(self.config.ban.window_seconds as i64);
 
-        // 增量:并入新记录后裁掉滑出窗口的旧时间戳。
+        // Incremental: merge the new records, then drop timestamps that slid
+        // out of the window.
         merge_attempts(&mut self.counts, attempts, cutoff);
         let in_window: usize = self.counts.values().map(VecDeque::len).sum();
 
         let threshold = self.config.ban.threshold;
         let trusted = &self.config.monitor.trusted_cidrs;
 
-        // 拉取已封禁集合用于去重。正式封禁时失败即中止本轮(fail-closed),
-        // 避免带着空集合重复提交未过期封禁;dry-run 只读展示,失败降级为空集继续。
+        // Fetch the already-banned set for dedup. On failure, abort this round
+        // (fail-closed) so unexpired bans are never resubmitted against an
+        // empty set; dry-run is read-only and degrades to an empty set with a
+        // warning.
         let existing = if dry_run {
             match self.api.list_temp_ban_cidrs().await {
                 Ok(set) => set,
@@ -85,7 +89,7 @@ impl Monitor {
             ..Default::default()
         };
 
-        // 候选封禁 IP:超过阈值、不在可信网段、尚未封禁。
+        // Ban candidates: above threshold, outside trusted CIDRs, not banned yet.
         let mut candidates: Vec<(IpAddr, u64)> = Vec::new();
         for (ip, times) in &self.counts {
             let count = times.len() as u64;
@@ -119,7 +123,7 @@ impl Monitor {
             return Ok(summary);
         }
 
-        // 按失败次数降序,便于日志可读。
+        // Sort by failure count descending for readable logs.
         candidates.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
 
         for (ip, count) in &candidates {
@@ -150,8 +154,8 @@ impl Monitor {
             })
             .collect();
 
-        // 提交失败直接上抛:daemon 模式由主循环记日志后下轮重试,
-        // --once 模式则以非零退出码暴露给 cron/告警。
+        // Propagate submission failures: daemon mode logs and retries next
+        // round; --once surfaces a non-zero exit code to cron/alerting.
         let n = self.api.create_temp_bans_batch(items).await?;
         summary.banned = n;
         info!(banned = n, "submitted temp-bans");
@@ -159,7 +163,7 @@ impl Monitor {
         Ok(summary)
     }
 
-    /// 读取 btmp 增量新记录并推进游标。
+    /// Read incremental new btmp records and advance the cursor.
     fn collect_attempts(&mut self) -> Result<Vec<FailedAttempt>> {
         let path = Path::new(&self.config.monitor.btmp_path);
         let (attempts, cursor) = btmp::read_attempts(path, self.cursor)?;
@@ -168,9 +172,10 @@ impl Monitor {
     }
 }
 
-/// 把一批失败记录并入窗口计数,并裁掉滑出窗口的旧时间戳。
+/// Merge a batch of failure records into the window counts and drop
+/// timestamps that slid out of the window.
 ///
-/// 用 `retain` 而非队头弹出,容忍写入方时间戳乱序。
+/// Uses `retain` instead of front-popping to tolerate out-of-order timestamps.
 fn merge_attempts(
     counts: &mut HashMap<IpAddr, VecDeque<DateTime<Utc>>>,
     attempts: Vec<FailedAttempt>,
@@ -187,7 +192,8 @@ fn merge_attempts(
     });
 }
 
-/// 将 IP 转为单主机 CIDR(v4 → /32,v6 → /128),与 xdp-firewall 归一化一致。
+/// Convert an IP to a single-host CIDR (v4 -> /32, v6 -> /128), matching the
+/// xdp-firewall normalization.
 fn ip_cidr(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(_) => format!("{ip}/32"),
@@ -195,12 +201,12 @@ fn ip_cidr(ip: IpAddr) -> String {
     }
 }
 
-/// IP 是否落入任一可信网段。
+/// Whether the IP falls into any trusted network.
 fn is_trusted(ip: IpAddr, cidrs: &[IpNet]) -> bool {
     cidrs.iter().any(|net| net.contains(&ip))
 }
 
-/// 用于测试/展示的辅助:返回给定 IP 的单主机 CIDR。
+/// Helper for tests/display: return the single-host CIDR of an IP.
 #[allow(dead_code)]
 pub fn ip_host_cidr(ip: IpAddr) -> String {
     ip_cidr(ip)
@@ -253,7 +259,8 @@ mod tests {
             Some(1)
         );
 
-        // 第二轮增量并入新记录,同 IP 计数累积。
+        // A second incremental round merges new records; counts accumulate
+        // per IP.
         merge_attempts(
             &mut counts,
             vec![attempt("2.2.2.2", now), attempt("1.1.1.1", now)],

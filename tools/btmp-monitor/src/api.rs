@@ -5,13 +5,14 @@ use std::time::Duration;
 
 use crate::config::Config;
 
-/// xdp-firewall API 单次批量创建的条数上限,与主仓库 `MAX_BATCH_SIZE` 一致。
+/// Per-request batch cap of the xdp-firewall API, matching the main repo's
+/// `MAX_BATCH_SIZE`.
 const MAX_BATCH_ITEMS: usize = 500;
 
-/// 单个 HTTP 请求的总超时,防止 API 挂起时 daemon 轮询停摆。
+/// Total per-request HTTP timeout so a hung API cannot stall the daemon poll loop.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 一次封禁请求(对应 xdp-firewall `CreateTempBanRequest`)。
+/// One ban request item (mirrors xdp-firewall `CreateTempBanRequest`).
 #[derive(Debug, Serialize)]
 pub struct CreateTempBanItem {
     pub cidr: String,
@@ -28,7 +29,7 @@ struct BatchRequest<'a> {
     items: &'a [CreateTempBanItem],
 }
 
-/// `/temp-bans` 分页响应中的单条记录(仅取 cidr)。
+/// One record of the paginated `/temp-bans` response (cidr only).
 #[derive(Debug, Deserialize)]
 struct TempBanModel {
     cidr: String,
@@ -40,7 +41,7 @@ struct Page {
     total_pages: u64,
 }
 
-/// 封装对 xdp-firewall 控制平面 API 的访问。
+/// Client for the xdp-firewall control-plane API.
 pub struct ApiClient {
     base_url: String,
     token: String,
@@ -60,7 +61,7 @@ impl ApiClient {
         })
     }
 
-    /// 拉取所有未过期的 temp-ban,返回其归一化 CIDR 集合。
+    /// Fetch all unexpired temp-bans and return their normalized CIDR set.
     pub async fn list_temp_ban_cidrs(&self) -> Result<std::collections::HashSet<String>> {
         let mut cidrs = std::collections::HashSet::new();
         let mut page: u64 = 1;
@@ -106,10 +107,12 @@ impl ApiClient {
         Ok(cidrs)
     }
 
-    /// 批量创建 temp-ban,超过 API 单次上限时自动分块提交。返回提交条数。
+    /// Batch-create temp-bans, auto-chunking past the per-request cap;
+    /// returns the submitted count.
     ///
-    /// 分块逐个提交:中途某块失败时,前面已成功的块不会回滚,错误会附带
-    /// 已提交数量;剩余候选由下一轮扫描重试。
+    /// Chunks are submitted one by one: when a chunk fails, earlier chunks
+    /// stay committed and the error carries the already-submitted count;
+    /// remaining candidates retry on the next scan.
     pub async fn create_temp_bans_batch(&self, items: Vec<CreateTempBanItem>) -> Result<usize> {
         let mut submitted = 0usize;
         for chunk in items.chunks(MAX_BATCH_ITEMS) {
@@ -125,7 +128,7 @@ impl ApiClient {
         Ok(submitted)
     }
 
-    /// 提交单个不超过 `MAX_BATCH_ITEMS` 的分块。
+    /// Submit one chunk of at most `MAX_BATCH_ITEMS` entries.
     async fn create_temp_ban_chunk(&self, chunk: &[CreateTempBanItem]) -> Result<usize> {
         let count = chunk.len();
         let url = format!("{}/temp-bans/batch", self.base_url);
@@ -173,13 +176,13 @@ mod tests {
         }
     }
 
-    /// 钉住与主仓库 `control_plane/api/mod.rs` 的 `MAX_BATCH_SIZE` 的一致性。
+    /// Pin consistency with the main repo's `MAX_BATCH_SIZE`.
     #[test]
     fn batch_limit_matches_server() {
         assert_eq!(MAX_BATCH_ITEMS, 500);
     }
 
-    /// 空输入直接短路,不应发起任何网络请求。
+    /// Empty input short-circuits without any network request.
     #[tokio::test]
     async fn empty_batch_short_circuits_without_network() {
         let client = ApiClient::new(&test_config()).unwrap();
