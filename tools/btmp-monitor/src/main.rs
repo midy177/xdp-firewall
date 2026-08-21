@@ -35,8 +35,9 @@ struct Cli {
     #[arg(long, env = "BTMP_MONITOR_WINDOW_SECONDS", default_value_t = 86_400)]
     window_seconds: u64,
 
-    /// Ban duration in seconds; the xdp-firewall API caps it at 31_536_000 (~1 year).
-    #[arg(long, env = "BTMP_MONITOR_DURATION_SECONDS", default_value_t = 86_400)]
+    /// Ban duration in seconds (default 10 minutes); the xdp-firewall API
+    /// caps it at 31_536_000 (~1 year).
+    #[arg(long, env = "BTMP_MONITOR_DURATION_SECONDS", default_value_t = 600)]
     duration_seconds: i64,
 
     /// Ban protocol: "any" | "tcp" | "udp"; "any" blocks every protocol for the IP.
@@ -73,7 +74,8 @@ struct Cli {
     #[arg(long)]
     once: bool,
 
-    /// Parse and print candidate IPs only; do not call the ban API.
+    /// Print ban candidates and the parameters a real run would submit;
+    /// makes no API requests at all.
     #[arg(long)]
     dry_run: bool,
 

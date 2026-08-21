@@ -4,7 +4,7 @@ use ipnet::IpNet;
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::api::{ApiClient, CreateTempBanItem};
 use crate::btmp::{self, FailedAttempt, ReadCursor};
@@ -62,20 +62,12 @@ impl Monitor {
         let threshold = self.config.ban.threshold;
         let trusted = &self.config.monitor.trusted_cidrs;
 
-        // Fetch the already-banned set for dedup. On failure, abort this round
-        // (fail-closed) so unexpired bans are never resubmitted against an
-        // empty set; dry-run is read-only and degrades to an empty set with a
-        // warning.
+        // Fetch the already-banned set for dedup. dry-run makes no API calls
+        // at all, so it runs without the dedup set; in real mode a failure
+        // aborts this round (fail-closed) so unexpired bans are never
+        // resubmitted against an empty set.
         let existing = if dry_run {
-            match self.api.list_temp_ban_cidrs().await {
-                Ok(set) => set,
-                Err(e) => {
-                    warn!(
-                        "failed to list existing temp-bans: {e:#}; dry-run continues with empty dedup set"
-                    );
-                    Default::default()
-                }
-            }
+            Default::default()
         } else {
             self.api
                 .list_temp_ban_cidrs()
@@ -131,10 +123,16 @@ impl Monitor {
         }
 
         if dry_run {
+            // Print the exact parameters a real run would submit; no API
+            // request is made.
             info!(
                 dry_run = true,
-                banned = candidates.len(),
-                "dry-run: would ban IPs"
+                would_ban = candidates.len(),
+                protocol = %self.config.ban.protocol,
+                port = ?self.config.ban_port(),
+                duration_seconds = self.config.ban.duration_seconds,
+                comment = %self.config.ban.comment,
+                "dry-run: would submit temp-bans (no API request made)"
             );
             summary.banned = candidates.len();
             return Ok(summary);
@@ -227,6 +225,45 @@ mod tests {
     fn ip_cidr_v4_and_v6() {
         assert_eq!(ip_cidr("1.2.3.4".parse().unwrap()), "1.2.3.4/32");
         assert_eq!(ip_cidr("::1".parse().unwrap()), "::1/128");
+    }
+
+    /// dry-run must complete without any API request: the config points at a
+    /// closed port, so any request would fail the round.
+    #[tokio::test]
+    async fn dry_run_makes_no_api_calls() {
+        use crate::btmp::UTMP_RECORD_SIZE;
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("btmp-monitor-test-{}-dryrun", std::process::id()));
+        let mut record = [0u8; UTMP_RECORD_SIZE];
+        let host = b"203.0.113.9";
+        record[76..76 + host.len()].copy_from_slice(host);
+        let now = chrono::Utc::now().timestamp();
+        let sec = i32::try_from(now).unwrap_or(1);
+        record[340..344].copy_from_slice(&sec.to_ne_bytes());
+        std::fs::write(&path, [record].concat()).unwrap();
+
+        let config = crate::config::Config {
+            api_url: "http://127.0.0.1:9".to_string(),
+            api_token: "t".to_string(),
+            ban: crate::config::BanConfig {
+                threshold: 1,
+                window_seconds: 86_400,
+                duration_seconds: 60,
+                protocol: "any".to_string(),
+                port: 0,
+                comment: "test".to_string(),
+            },
+            monitor: crate::config::MonitorConfig {
+                btmp_path: path.display().to_string(),
+                trusted_cidrs: Vec::new(),
+            },
+        };
+        let mut monitor = Monitor::new(config).unwrap();
+        let summary = monitor.run_once(true).await.unwrap();
+        assert_eq!(summary.parsed, 1);
+        assert_eq!(summary.banned, 1);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -12,7 +12,7 @@ Rust 实现,独立 Cargo 项目,不依赖主防火墙二进制。**无配置文�
 4. 跳过:落入可信网段(`--trusted-cidr`)的 IP、已在 xdp-firewall 中未过期封禁的 IP。
 5. 剩余 IP 通过 `POST /temp-bans/batch` 提交封禁,封禁时长、协议、端口等由参数决定;超过 API 单次上限(500 条)时自动分块提交。
 
-幂等与失败语义:每轮先 `GET /temp-bans` 拉取未过期封禁集合,未过期的 IP 不会重复提交;该请求失败时本轮直接中止(不带着空集合重复提交),daemon 模式下轮重试,`--once` 模式以非零退出码暴露给 cron。
+幂等与失败语义:每轮先 `GET /temp-bans` 拉取未过期封禁集合,未过期的 IP 不会重复提交;该请求失败时本轮直接中止(不带着空集合重复提交),daemon 模式下轮重试,`--once` 模式以非零退出码暴露给 cron。`--dry-run` **完全不发起任何 API 请求**(包括上面的去重拉取),只解析 btmp 并打印候选 IP 与将提交的封禁参数。
 
 ## 前置条件:确认 sshd 在写 btmp
 
@@ -72,7 +72,7 @@ make docker-run           # 容器运行:host 网络 + 只读挂载 /var/log/btm
 | `--api-token` | `XDP_FIREWALL_API_TOKEN` | —(必需) | 与 xdp-firewall 的 `XDP_FIREWALL_API_TOKEN` 一致;仅 `--dry-run` 可省略 |
 | `--threshold` | `BTMP_MONITOR_THRESHOLD` | `5` | 触发封禁的失败次数 |
 | `--window-seconds` | `BTMP_MONITOR_WINDOW_SECONDS` | `86400` | 统计窗口(秒) |
-| `--duration-seconds` | `BTMP_MONITOR_DURATION_SECONDS` | `86400` | 封禁时长(秒),API 上限 31_536_000 |
+| `--duration-seconds` | `BTMP_MONITOR_DURATION_SECONDS` | `600` | 封禁时长(秒),默认 10 分钟;API 上限 31_536_000 |
 | `--protocol` | `BTMP_MONITOR_PROTOCOL` | `any` | `any` / `tcp` / `udp` |
 | `--port` | `BTMP_MONITOR_PORT` | `0` | 仅 `protocol != any` 时生效,1..=65535 |
 | `--comment` | `BTMP_MONITOR_COMMENT` | `btmp auto-ban: ...` | 写入 temp-ban 记录的备注 |
@@ -80,7 +80,7 @@ make docker-run           # 容器运行:host 网络 + 只读挂载 /var/log/btm
 | `--trusted-cidr` | `BTMP_MONITOR_TRUSTED_CIDRS` | `127.0.0.0/8,::1/128` | 永不封禁的网段;参数可多次指定,环境变量逗号分隔(如内网:`10.0.0.0/8,172.16.0.0/12,192.168.0.0/16`) |
 | `--interval` | `BTMP_MONITOR_INTERVAL` | `60` | daemon 轮询间隔(秒) |
 | `--once` | — | — | 单次运行后退出(cron 场景) |
-| `--dry-run` | — | — | 只解析并打印候选 IP,不调用封禁 API |
+| `--dry-run` | — | — | 只解析并打印候选 IP 与封禁参数,**零 API 请求**(无需 token/API 可用) |
 
 示例——只封 SSH、阈值 3 次、封 7 天、信任内网:
 
