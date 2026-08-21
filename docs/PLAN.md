@@ -2,6 +2,9 @@
 
 ## Active Plan
 
+- [completed] Rework the `tools/btmp-monitor` collector to read `/var/log/btmp` utmp records directly: 384-byte binary parsing (IP from `ut_host` with `ut_addr_v6` fallback, time from `ut_tv`, trailing partial records dropped), an offset+inode incremental cursor with rotation reset, and in-memory per-IP window counting so each daemon poll is O(new records) instead of a full btmp rescan; remove the external `lastb` command dependency entirely.
+- [completed] Rename the `tools/lastb-monitor` secondary tool to `tools/btmp-monitor` (package name, binary name, README, systemd/cron examples, and cross-references in CLAUDE.md/README/docs) to match the direct btmp collection path.
+- [completed] Drop the TOML config file from `tools/btmp-monitor`: all parameters are clap flags with `BTMP_MONITOR_*` / `XDP_FIREWALL_API_TOKEN` environment variable overrides (token required except in `--dry-run`; trusted CIDRs default to loopback and accept comma-separated env values).
 - [pending] Refactor large backend modules by domain boundary: split `api.rs`, `xdp.rs`, `xds.rs`, `geo.rs`, and `threat.rs` into smaller submodules that mirror control-plane, agent, data-plane, policy, and intelligence responsibilities.
 - [pending] Refactor the frontend console so `App.vue` is decomposed into route/view components, reusable composables, API client helpers, validation helpers, i18n text, and shared types.
 - [pending] Keep functions focused and reasonably short during new development and refactors; extract validation, request parsing, persistence, compilation, and rendering branches into named helpers when a function starts mixing responsibilities or becomes difficult to scan.
