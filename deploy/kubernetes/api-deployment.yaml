@@ -7,7 +7,7 @@ metadata:
     app.kubernetes.io/name: xdp-firewall
     app.kubernetes.io/component: api
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: xdp-firewall
@@ -21,7 +21,7 @@ spec:
       serviceAccountName: xdp-firewall-api
       containers:
         - name: api
-          image: xdp-firewall:0.1.9
+          image: xdp-firewall:0.1.25
           imagePullPolicy: IfNotPresent
           env:
             - name: DATABASE_URL

@@ -50,7 +50,7 @@ spec:
             - name: XDP_FIREWALL_XDP_ATTACH_STRATEGY
               value: dispatcher
             - name: XDP_FIREWALL_XDP_RUN_PRIORITY
-              value: "10"
+              value: "1"
             - name: XDP_FIREWALL_AGENT_ONLY
               value: "true"
             - name: RUST_LOG
