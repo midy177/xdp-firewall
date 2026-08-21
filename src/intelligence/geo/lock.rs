@@ -55,8 +55,11 @@ async fn ensure_lock_row(db: &DatabaseConnection, now: chrono::NaiveDateTime) ->
         ..Default::default()
     })
     .on_conflict(
+        // `do_nothing()` renders invalid SQL on MySQL (sea-query emits a
+        // trailing " IGNORE"); self-assigning the conflict target column is a
+        // cross-database no-op that leaves an existing lock row untouched.
         OnConflict::column(geo_ip_list_state::Column::Country)
-            .do_nothing()
+            .update_columns([geo_ip_list_state::Column::Country])
             .to_owned(),
     )
     .exec_without_returning(db)

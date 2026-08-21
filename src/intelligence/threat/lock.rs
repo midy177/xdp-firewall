@@ -62,11 +62,17 @@ async fn ensure_threat_refresh_lock_row(
         ..Default::default()
     })
     .on_conflict(
+        // `do_nothing()` renders invalid SQL on MySQL (sea-query emits a
+        // trailing " IGNORE"); self-assigning the conflict target columns is a
+        // cross-database no-op that leaves an existing lock row untouched.
         OnConflict::columns([
             threat_source_state::Column::PolicyName,
             threat_source_state::Column::SourceName,
         ])
-        .do_nothing()
+        .update_columns([
+            threat_source_state::Column::PolicyName,
+            threat_source_state::Column::SourceName,
+        ])
         .to_owned(),
     )
     .exec_without_returning(db)

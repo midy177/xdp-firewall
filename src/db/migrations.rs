@@ -1,12 +1,14 @@
 use anyhow::Result;
 use sea_orm::{DatabaseConnection, Schema};
 
+mod columns;
 mod indexes;
 mod legacy;
 mod tables;
 #[cfg(test)]
 mod tests;
 
+use columns::ensure_mysql_text_capacity;
 use indexes::{
     create_dynamic_policy_indexes, create_geo_indexes, create_temp_ban_indexes,
     create_threat_indexes, create_trusted_cidr_indexes, ensure_firewall_rule_key_unique_index,
@@ -26,6 +28,7 @@ pub async fn migrate(db: &DatabaseConnection) -> Result<()> {
     create_temp_ban_tables(db, &schema).await?;
     create_trusted_cidr_tables(db, &schema).await?;
     create_node_tables(db, &schema).await?;
+    ensure_mysql_text_capacity(db).await?;
     create_geo_indexes(db).await?;
     create_dynamic_policy_indexes(db).await?;
     create_temp_ban_indexes(db).await?;

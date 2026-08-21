@@ -28,6 +28,17 @@ async fn migrate_backfills_and_requires_firewall_rule_key() {
     assert_firewall_rule_key_constraints(&db, backend, &rule_key).await;
 }
 
+#[tokio::test]
+async fn migrate_is_idempotent_across_restarts() {
+    let db = sqlite_memory_db().await;
+
+    migrate(&db).await.unwrap();
+    // A second run must succeed too: startup replays the full migration set,
+    // and index creation probes the catalog first instead of relying on
+    // `CREATE INDEX IF NOT EXISTS`, which MySQL does not support.
+    migrate(&db).await.unwrap();
+}
+
 async fn sqlite_memory_db() -> DatabaseConnection {
     let mut options = ConnectOptions::new("sqlite::memory:");
     options.max_connections(1);

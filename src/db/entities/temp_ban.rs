@@ -12,6 +12,7 @@ pub struct Model {
     pub protocol: String,
     pub port: Option<i32>,
     pub expires_at: NaiveDateTime,
+    #[sea_orm(column_type = "Text")]
     pub comment: Option<String>,
     pub created_at: NaiveDateTime,
 }

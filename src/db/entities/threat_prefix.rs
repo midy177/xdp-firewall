@@ -9,6 +9,9 @@ pub struct Model {
     pub id: i32,
     pub policy_name: String,
     pub source_name: String,
+    // Threat feeds aggregate to >64 KiB of CIDR JSON; migrations promote this
+    // to MEDIUMTEXT on MySQL (other backends' TEXT is unlimited).
+    #[sea_orm(column_type = "Text")]
     pub cidrs_json: String,
     pub updated_at: NaiveDateTime,
 }

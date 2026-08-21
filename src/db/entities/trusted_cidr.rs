@@ -10,6 +10,7 @@ pub struct Model {
     pub policy_name: String,
     pub enabled: bool,
     pub cidr: String,
+    #[sea_orm(column_type = "Text")]
     pub comment: Option<String>,
     pub updated_at: NaiveDateTime,
 }

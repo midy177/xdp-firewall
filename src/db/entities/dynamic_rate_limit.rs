@@ -14,6 +14,7 @@ pub struct Model {
     pub port: Option<i32>,
     pub packets_per_second: i32,
     pub burst: i32,
+    #[sea_orm(column_type = "Text")]
     pub comment: Option<String>,
     pub updated_at: NaiveDateTime,
 }

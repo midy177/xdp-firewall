@@ -1,11 +1,23 @@
 use crate::db::sql::raw_sql;
 use anyhow::{Result, bail};
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, EntityName};
 
-pub(super) async fn create_index(
+pub(super) async fn create_index<E: EntityName>(
     db: &DatabaseConnection,
-    stmt: sea_orm::sea_query::IndexCreateStatement,
+    entity: E,
+    index: &str,
+    mut stmt: sea_orm::sea_query::IndexCreateStatement,
 ) -> Result<()> {
+    // MySQL has no `CREATE INDEX IF NOT EXISTS`, and sea-query silently drops
+    // the `.if_not_exists()` flag when rendering for the MySQL backend, so a
+    // second startup would fail with error 1061 (duplicate key name). Probe the
+    // catalog explicitly (information_schema / PRAGMA) to stay idempotent.
+    if index_exists(db, index, entity.table_name()).await? {
+        return Ok(());
+    }
+    stmt.name(index.to_string())
+        .table(entity.table_ref())
+        .if_not_exists();
     db.execute(&stmt).await?;
     Ok(())
 }

@@ -8,6 +8,9 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub country: String,
+    // Large countries aggregate to >64 KiB of CIDR JSON; migrations promote
+    // this to MEDIUMTEXT on MySQL (other backends' TEXT is unlimited).
+    #[sea_orm(column_type = "Text")]
     pub cidrs_json: String,
     pub updated_at: NaiveDateTime,
 }

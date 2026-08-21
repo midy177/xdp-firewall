@@ -36,7 +36,13 @@ pub(super) async fn insert_builtin_threat_sources(
                     threat_source::Column::PolicyName,
                     threat_source::Column::Name,
                 ])
-                .do_nothing()
+                // `do_nothing()` renders invalid SQL on MySQL (sea-query emits
+                // a trailing " IGNORE"); self-assigning the conflict target
+                // columns is a cross-database no-op on collision.
+                .update_columns([
+                    threat_source::Column::PolicyName,
+                    threat_source::Column::Name,
+                ])
                 .to_owned(),
             )
             .exec_without_returning(db)
