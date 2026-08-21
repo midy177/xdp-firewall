@@ -4,6 +4,19 @@ Distributed XDP firewall control plane written in Rust.
 
 Each server runs the same agent. A single firewall policy is stored in SQLite, PostgreSQL, or MySQL with SeaORM. The API control-plane process writes configuration to the database and exposes both the Axum HTTP API/UI and a gRPC xDS stream; agents subscribe to xDS and apply the latest policy to local XDP maps through Aya. SQLite is intended for a single-server deployment; PostgreSQL/MySQL are the distributed configuration source for multiple servers. The policy is initialized with built-in threat intelligence feeds for `ipsum`, `spamhaus-drop`, and `voipbl`.
 
+## Web Console
+
+The API binary embeds a Vue 3 console (hash routing, token held in memory only, Chinese/English toggle). Default language is Chinese; the screenshots below show the console managing a small cluster.
+
+| | | |
+| --- | --- | --- |
+| ![Firewall rules](https://raw.githubusercontent.com/midy177/xdp-firewall/master/docs/rules.jpeg) | ![Trusted CIDRs](https://raw.githubusercontent.com/midy177/xdp-firewall/master/docs/trusted.jpeg) | ![Temporary bans](https://raw.githubusercontent.com/midy177/xdp-firewall/master/docs/tempBans.jpeg) |
+| Firewall rules | Trusted CIDRs (whitelist) | Temporary bans |
+| ![Threat intelligence](https://raw.githubusercontent.com/midy177/xdp-firewall/master/docs/threats.jpeg) | ![Country rules](https://raw.githubusercontent.com/midy177/xdp-firewall/master/docs/geo.jpeg) | ![Dynamic defense](https://raw.githubusercontent.com/midy177/xdp-firewall/master/docs/defense.jpeg) |
+| Threat-intel feeds | Country (geo) rules | Dynamic defense |
+| ![Nodes](https://raw.githubusercontent.com/midy177/xdp-firewall/master/docs/nodes.jpeg) | ![Live drop events](https://raw.githubusercontent.com/midy177/xdp-firewall/master/docs/drops.jpeg) | ![API docs](https://raw.githubusercontent.com/midy177/xdp-firewall/master/docs/api-docs.jpeg) |
+| Node fleet & sync status | Live drop events (SSE) | API docs (token-free) |
+
 ## Quick Start
 
 ```bash

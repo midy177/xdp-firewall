@@ -4,6 +4,20 @@ version = "0.1.26"
 edition = "2024"
 description = "Distributed XDP firewall with database-backed policy"
 license = "MIT"
+repository = "https://github.com/midy177/xdp-firewall"
+homepage = "https://github.com/midy177/xdp-firewall"
+readme = "README.md"
+keywords = ["firewall", "ebpf", "xdp", "network-security", "bpf"]
+categories = ["network-programming", "os::linux-apis"]
+# Screenshots and internal design notes are referenced from the README via
+# absolute URLs; keep the heavy assets out of the crate tarball.
+exclude = [
+    "docs/*.jpeg",
+    "docs/DESIGN.md",
+    "docs/PLAN.md",
+    "docs/post-rustcc-cn.md",
+    "docs/xdp-firewall-方案介绍.md",
+]
 
 [dependencies]
 anyhow = "1"
