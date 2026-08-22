@@ -1,0 +1,37 @@
+# Docker Compose parameters for btmp-monitor.
+# Use with:
+# docker compose --env-file tools/btmp-monitor/deploy/docker-compose/compose-env \
+#   -f tools/btmp-monitor/deploy/docker-compose/compose.yml up -d
+
+# Build locally with `make zig-build-amd64 && make docker-build` (or push with
+# `make docker-buildx-push IMAGE_REPO=<registry>/btmp-monitor`), or point this
+# at a registry image.
+BTMP_MONITOR_IMAGE=btmp-monitor:0.1.0
+
+# Required. Must match the xdp-firewall control plane XDP_FIREWALL_API_TOKEN.
+XDP_FIREWALL_API_TOKEN=change-this-token
+
+# xdp-firewall API base URL. With network_mode: host and the API running on
+# the same server, 127.0.0.1 is correct.
+BTMP_MONITOR_API_URL=http://127.0.0.1:8080
+
+# Failed logins (inside the window) required before banning an IP.
+BTMP_MONITOR_THRESHOLD=5
+BTMP_MONITOR_WINDOW_SECONDS=86400
+
+# Ban duration; 600s = 10 minutes. The BPF-side TTL lifts the ban
+# automatically when it expires.
+BTMP_MONITOR_DURATION_SECONDS=600
+
+# Ban scope: any | tcp | udp. When not "any", set BTMP_MONITOR_PORT (1..=65535).
+BTMP_MONITOR_PROTOCOL=any
+BTMP_MONITOR_PORT=0
+
+# Trusted CIDRs are never banned; comma-separated, no spaces.
+# Example: BTMP_MONITOR_TRUSTED_CIDRS=127.0.0.0/8,::1/128,10.0.0.0/8,192.168.0.0/16
+BTMP_MONITOR_TRUSTED_CIDRS=127.0.0.0/8,::1/128
+
+# Daemon poll interval in seconds; each round only reads new btmp records.
+BTMP_MONITOR_INTERVAL=60
+
+RUST_LOG=btmp_monitor=info

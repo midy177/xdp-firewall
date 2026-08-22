@@ -1,0 +1,85 @@
+# Single-server all-in-one stack: xdp-firewall control plane (SQLite) + host
+# agent + btmp-monitor. Merges deploy/docker-compose/compose.sqlite.yml with
+# the standalone btmp-monitor compose.yml for servers that do not run an
+# existing xdp-firewall deployment.
+services:
+  api:
+    image: ${XDP_FIREWALL_IMAGE:-xdp-firewall:0.1.26}
+    environment:
+      DATABASE_URL: sqlite:///var/lib/xdp-firewall/xdp-firewall.db?mode=rwc
+      XDP_FIREWALL_API_TOKEN: ${XDP_FIREWALL_API_TOKEN:?set XDP_FIREWALL_API_TOKEN to enable API authentication}
+      XDP_FIREWALL_AGENT_TOKEN: ${XDP_FIREWALL_AGENT_TOKEN:?set XDP_FIREWALL_AGENT_TOKEN to authenticate agents}
+      XDP_FIREWALL_TRUSTED_CIDRS: ${XDP_FIREWALL_TRUSTED_CIDRS:-}
+      XDP_FIREWALL_XDS_PUSH_INTERVAL_SECONDS: ${XDP_FIREWALL_XDS_PUSH_INTERVAL_SECONDS:-5}
+      RUST_LOG: ${RUST_LOG:-xdp_firewall=info}
+    volumes:
+      # SQLite data lives next to this compose file (./sqlite-data), same as
+      # the main repo layout.
+      - ./sqlite-data:/var/lib/xdp-firewall
+    ports:
+      - "${XDP_FIREWALL_API_PORT:-8080}:8080"
+      - "${XDP_FIREWALL_XDS_PORT:-50051}:50051"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -kfsS https://127.0.0.1:8080/health || curl -fsS http://127.0.0.1:8080/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  agent:
+    image: ${XDP_FIREWALL_IMAGE:-xdp-firewall:0.1.26}
+    depends_on:
+      api:
+        condition: service_healthy
+    network_mode: host
+    uts: host
+    privileged: true
+    pid: host
+    environment:
+      # Host-network agent reaching the api through the published port; keep
+      # in sync with XDP_FIREWALL_XDS_PORT above.
+      XDP_FIREWALL_XDS_URL: ${XDP_FIREWALL_XDS_URL:-http://127.0.0.1:50051}
+      XDP_FIREWALL_AGENT_TOKEN: ${XDP_FIREWALL_AGENT_TOKEN:?set XDP_FIREWALL_AGENT_TOKEN to authenticate agents}
+      XDP_FIREWALL_AGENT_ONLY: "true"
+      XDP_FIREWALL_XDP_MODE: ${XDP_FIREWALL_XDP_MODE:-auto}
+      XDP_FIREWALL_XDP_ATTACH_STRATEGY: ${XDP_FIREWALL_XDP_ATTACH_STRATEGY:-direct}
+      XDP_FIREWALL_XDP_ALLOW_REPLACE: ${XDP_FIREWALL_XDP_ALLOW_REPLACE:-false}
+      XDP_FIREWALL_XDP_RUN_PRIORITY: ${XDP_FIREWALL_XDP_RUN_PRIORITY:-10}
+      RUST_LOG: ${RUST_LOG:-xdp_firewall=info}
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf
+    command:
+      - agent
+    restart: unless-stopped
+
+  btmp-monitor:
+    image: ${BTMP_MONITOR_IMAGE:-btmp-monitor:0.1.0}
+    depends_on:
+      api:
+        condition: service_healthy
+    network_mode: host
+    environment:
+      # Same token as the api service above.
+      XDP_FIREWALL_API_TOKEN: ${XDP_FIREWALL_API_TOKEN:?set XDP_FIREWALL_API_TOKEN to authenticate against the xdp-firewall API}
+      # Host-network client reaching the api through the published port; keep
+      # in sync with XDP_FIREWALL_API_PORT above.
+      BTMP_MONITOR_API_URL: ${BTMP_MONITOR_API_URL:-http://127.0.0.1:8080}
+      BTMP_MONITOR_THRESHOLD: ${BTMP_MONITOR_THRESHOLD:-5}
+      BTMP_MONITOR_WINDOW_SECONDS: ${BTMP_MONITOR_WINDOW_SECONDS:-86400}
+      BTMP_MONITOR_DURATION_SECONDS: ${BTMP_MONITOR_DURATION_SECONDS:-600}
+      BTMP_MONITOR_PROTOCOL: ${BTMP_MONITOR_PROTOCOL:-any}
+      BTMP_MONITOR_PORT: ${BTMP_MONITOR_PORT:-0}
+      BTMP_MONITOR_BTMP_PATH: ${BTMP_MONITOR_BTMP_PATH:-/var/log/btmp}
+      BTMP_MONITOR_TRUSTED_CIDRS: ${BTMP_MONITOR_TRUSTED_CIDRS:-127.0.0.0/8,::1/128}
+      BTMP_MONITOR_INTERVAL: ${BTMP_MONITOR_INTERVAL:-60}
+      # Separate from RUST_LOG: the stack-level RUST_LOG=xdp_firewall=info would
+      # filter out btmp-monitor logs entirely.
+      RUST_LOG: ${BTMP_MONITOR_RUST_LOG:-btmp_monitor=info}
+    volumes:
+      # Mount the whole /var/log read-only instead of the single btmp file:
+      # a single-file bind mount pins the old inode, so after logrotate
+      # rotates btmp the container would keep reading the stale file forever.
+      - /var/log:/var/log:ro
+    # The tool only reads btmp and talks to the API; keep the rootfs read-only.
+    read_only: true
+    restart: unless-stopped

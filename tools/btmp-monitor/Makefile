@@ -96,6 +96,25 @@ docker-shell:
 		--name $(CONTAINER_NAME)-shell \
 		$(IMAGE)
 
+COMPOSE_DIR ?= deploy/docker-compose
+
+.PHONY: compose-up
+compose-up:
+	docker compose --env-file $(COMPOSE_DIR)/compose-env -f $(COMPOSE_DIR)/compose.yml up -d
+
+.PHONY: compose-down
+compose-down:
+	docker compose --env-file $(COMPOSE_DIR)/compose-env -f $(COMPOSE_DIR)/compose.yml down
+
+# All-in-one stack: xdp-firewall api (SQLite) + host agent + btmp-monitor.
+.PHONY: compose-full-up
+compose-full-up:
+	docker compose --env-file $(COMPOSE_DIR)/compose-env.full -f $(COMPOSE_DIR)/compose.full.yml up -d
+
+.PHONY: compose-full-down
+compose-full-down:
+	docker compose --env-file $(COMPOSE_DIR)/compose-env.full -f $(COMPOSE_DIR)/compose.full.yml down
+
 .PHONY: clean
 clean:
 	cargo clean

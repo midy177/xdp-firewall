@@ -1,0 +1,85 @@
+# Docker Compose parameters for the single-server all-in-one stack
+# (xdp-firewall api + agent + btmp-monitor).
+# Use with:
+#   make compose-full-up        (from tools/btmp-monitor)
+# or:
+#   docker compose --env-file tools/btmp-monitor/deploy/docker-compose/compose-env.full \
+#     -f tools/btmp-monitor/deploy/docker-compose/compose.full.yml up -d
+
+# ----------------------------- xdp-firewall ---------------------------------
+
+# Control-plane + agent image. Build from the main repo with
+# `make docker-build`, or point this at a registry image.
+XDP_FIREWALL_IMAGE=xdp-firewall:0.1.26
+
+# Required. Change both tokens before exposing the service.
+# XDP_FIREWALL_API_TOKEN is shared with btmp-monitor below.
+XDP_FIREWALL_API_TOKEN=change-this-api-token
+XDP_FIREWALL_AGENT_TOKEN=change-this-agent-token
+
+# Host ports exposed by the API control-plane service.
+# If you change these, also update XDP_FIREWALL_XDS_URL and
+# BTMP_MONITOR_API_URL below (agent and btmp-monitor are host-network clients
+# that dial the published ports).
+XDP_FIREWALL_API_PORT=8080
+XDP_FIREWALL_XDS_PORT=50051
+
+# Agent connection to the embedded xDS endpoint.
+XDP_FIREWALL_XDS_URL=http://127.0.0.1:50051
+
+# Multiple runtime trusted CIDRs are comma-separated. Do not use spaces.
+# These CIDRs are injected into xDS snapshots only and are not persisted.
+# Trusted CIDRs are the highest-priority allow before firewall, threat, country,
+# and dynamic defense checks.
+# Example: XDP_FIREWALL_TRUSTED_CIDRS=10.0.0.0/8,192.168.0.0/16,203.0.113.10/32
+XDP_FIREWALL_TRUSTED_CIDRS=
+
+# xDS control plane checks policy versions at this cadence.
+XDP_FIREWALL_XDS_PUSH_INTERVAL_SECONDS=5
+
+# XDP attach mode: auto, driver, or skb.
+# AWS ENA instances with jumbo MTU should use skb to skip noisy native attach fallback.
+XDP_FIREWALL_XDP_MODE=auto
+
+# XDP attach strategy: direct or dispatcher. Dispatcher uses xdp-loader/libxdp
+# and is preferred when the interface may already run another XDP program.
+XDP_FIREWALL_XDP_ATTACH_STRATEGY=direct
+# XDP_FIREWALL_XDP_ALLOW_REPLACE is only meaningful for direct attach mode.
+XDP_FIREWALL_XDP_RUN_PRIORITY=10
+
+# ------------------------------ btmp-monitor --------------------------------
+
+# Build locally with `make zig-build-amd64 && make docker-build` (or push with
+# `make docker-buildx-push IMAGE_REPO=<registry>/btmp-monitor`), or point this
+# at a registry image. Uses the XDP_FIREWALL_API_TOKEN above.
+BTMP_MONITOR_IMAGE=btmp-monitor:0.1.0
+
+# xdp-firewall API base URL. With network_mode: host and the api running in
+# this stack, 127.0.0.1 plus the published API port is correct.
+BTMP_MONITOR_API_URL=http://127.0.0.1:8080
+
+# Failed logins (inside the window) required before banning an IP.
+BTMP_MONITOR_THRESHOLD=5
+BTMP_MONITOR_WINDOW_SECONDS=86400
+
+# Ban duration; 600s = 10 minutes. The BPF-side TTL lifts the ban
+# automatically when it expires.
+BTMP_MONITOR_DURATION_SECONDS=600
+
+# Ban scope: any | tcp | udp. When not "any", set BTMP_MONITOR_PORT (1..=65535).
+BTMP_MONITOR_PROTOCOL=any
+BTMP_MONITOR_PORT=0
+
+# Trusted CIDRs are never banned; comma-separated, no spaces.
+# Example: BTMP_MONITOR_TRUSTED_CIDRS=127.0.0.0/8,::1/128,10.0.0.0/8,192.168.0.0/16
+BTMP_MONITOR_TRUSTED_CIDRS=127.0.0.0/8,::1/128
+
+# Daemon poll interval in seconds; each round only reads new btmp records.
+BTMP_MONITOR_INTERVAL=60
+
+# Log filter for btmp-monitor only. Kept separate from RUST_LOG so the
+# stack-level xdp_firewall filter does not silence the monitor.
+BTMP_MONITOR_RUST_LOG=btmp_monitor=info
+
+# Log filter for the api and agent services.
+RUST_LOG=xdp_firewall=info

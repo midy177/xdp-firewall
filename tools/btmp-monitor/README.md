@@ -135,6 +135,49 @@ WantedBy=multi-user.target
 */5 * * * * root XDP_FIREWALL_API_TOKEN=change-this-token /usr/local/bin/btmp-monitor --once
 ```
 
+### Docker Compose(daemon)
+
+模板在 `deploy/docker-compose/`,与主仓库部署方式同构:改好 `compose-env` 里的 token 与参数后,
+
+```bash
+# 先构建镜像(或把 compose-env 的 BTMP_MONITOR_IMAGE 指向registry镜像)
+make zig-build-amd64 && make docker-build
+
+# 起停
+make compose-up
+make compose-down
+```
+
+等价的裸命令:
+
+```bash
+docker compose --env-file tools/btmp-monitor/deploy/docker-compose/compose-env \
+    -f tools/btmp-monitor/deploy/docker-compose/compose.yml up -d
+```
+
+两个容器化特有的设计:
+
+- **挂载 `/var/log` 整个目录(只读)而不是单个 btmp 文件**:单文件 bind mount 会把旧 inode 钉死,logrotate 轮转后容器里看到的永远是旧文件,增量游标的轮转检测也就失效了;挂目录让容器内每次 open 都解析到当前文件。
+- `network_mode: host` + `read_only: true`:工具只读 btmp、只调 API,无监听端口、无写盘需求;同机部署 xdp-firewall api 时 `BTMP_MONITOR_API_URL` 保持 `127.0.0.1:8080` 即可。
+
+### Docker Compose 全家桶(api + agent + btmp-monitor)
+
+目标服务器上**没有**现成 xdp-firewall 时,用 `compose.full.yml` 一把起整套(合并了主仓库 `deploy/docker-compose/compose.sqlite.yml`):SQLite 控制平面 + 宿主机 XDP agent + btmp-monitor,token 两个(`XDP_FIREWALL_API_TOKEN` / `XDP_FIREWALL_AGENT_TOKEN`)填在 `compose-env.full` 里即可。
+
+```bash
+# 需要两个镜像:主仓库 make docker-build 产出 XDP_FIREWALL_IMAGE,
+# 本目录 make zig-build-amd64 && make docker-build 产出 BTMP_MONITOR_IMAGE
+make compose-full-up
+make compose-full-down
+```
+
+与单独模板的差异:
+
+- btmp-monitor 与 agent 均 `depends_on: api (service_healthy)`,api 健康检查通过后才启动。
+- SQLite 数据落在 compose 文件旁的 `deploy/docker-compose/sqlite-data/`(与主仓库布局一致)。
+- btmp-monitor 的日志过滤用独立变量 `BTMP_MONITOR_RUST_LOG`(默认 `btmp_monitor=info`);栈级 `RUST_LOG=xdp_firewall=info` 会把它的日志整个过滤掉,两者不可共用。
+- 修改 `XDP_FIREWALL_API_PORT` / `XDP_FIREWALL_XDS_PORT` 时需同步改 `BTMP_MONITOR_API_URL` / `XDP_FIREWALL_XDS_URL`(btmp-monitor 与 agent 走 host 网络拨已发布端口)。
+
 ## 注意
 
 - 需以 root 运行才能读取 `/var/log/btmp`。
