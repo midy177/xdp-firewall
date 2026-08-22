@@ -10,5 +10,5 @@ resources:
   - agent-daemonset.yaml
 images:
   - name: xdp-firewall
-    newName: 1228022817/xdp-firewall
-    newTag: 0.1.9
+    newName: xdp-firewall
+    newTag: 0.1.26

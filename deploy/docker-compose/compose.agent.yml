@@ -1,6 +1,6 @@
 services:
   agent:
-    image: ${XDP_FIREWALL_IMAGE:-1228022817/xdp-firewall:0.1.9}
+    image: ${XDP_FIREWALL_IMAGE:-xdp-firewall:0.1.26}
     network_mode: host
     uts: host
     privileged: true

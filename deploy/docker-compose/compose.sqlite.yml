@@ -1,6 +1,6 @@
 services:
   api:
-    image: ${XDP_FIREWALL_IMAGE:-1228022817/xdp-firewall:0.1.9}
+    image: ${XDP_FIREWALL_IMAGE:-xdp-firewall:0.1.26}
     environment:
       DATABASE_URL: sqlite:///var/lib/xdp-firewall/xdp-firewall.db?mode=rwc
       XDP_FIREWALL_API_TOKEN: ${XDP_FIREWALL_API_TOKEN:?set XDP_FIREWALL_API_TOKEN to enable API authentication}
@@ -21,7 +21,7 @@ services:
     restart: unless-stopped
 
   agent:
-    image: ${XDP_FIREWALL_IMAGE:-1228022817/xdp-firewall:0.1.9}
+    image: ${XDP_FIREWALL_IMAGE:-xdp-firewall:0.1.26}
     depends_on:
       api:
         condition: service_healthy
